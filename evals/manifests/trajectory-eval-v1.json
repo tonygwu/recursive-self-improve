@@ -1,0 +1,42 @@
+{
+  "dataset_id": "trajectory-eval-v1",
+  "files": {
+    "labeled/2026-08-agent-cli-env-gotchas.yaml": {
+      "bytes": 1600,
+      "sha256": "3074239981870b1efb67d061c0fe68a0f707f70863855262dfd5ee976efb8d8b"
+    },
+    "labeled/2026-08-gemini-model-identity.yaml": {
+      "bytes": 1165,
+      "sha256": "5f24c9ba48081b2a837d3bc0db641ead2c85783a6c16c0c19e1588e656b7c8f7"
+    },
+    "labeled/2026-08-pricing-default-truncation-bias.yaml": {
+      "bytes": 1452,
+      "sha256": "01e3748d8b20966c7d821fb616b2e7a8bec4f7373d2976e1be7c7aaed810437d"
+    },
+    "labeled/2026-08-silent-implementation-choices.yaml": {
+      "bytes": 1425,
+      "sha256": "9d40464a8ad332b3a5c9c0b27d4c7465f74d3b15e8a0df613bc2630f69f9ffa6"
+    },
+    "labeled/2026-08-wrong-artifact-verification.yaml": {
+      "bytes": 1296,
+      "sha256": "79a67e78ceaef17196e3b369cb4487f849569869796fbaf20690a42049cca37b"
+    },
+    "retrieval/corpus.jsonl": {
+      "bytes": 56004,
+      "sha256": "64a22901bd2e0f0003f2b46617c37fc2b0d7c2d10787f07daf0be5f307eec0c5"
+    },
+    "retrieval/qrels.yaml": {
+      "bytes": 74086,
+      "sha256": "bf61942ec29ab98924f02e6001f95ca7882c03df8c47442f7e8069812d5640dc"
+    }
+  },
+  "kind": "private",
+  "schema_versions": {
+    "bundle": 1,
+    "corpus": 1,
+    "labels": 1,
+    "qrels": 1
+  },
+  "sha256": "8aba60aa1e50adafc4ebcc3bc3084672cc0fe51a152d48a708d7b1b3cb7dc572",
+  "version": 1
+}

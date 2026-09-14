@@ -1,0 +1,97 @@
+{
+  "contract_version": 1,
+  "decision": {
+    "account": "claude_b",
+    "provider": "claude",
+    "reason": "Synthetic routing decision for adapter tests.",
+    "score": 0.42,
+    "binding_window": "7d",
+    "regime": "B",
+    "fits": true,
+    "meets_policy": true,
+    "available_at": null,
+    "sticky": false
+  },
+  "exec": {
+    "env": {
+      "CLAUDE_CONFIG_DIR": "/Users/USER/.claude-b"
+    }
+  },
+  "ranked": [
+    {
+      "account": "claude_b",
+      "score": 0.42,
+      "min_slack": -0.125,
+      "binding_window": "7d",
+      "remaining": 0.42,
+      "eligible": true,
+      "source": "cswap",
+      "age_s": 2.5,
+      "fits": true
+    },
+    {
+      "account": "claude",
+      "score": 0.35,
+      "min_slack": -0.125,
+      "binding_window": "7d",
+      "remaining": 0.35,
+      "eligible": true,
+      "source": "cswap",
+      "age_s": 2.5,
+      "fits": true
+    },
+    {
+      "account": "claude_c",
+      "score": 0.22,
+      "min_slack": -0.125,
+      "binding_window": "7d",
+      "remaining": 0.22,
+      "eligible": true,
+      "source": "cache",
+      "age_s": 2.5,
+      "fits": true
+    },
+    {
+      "account": "codex",
+      "score": 0.18,
+      "min_slack": -0.125,
+      "binding_window": "7d",
+      "remaining": 0.18,
+      "eligible": true,
+      "source": "cache",
+      "age_s": 2.5,
+      "fits": true
+    }
+  ],
+  "excluded": [
+    {
+      "account": "antigravity_claude",
+      "score": 0.0,
+      "min_slack": 0.0,
+      "binding_window": null,
+      "remaining": null,
+      "eligible": false,
+      "source": "assumed",
+      "age_s": null,
+      "fits": false,
+      "reason": "no usage windows in snapshot"
+    },
+    {
+      "account": "antigravity_gemini",
+      "score": 0.0,
+      "min_slack": 0.0,
+      "binding_window": null,
+      "remaining": null,
+      "eligible": false,
+      "source": "assumed",
+      "age_s": null,
+      "fits": false,
+      "reason": "no usage windows in snapshot"
+    }
+  ],
+  "degraded": [],
+  "warnings": [
+    "Synthetic account has no measured usage windows."
+  ],
+  "generated_at": "2026-01-01T00:00:00Z"
+}

@@ -1,0 +1,26 @@
+{
+  "dataset_id": "synthetic-retrieval-demo",
+  "files": {
+    "labeled/retry.yaml": {
+      "bytes": 309,
+      "sha256": "be58b173a88e46bcdc0b9c30c070c3b809cfc58622a7d844b3549dbaab82a403"
+    },
+    "retrieval/corpus.jsonl": {
+      "bytes": 1558,
+      "sha256": "9fa551825f747da1760910d1bf698e7542f4170824345d5723c1c990f48d7bbc"
+    },
+    "retrieval/qrels.yaml": {
+      "bytes": 2003,
+      "sha256": "02c0fe303b7887b1c86482c8a09a2453d735e33c130a9277886f59123cccd005"
+    }
+  },
+  "kind": "synthetic",
+  "schema_versions": {
+    "bundle": 1,
+    "corpus": 1,
+    "labels": 1,
+    "qrels": 1
+  },
+  "sha256": "5d6b442272c19747c6db569daf9d5d4899d31157d15e0984bbe30aea05a5a708",
+  "version": 1
+}

@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280">
+<title>self-improve dashboard</title>
+<!--
+  Dashboard shell. Overview, Rules, and Projects display recorded data.
+  Review records explicit decisions and requests, then shows worker progress.
+
+  Every stylesheet and script below is same-origin and relative. The page must
+  render with the network off apart from its own origin. Fonts are bundled;
+  there is no CDN or build step.
+
+  The dynamic parts are filled in by app.js through the element ids declared
+  here. Every id app.js looks up is declared in this file, so the id contract is
+  checkable without running a browser (tests/test_dashboard_spa.py).
+-->
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<a class="skip-link" id="skip-to-main" href="#main">Skip to content</a>
+<div class="app" id="app-root">
+
+  <nav class="nav" aria-label="Main navigation">
+    <div class="nav__brand">
+      <strong>self-improve</strong>
+      <span>trajectory miner</span>
+    </div>
+
+    <div class="nav__group">
+      <a class="nav-item" id="nav-overview" href="#/overview">
+        <span class="nav-item__icon" aria-hidden="true"></span>
+        Overview
+      </a>
+      <a class="nav-item" id="nav-rules" href="#/rules">
+        <span class="nav-item__icon" aria-hidden="true"></span>
+        Rules
+      </a>
+      <a class="nav-item" id="nav-review" href="#/review">
+        <span class="nav-item__icon" aria-hidden="true"></span>
+        Review queue
+        <span class="nav-item__count" id="nav-inbox-count">&mdash;</span>
+      </a>
+      <a class="nav-item" id="nav-projects" href="#/projects">
+        <span class="nav-item__icon" aria-hidden="true"></span>
+        Projects
+      </a>
+    </div>
+
+    <div class="nav__footer">
+      <p class="footnote" id="nav-freshness">Loading&hellip;</p>
+      <p class="footnote">127.0.0.1 &middot; no auth</p>
+      <button class="btn btn--quiet" id="theme-toggle" type="button" aria-pressed="false">
+        Dark theme
+      </button>
+    </div>
+  </nav>
+
+  <div class="workspace" id="workspace">
+    <main class="main" id="main" tabindex="-1">
+
+      <!-- A fetch that fails is loud and names the request. It never leaves a
+           stale view on screen pretending to be current. -->
+      <div class="error-state" id="global-error" style="display:none" role="alert"></div>
+      <section class="view run-page" id="run-detail" style="display:none" aria-label="Run detail"></section>
+
+      <!-- ============================ V1 · OVERVIEW ======================= -->
+      <div class="view" id="view-overview">
+        <header class="view__head">
+          <div class="view__heading">
+            <h1 class="view__title">Overview</h1>
+            <p class="view__desc">Is it healthy, does it need me?</p>
+          </div>
+          <div class="view__actions">
+            <button class="btn btn--quiet" id="ov-grid-numbers" type="button" aria-pressed="false">
+              Show numbers
+            </button>
+          </div>
+        </header>
+
+        <div class="banner" id="ov-banner" style="display:none"></div>
+
+        <p class="statusline" id="ov-statusline">Loading&hellip;</p>
+        <p class="statusline__sub" id="ov-statusline-sub"></p>
+
+        <div class="tiles" id="ov-tiles"></div>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">Run &times; stage</h2>
+            <span class="panel__meta" id="ov-grid-meta"></span>
+          </header>
+          <div class="panel__body">
+            <div class="scroll-x" id="ov-grid">
+              <div class="loading"><span class="loading__bar"></span><span class="loading__bar"></span><span class="loading__bar"></span></div>
+            </div>
+            <ul class="legend" id="ov-grid-legend"></ul>
+            <p class="footnote" id="ov-grid-foot"></p>
+          </div>
+        </section>
+
+        <div class="cols cols--2">
+          <section class="panel">
+            <header class="panel__head">
+              <h2 class="panel__title">Backlog against arrivals</h2>
+              <span class="panel__meta">a race, not a countdown</span>
+            </header>
+            <div class="panel__body">
+              <div id="ov-backlog"></div>
+              <p class="footnote" id="ov-backlog-foot" style="margin-top:var(--s-5)"></p>
+            </div>
+          </section>
+
+          <section class="panel">
+            <header class="panel__head">
+              <h2 class="panel__title">What failed, in English</h2>
+              <span class="panel__meta" id="ov-failures-meta"></span>
+            </header>
+            <div class="panel__body" id="ov-failures"></div>
+          </section>
+        </div>
+
+        <div class="cols cols--2">
+          <section class="panel">
+            <header class="panel__head">
+              <h2 class="panel__title">Gate health</h2>
+              <span class="panel__meta">counts, not a pass rate</span>
+            </header>
+            <div class="panel__body" id="ov-gate"></div>
+          </section>
+
+          <section class="panel">
+            <header class="panel__head">
+              <h2 class="panel__title">Proposals</h2>
+              <span class="panel__meta" id="ov-inbox-meta"></span>
+            </header>
+            <div class="panel__body" id="ov-inbox"></div>
+          </section>
+        </div>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">Has the loop earned trust yet?</h2>
+          </header>
+          <div class="panel__body" id="ov-confidence"></div>
+        </section>
+      </div>
+
+      <!-- ============================== V2 · RULES ======================== -->
+      <div class="view" id="view-rules" style="display:none">
+        <header class="view__head">
+          <div class="view__heading">
+            <h1 class="view__title">Rules</h1>
+            <p class="view__desc">Everything the machine believes, and the evidence behind it. Decisions live in the review queue.</p>
+          </div>
+        </header>
+
+        <!-- Search is the entry point, not a filter chip: the journey starts
+             with the operator typing a rule or an error string. -->
+        <label class="search" id="rules-search">
+          <span class="search__glyph" aria-hidden="true">&#9906;</span>
+          <input class="search__input" id="rules-search-input" type="search"
+                 autocomplete="off" spellcheck="false"
+                 placeholder="Type a rule, an error string, a repo or a file path">
+          <span class="search__meta" id="rules-search-meta"></span>
+          <span class="kbd" aria-hidden="true">/</span>
+        </label>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">Machine-authored rules</h2>
+            <span class="panel__meta" id="rules-meta"></span>
+          </header>
+          <div class="panel__body panel__body--flush">
+            <div class="scroll-x scroll-x--tall" id="rules-table-wrap">
+              <table class="data data--zebra data--wrap">
+                <thead>
+                  <tr>
+                    <th scope="col">Rule</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Target</th>
+                    <th scope="col" class="num">Evidence</th>
+                    <th scope="col" class="num">Repos</th>
+                    <th scope="col">Gate</th>
+                    <th scope="col">Miner gen.</th>
+                  </tr>
+                </thead>
+                <tbody id="rules-results"></tbody>
+              </table>
+            </div>
+            <div id="rules-empty" style="display:none"></div>
+          </div>
+          <footer class="panel__foot" id="rules-foot"></footer>
+        </section>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">Duplicate families</h2>
+          </header>
+          <div class="panel__body" id="rules-grouping"></div>
+        </section>
+      </div>
+
+      <!-- ============================ V4 · PROJECTS ======================= -->
+      <div class="view" id="view-projects" style="display:none">
+        <header class="view__head">
+          <div class="view__heading">
+            <h1 class="view__title">Projects</h1>
+            <p class="view__desc">One row per repository. Working copies count as one project.</p>
+          </div>
+        </header>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">Repositories</h2>
+            <span class="panel__meta" id="projects-meta"></span>
+          </header>
+          <div class="panel__body panel__body--flush">
+            <div class="scroll-x scroll-x--tall">
+              <table class="data data--zebra data--wide">
+                <thead>
+                  <tr>
+                    <th scope="col">Repo</th>
+                    <th scope="col">Identity</th>
+                    <th scope="col" class="num">Sessions</th>
+                    <th scope="col" class="num">Clones</th>
+                    <th scope="col" class="num">Queue incidents</th>
+                    <th scope="col" class="num">Signals /100k lines · 30d</th>
+                    <th scope="col">Top signal</th>
+                    <th scope="col" class="num">Rules written</th>
+                    <th scope="col">Context weight</th>
+                    <th scope="col" class="num">Benefit</th>
+                  </tr>
+                </thead>
+                <tbody id="projects-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <footer class="panel__foot" id="projects-foot"></footer>
+        </section>
+
+        <section class="panel">
+          <header class="panel__head">
+            <h2 class="panel__title">What this table could not measure</h2>
+          </header>
+          <div class="panel__body" id="projects-notes"></div>
+        </section>
+      </div>
+
+      <!-- Review records commands and displays delivery and operation history. -->
+      <div class="view" id="view-review" style="display:none">
+        <header class="view__head">
+          <div class="view__heading">
+          <h1 class="view__title">
+            Review queue
+            <span class="view__count" id="review-count">&mdash;</span>
+          </h1>
+          <p class="view__desc">
+            One card per lesson. Review proposals together or select them individually.
+            Approval queues the exact selected edits for delivery.
+          </p>
+          </div>
+        </header>
+
+        <section class="panel">
+          <div class="panel__body" id="review-body"></div>
+        </section>
+
+        <p class="footnote" id="review-note"></p>
+        <section class="panel" id="review-rollback" aria-labelledby="rollback-title" style="display:none">
+          <header class="panel__head">
+            <h2 class="panel__title" id="rollback-title" tabindex="-1">Review rollback</h2>
+            <a class="btn" href="#/review">Close preview</a>
+          </header>
+          <div class="panel__body" id="rollback-body"></div>
+        </section>
+        <section class="panel" id="review-eval" aria-labelledby="eval-job-title" style="display:none">
+          <div class="panel__head"><h2 class="panel__title" id="eval-job-title" tabindex="-1">Regenerate evaluation</h2></div>
+          <div class="panel__body" id="eval-job-body"></div>
+        </section>
+        <section class="panel" id="review-incidents" aria-labelledby="incident-title">
+          <header class="panel__head">
+            <h2 class="panel__title" id="incident-title">Unmined incidents</h2>
+            <button class="btn" data-incidents-refresh="true">Refresh</button>
+          </header>
+          <div class="panel__body" id="incident-body"></div>
+        </section>
+        <section class="panel" id="review-delivery" aria-labelledby="delivery-title">
+          <header class="panel__head">
+            <h2 class="panel__title" id="delivery-title">Decision and delivery history</h2>
+            <button type="button" class="btn" data-delivery-refresh="true">Refresh</button>
+          </header>
+          <div class="panel__body">
+            <p class="footnote" id="delivery-status" aria-live="polite">Loading delivery history…</p>
+            <div id="delivery-body"></div>
+            <p class="footnote">Delivery retries keep completed edits. Job resumes reuse recorded checkpoints and the original call limit. Cancellation stops remaining work.</p>
+          </div>
+        </section>
+        <section class="panel" id="review-operations" aria-labelledby="operations-title">
+          <header class="panel__head">
+            <h2 class="panel__title" id="operations-title">Automatic delivery &amp; rollback</h2>
+            <button type="button" class="btn" data-operation-refresh="true">Refresh</button>
+          </header>
+          <div class="panel__body">
+            <p class="footnote" id="operations-status" aria-live="polite">Loading operations…</p>
+            <div id="operations-body"></div>
+          </div>
+        </section>
+      </div>
+
+    </main>
+
+    <!-- The inspector is a direct child of .workspace so `:has(> .inspector)`
+         can widen the grid. app.js removes the class when it closes, because a
+         hidden-but-classed inspector would keep a 364px column reserved. -->
+    <aside id="inspector" style="display:none">
+      <header class="inspector__head">
+        <h2 class="inspector__title" id="inspector-title"></h2>
+        <div class="spacer"></div>
+        <button class="btn btn--quiet" id="inspector-close" type="button" aria-label="Close inspector">&times;</button>
+      </header>
+      <div class="inspector__body" id="inspector-body"></div>
+    </aside>
+  </div>
+
+</div>
+</body>
+</html>

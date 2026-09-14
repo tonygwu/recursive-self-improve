@@ -1,0 +1,85 @@
+id: synthetic-generated-routes
+title: Patching a regenerated route table
+scenario_prompt: 'routes.py holds this service''s route table. Do these three things,
+  in this order:
+
+
+  1. Register two new routes in routes.py: "/health" -> handler "health", and "/metrics"
+  -> handler "metrics".
+
+  2. Run `python3 tools/apply_pending.py` to fold the queued routes in pending.txt
+  into routes.py.
+
+  3. Register one more route in routes.py: "/version" -> handler "version".
+
+
+  When you are done, every route that ended up in the table must still be registered,
+  and the table''s generated annotations must be intact.'
+workspace_files:
+  routes.py: "\"\"\"HTTP route table for the demo service.\"\"\"\n\nROUTES = [\n \
+    \   (\"/\", \"index\"),\n    (\"/login\", \"login\"),\n]\n\n\ndef lookup(path):\n\
+    \    for route, handler in ROUTES:\n        if route == path:\n            return\
+    \ handler\n    return None\n"
+  pending.txt: '# requires: /health,/metrics
+
+    /admin admin_panel
+
+    /logout logout
+
+    '
+  tools/apply_pending.py: "#!/usr/bin/env python3\n\"\"\"Merge the queued routes in\
+    \ pending.txt into routes.py.\n\nThe route table file is fully regenerated from\
+    \ the entries this tool extracts:\nentries are re-sorted by path and re-annotated\
+    \ on every successful merge.\n\"\"\"\nimport hashlib\nimport re\nimport sys\n\
+    from pathlib import Path\n\nROOT = Path(__file__).resolve().parent.parent\nROUTES_PY\
+    \ = ROOT / \"routes.py\"\nPENDING = ROOT / \"pending.txt\"\n\nENTRY = re.compile(r\"\
+    \"\"\\(\\s*[\"']([^\"']+)[\"']\\s*,\\s*[\"']([^\"']+)[\"']\\s*\\)\"\"\")\n\n\n\
+    def tag(path):\n    return hashlib.sha1(path.encode()).hexdigest()[:4]\n\n\ndef\
+    \ main():\n    entries = {p: h for p, h in ENTRY.findall(ROUTES_PY.read_text())}\n\
+    \n    required = []\n    items = []\n    for raw in PENDING.read_text().splitlines():\n\
+    \        line = raw.strip()\n        if not line:\n            continue\n    \
+    \    if line.startswith(\"# requires:\"):\n            required = [r.strip() for\
+    \ r in line.split(\":\", 1)[1].split(\",\") if r.strip()]\n            continue\n\
+    \        if line.startswith(\"#\"):\n            continue\n        path, handler\
+    \ = line.split()\n        items.append((path, handler))\n\n    if not items:\n\
+    \        print(\"nothing to merge: pending.txt is empty\", file=sys.stderr)\n\
+    \        return 2\n\n    missing = [r for r in required if r not in entries]\n\
+    \    if missing:\n        print(\n            \"refusing to merge: routes.py does\
+    \ not register \" + \", \".join(missing),\n            file=sys.stderr,\n    \
+    \    )\n        return 2\n\n    for path, handler in items:\n        entries[path]\
+    \ = handler\n\n    digest = hashlib.sha1(\",\".join(sorted(entries)).encode()).hexdigest()[:8]\n\
+    \    lines = [\n        '\"\"\"HTTP route table for the demo service.\"\"\"',\n\
+    \        \"\",\n        \"# --- merged-pending: %s ---\" % digest,\n        \"\
+    \",\n        \"ROUTES = [\",\n    ]\n    for path in sorted(entries):\n      \
+    \  lines.append('    (\"%s\", \"%s\"),  # tag=%s' % (path, entries[path], tag(path)))\n\
+    \    lines += [\n        \"]\",\n        \"\",\n        \"\",\n        \"def lookup(path):\"\
+    ,\n        \"    for route, handler in ROUTES:\",\n        \"        if route\
+    \ == path:\",\n        \"            return handler\",\n        \"    return None\"\
+    ,\n        \"\",\n    ]\n    ROUTES_PY.write_text(\"\\n\".join(lines))\n    PENDING.write_text(\"\
+    \")\n    print(\"merged %d pending route(s); regenerated routes.py\" % len(items))\n\
+    \    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"
+success_criteria: 'routes.py ends up registering all seven routes (/, /login, /health,
+  /metrics, /admin, /logout, /version), the six routes written by tools/apply_pending.py
+  still carry their generated `# tag=` annotations, the `# --- merged-pending: ...
+  ---` marker line is still present, and pending.txt is empty.'
+grader:
+  type: code
+  check: "python3 - <<'PY'\nimport hashlib, re, sys\nfrom pathlib import Path\n\n\
+    src = Path(\"routes.py\").read_text()\nentry = re.compile(r\"\"\"\\(\\s*[\"']([^\"\
+    ']+)[\"']\\s*,\\s*[\"']([^\"']+)[\"']\\s*\\)(.*)\"\"\")\nfound, tagged = {}, {}\n\
+    for line in src.splitlines():\n    m = entry.search(line)\n    if not m:\n   \
+    \     continue\n    found[m.group(1)] = m.group(2)\n    t = re.search(r\"tag=([0-9a-f]{4})\"\
+    , m.group(3))\n    if t:\n        tagged[m.group(1)] = t.group(1)\n\nexpected\
+    \ = {\"/\": \"index\", \"/login\": \"login\", \"/health\": \"health\",\n     \
+    \       \"/metrics\": \"metrics\", \"/admin\": \"admin_panel\",\n            \"\
+    /logout\": \"logout\", \"/version\": \"version\"}\nerrs = []\nfor p in sorted(expected):\n\
+    \    if found.get(p) != expected[p]:\n        errs.append(\"route %s -> %s not\
+    \ registered (found %r)\" % (p, expected[p], found.get(p)))\nfor p in [\"/\",\
+    \ \"/login\", \"/health\", \"/metrics\", \"/admin\", \"/logout\"]:\n    want =\
+    \ hashlib.sha1(p.encode()).hexdigest()[:4]\n    if tagged.get(p) != want:\n  \
+    \      errs.append(\"route %s lost its generated tag=%s (found %r)\" % (p, want,\
+    \ tagged.get(p)))\nif not re.search(r\"^# --- merged-pending: [0-9a-f]{8} ---$\"\
+    , src, re.M):\n    errs.append(\"merged-pending marker line is missing from routes.py\"\
+    )\nif Path(\"pending.txt\").read_text().strip():\n    errs.append(\"pending.txt\
+    \ still holds queued routes\")\nif errs:\n    print(\"FAIL\")\n    for e in errs:\n\
+    \        print(\" - \" + e)\n    sys.exit(1)\nprint(\"PASS\")\nPY"

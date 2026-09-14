@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+state/
+reports/
+.DS_Store
+
+# Private exports and operational backups belong outside every checkout.
+/evals/labeled/
+/evals/retrieval/corpus.jsonl
+/evals/retrieval/qrels.yaml
+/private-data/
+/backups/
+*.db
+*.db-wal
+*.db-shm

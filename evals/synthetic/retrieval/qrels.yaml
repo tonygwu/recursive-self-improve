@@ -1,0 +1,54 @@
+notes: Invented public examples for harness tests and demos. No real mining or adjudication
+  results. Provenance values exercise report groups only.
+documents:
+  doc:70bee526ea1da077:
+    kind: learning
+    text: When an HTTP request times out, retry at most three times and keep the last
+      error.
+  doc:ee1de797ac101d1b:
+    kind: rule_unit
+    text: Retry timed-out HTTP calls at most three times; record the final error.
+  doc:a6231a8f2871022f:
+    kind: learning
+    text: When changing the database schema, back up the database before applying
+      the migration.
+  doc:8d764d654198b90a:
+    kind: rule_unit
+    text: Before a schema migration, make a database backup.
+  doc:9bcab6fc013258ff:
+    kind: rule_unit
+    text: A missing configuration key must raise an error.
+  doc:8efcf9ce71700b95:
+    kind: learning
+    text: Do not infer a missing setting; raise an error for the missing key.
+judgments:
+- query_id: doc:70bee526ea1da077
+  doc_id: doc:ee1de797ac101d1b
+  label: relevant
+  provenance: miner_flagged
+  reason: Both prescribe bounded retries after an HTTP timeout.
+- query_id: doc:a6231a8f2871022f
+  doc_id: doc:8d764d654198b90a
+  label: relevant
+  provenance: miner_flagged
+  reason: Both require a backup before a schema migration.
+- query_id: doc:8efcf9ce71700b95
+  doc_id: doc:9bcab6fc013258ff
+  label: relevant
+  provenance: miner_flagged
+  reason: Both require an error for missing configuration.
+- query_id: doc:70bee526ea1da077
+  doc_id: doc:8d764d654198b90a
+  label: not_relevant
+  provenance: hard_negative
+  reason: HTTP retry handling does not prescribe a database backup.
+- query_id: doc:a6231a8f2871022f
+  doc_id: doc:9bcab6fc013258ff
+  label: not_relevant
+  provenance: hard_negative
+  reason: A schema backup is a different action from rejecting missing configuration.
+- query_id: doc:70bee526ea1da077
+  doc_id: doc:9bcab6fc013258ff
+  label: borderline
+  provenance: hard_negative
+  reason: Both preserve errors, but their triggers and corrective actions differ.

@@ -1,0 +1,96 @@
+id: seed-2026-08-agent-cli-env-gotchas
+title: Headless CLI Environment Pinning
+scenario_prompt: '`com.example.nightly.plist` is a launchd job that has never produced
+  `report.txt`. Fix the job so that when launchd runs it, it exits 0 and leaves `report.txt`
+  in this folder holding the output of the vendored `tools/codex` shim. `NOTES.md`
+  and `logs/launchd.err` are everything we know so far. Do not fabricate the report
+  — it has to be what `tools/codex` printed.'
+workspace_files:
+  com.example.nightly.plist: "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE\
+    \ plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"\
+    >\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>com.example.nightly</string>\n\
+    \  <key>ProgramArguments</key>\n  <array>\n    <string>/bin/sh</string>\n    <string>run_nightly.sh</string>\n\
+    \  </array>\n  <key>StartCalendarInterval</key>\n  <dict>\n    <key>Hour</key><integer>3</integer>\n\
+    \    <key>Minute</key><integer>0</integer>\n  </dict>\n  <key>StandardErrorPath</key>\n\
+    \  <string>logs/launchd.err</string>\n</dict>\n</plist>\n"
+  run_nightly.sh: '#!/bin/sh
+
+    set -e
+
+
+    codex exec "summarize today''s commits" > report.txt
+
+
+    echo "nightly ok"
+
+    '
+  tools/codex: "#!/bin/sh\n# Vendored shim for the codex CLI. Same surface as `codex\
+    \ exec`.\n\nif [ \"${1:-}\" != \"exec\" ]; then\n  echo \"codex: unknown subcommand:\
+    \ ${1:-<none>}\" >&2\n  exit 2\nfi\nshift\n\n# Extra context may be piped in.\
+    \ codex reads it before it starts the run.\nextra=\"\"\n[ -t 0 ] || extra=$(cat)\n\
+    \nskip=0\nprompt=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    --skip-git-repo-check)\
+    \ skip=1 ;;\n    -*) ;;\n    *) prompt=$a ;;\n  esac\ndone\n\nif [ \"$skip\" -ne\
+    \ 1 ] && [ ! -f \"${HOME:-/nonexistent}/.codex/trusted\" ]; then\n  echo \"codex:\
+    \ this folder is not a trusted workspace; refusing to run\" >&2\n  exit 1\nfi\n\
+    \nself_dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nnonce=$(cat \"$self_dir/../.nonce\"\
+    \ 2>/dev/null || echo NONONCE)\nprintf 'codex-exec-ok %s %s%s\\n' \"$nonce\" \"\
+    $prompt\" \"$extra\"\n"
+  logs/launchd.err: '/bin/sh: run_nightly.sh: No such file or directory
+
+    '
+  NOTES.md: "# nightly report job\n\n`run_nightly.sh` calls the vendored `codex` shim\
+    \ in `./tools` and redirects its\nstdout into `report.txt`. `com.example.nightly.plist`\
+    \ is the launchd job that is\nsupposed to run it at 03:00 every day.\n\nWhat we\
+    \ have seen so far:\n\n- 2026-08-16 03:00 - launchd ran the job. No `report.txt`\
+    \ appeared.\n  `logs/launchd.err` holds the only line it left behind.\n- 2026-08-17\
+    \ 21:40 - ran the job from the release wrapper, which stays attached\n  to it\
+    \ for the whole run. It sat at 0% CPU for 40 minutes and wrote nothing.\n  I killed\
+    \ it.\n- 2026-08-18 09:15 - ran `sh run_nightly.sh` in my own terminal, with `./tools`\n\
+    \  on PATH. It finished in under a second, exit 0, and `report.txt` was written.\n\
+    \  So I cannot reproduce either failure that way.\n"
+success_criteria: Launching the plist's ProgramArguments the way launchd does - working
+  directory not this folder unless the plist says so, a bare system PATH, a HOME with
+  no codex trust record, and an inherited stdin that never reaches EOF - exits 0 within
+  25 seconds and leaves report.txt in the workspace containing the line that tools/codex
+  printed (including the nonce the grader wrote just before the run).
+grader:
+  type: code
+  check: "python3 - <<'PYEOF'\nimport glob, os, plistlib, signal, subprocess, sys\n\
+    \nws = os.getcwd()\n\ndef fail(msg):\n    sys.stderr.write(\"FAIL: \" + msg +\
+    \ \"\\n\")\n    sys.exit(1)\n\nplist_path = os.path.join(ws, \"com.example.nightly.plist\"\
+    )\nif not os.path.isfile(plist_path):\n    fail(\"com.example.nightly.plist is\
+    \ missing\")\ntry:\n    with open(plist_path, \"rb\") as fh:\n        pl = plistlib.load(fh)\n\
+    except Exception as exc:\n    fail(\"plist does not parse: %r\" % (exc,))\n\n\
+    argv = list(pl.get(\"ProgramArguments\") or [])\nif not argv and pl.get(\"Program\"\
+    ):\n    argv = [pl[\"Program\"]]\nif not argv:\n    fail(\"plist has no ProgramArguments\"\
+    )\nargv = [str(a) for a in argv]\n\nfor path in glob.glob(os.path.join(ws, \"\
+    *.sh\")) + glob.glob(os.path.join(ws, \"tools\", \"*\")):\n    try:\n        os.chmod(path,\
+    \ 0o755)\n    except OSError:\n        pass\nhead = argv[0] if os.path.isabs(argv[0])\
+    \ else os.path.join(ws, argv[0])\nif os.path.isfile(head) and os.path.realpath(head).startswith(os.path.realpath(ws)):\n\
+    \    try:\n        os.chmod(head, 0o755)\n    except OSError:\n        pass\n\n\
+    wd = str(pl.get(\"WorkingDirectory\") or \"/\")\nif not os.path.isdir(wd):\n \
+    \   fail(\"WorkingDirectory %r does not exist\" % (wd,))\n\nenv = {\"PATH\": \"\
+    /usr/bin:/bin:/usr/sbin:/sbin\", \"HOME\": ws}\nfor k, v in (pl.get(\"EnvironmentVariables\"\
+    ) or {}).items():\n    env[str(k)] = str(v)\n\nnonce = \"NONCE%d\" % os.getpid()\n\
+    with open(os.path.join(ws, \".nonce\"), \"w\") as fh:\n    fh.write(nonce)\n\n\
+    for d in (ws, wd):\n    try:\n        os.remove(os.path.join(d, \"report.txt\"\
+    ))\n    except OSError:\n        pass\n\nread_fd, write_fd = os.pipe()\nlog_path\
+    \ = os.path.join(ws, \".grader-run.log\")\nlog = open(log_path, \"wb\")\ntry:\n\
+    \    proc = subprocess.Popen(argv, cwd=wd, env=env, stdin=read_fd,\n         \
+    \                   stdout=log, stderr=subprocess.STDOUT,\n                  \
+    \          start_new_session=True)\nexcept Exception as exc:\n    os.close(read_fd)\n\
+    \    os.close(write_fd)\n    log.close()\n    fail(\"launchd could not start ProgramArguments\
+    \ %r: %r\" % (argv, exc))\nos.close(read_fd)\nhung = False\ntry:\n    rc = proc.wait(timeout=25)\n\
+    except subprocess.TimeoutExpired:\n    hung = True\n    rc = -1\n    try:\n  \
+    \      os.killpg(os.getpgid(proc.pid), signal.SIGKILL)\n    except OSError:\n\
+    \        pass\n    proc.wait()\nos.close(write_fd)\nlog.close()\nwith open(log_path,\
+    \ \"rb\") as fh:\n    tail = fh.read().decode(\"utf-8\", \"replace\")[-500:]\n\
+    \nif hung:\n    fail(\"job was still running after 25s with stdin held open; output\
+    \ so far: %r\" % (tail,))\nif rc != 0:\n    fail(\"job exited %d; output: %r\"\
+    \ % (rc, tail))\n\nreport = None\nfor d in (ws, wd):\n    cand = os.path.join(d,\
+    \ \"report.txt\")\n    if os.path.isfile(cand):\n        report = cand\n     \
+    \   break\nif report is None:\n    fail(\"no report.txt was produced; job output:\
+    \ %r\" % (tail,))\nwith open(report, \"r\", errors=\"replace\") as fh:\n    text\
+    \ = fh.read()\nif \"codex-exec-ok\" not in text or nonce not in text:\n    fail(\"\
+    report.txt does not hold output from tools/codex: %r\" % (text[:300],))\nprint(\"\
+    PASS\")\nPYEOF"

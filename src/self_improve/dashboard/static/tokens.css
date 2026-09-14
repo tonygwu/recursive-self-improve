@@ -1,0 +1,319 @@
+/* =============================================================================
+   tokens.css — design tokens for the self-improve dashboard.
+   Plain CSS custom properties. No build step, no @import, no CDN; bundled fonts only;
+   the page must render with the network off.
+
+   HOW THE THEMES WORK
+     :root                              the COMPLETE light palette
+     :root[data-theme="dark"]           an explicit dark toggle wins
+     @media (prefers-color-scheme:dark)
+       :root:not([data-theme="light"])  system dark, unless light was chosen
+
+   Every colour has its full definition on bare :root. No colour is defined
+   only inside a media query, so a browser that never matches the query still
+   gets a complete theme. The two dark blocks carry the SAME property set with
+   the SAME values. They are duplicated because CSS cannot share one
+   declaration block across a media boundary. If you edit one, edit the other.
+
+   Put data-theme="dark" or data-theme="light" on <html> to force a theme.
+   With no attribute the operating system decides.
+
+   CONTRAST. Measured with the WCAG 2.x formula, both themes:
+     All body/caption text >= 4.5:1 on each supporting surface.
+     Reference muted ink is darkened slightly on sunken surfaces to retain
+     readable captions; it must not disappear into a zebra row.
+     every status ink >= 4.5:1 on --c-bg-surface AND on its own -subtle fill
+     --c-border-strong >= 3.0:1 on --c-bg-surface (it outlines that surface)
+     --c-border-default is a hairline separator and is deliberately BELOW 3:1.
+       It never carries meaning on its own; it only separates two regions.
+
+   COLOUR IS NEVER THE ONLY CHANNEL. app.css pairs every state with a glyph
+   (--st-glyph) and a fill treatment: solid, hatched, or empty-and-dashed.
+   A red-green colourblind reader can read the grid from shape alone.
+
+   -----------------------------------------------------------------------------
+   TOKEN INDEX — this is the contract with the markup.
+   -----------------------------------------------------------------------------
+   SURFACES
+     --c-bg-canvas          page background, behind every panel
+     --c-bg-surface         panel / table / tile background
+     --c-bg-surface-raised  popover, inspector, sticky head; sits above surface
+     --c-bg-subtle          table head, zebra row, hover, inset well
+   BORDERS
+     --c-border-default     hairline between rows, cells and panels
+     --c-border-strong      panel outline, grid rules, table outer edge
+     --c-border-focus       focus ring
+   TEXT
+     --c-text-primary       body text and headings
+     --c-text-secondary     labels, table heads, supporting prose
+     --c-text-muted         captions, units, the "not applicable" em dash
+     --c-text-inverse       text on a filled accent background
+   ACCENT — one interactive hue for links, selection, meters and focus
+     --c-accent             link, active nav item, meter fill, selected rule
+     --c-accent-hover       hover and active state of the above
+     --c-accent-subtle      selected-row tint, meter track
+     --c-overlay            scrim behind a popover layer
+     --c-shadow             shadow colour, consumed by the --e-* tokens
+   STATE — five reserved hues plus grey. Each state has an INK (text, glyph,
+   border) and a SUBTLE (fill).
+     --c-status-ok          / --c-status-ok-subtle       ran; stage succeeded
+     --c-status-partial     / --c-status-partial-subtle  ran WITH FAILURES; also
+                                                         the "needs a human" hue
+     --c-status-fail        / --c-status-fail-subtle     stage failed; run error
+     --c-status-running     / --c-status-running-subtle  still running, or never
+                                                         reported completion
+     --c-status-skipped     / --c-status-skipped-subtle  DID NOT RUN. The subtle
+                                                         fill is transparent on
+                                                         purpose: absence must
+                                                         read as absence, never
+                                                         as a neutral pass.
+     --c-status-stale       / --c-status-stale-subtle    abandoned; closed by the
+                                                         stale-run reaper
+     --c-status-info        / --c-status-info-subtle     neutral note; no
+                                                         evidence either way
+   GATE VERDICTS — aliases onto the state hues, so the palette keeps five
+   reserved hues instead of growing a categorical set.
+   Gate colors describe evaluation outcomes. Execution permission belongs to
+   the shared policy and is not encoded by these colors.
+     --c-verdict-pass          -> ok       gated_pass
+     --c-verdict-fail          -> fail     gated_fail
+     --c-verdict-ungated       -> info     ungated
+     --c-verdict-inconclusive  -> partial  inconclusive
+     Each has a -subtle twin with the same alias.
+   SPACING — 0, 2, 4, 6, 8, 12, 16, 24, 32, 48
+     --s-0 --s-1 --s-2 --s-3 --s-4 --s-5 --s-6 --s-7 --s-8 --s-9
+   RADII
+     --r-sm  cells, badges, inputs
+     --r-md  panels, tiles
+     --r-lg  popovers and dialogs
+   LAYERS
+     --z-base --z-sticky --z-popover
+   TYPE — composite `font` shorthands. Use as `font: var(--t-body);`
+     --font-sans --font-mono   bundled Inter / Fira Mono, system fallbacks
+     --t-display      the one big number in a stat tile
+     --t-h1           view title
+     --t-h2           panel title
+     --t-h3           section label inside a panel
+     --t-body         default body text
+     --t-body-strong  emphasised body: row titles, tile labels
+     --t-caption      captions, units, footnotes
+     --t-mono         ids, paths, code
+     --t-mono-sm      dense mono in table cells and grid counts
+   ELEVATION — flat wells, subtly raised panels, and floating layers.
+     --e-flat --e-raised --e-popover
+   ============================================================================= */
+
+/* Exact upstream binaries and OFL notices live in fonts/. Requests stay same-origin. */
+@font-face {
+  font-family: "Inter";
+  src: url("fonts/InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("fonts/InterVariable-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Fira Mono";
+  src: url("fonts/FiraMono-Regular.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Fira Mono";
+  src: url("fonts/FiraMono-Bold.woff") format("woff");
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+
+  /* surfaces */
+  --c-bg-canvas: #f6f8fa;
+  --c-bg-surface: #ffffff;
+  --c-bg-surface-raised: #ffffff;
+  --c-bg-subtle: #eef1f4;
+
+  /* borders */
+  --c-border-default: #e2e6eb;
+  --c-border-strong: #8a939e;
+  --c-border-focus: #4a5fd1;
+
+  /* text */
+  --c-text-primary: #141a21;
+  --c-text-secondary: #4d5765;
+  --c-text-muted: #626d7a;
+  --c-text-inverse: #ffffff;
+
+  /* accent */
+  --c-accent: #3a4cae;
+  --c-accent-hover: #2f3e91;
+  --c-accent-subtle: #eef2ff;
+  --c-overlay: rgba(20, 26, 31, 0.38);
+  --c-shadow: rgba(20, 28, 38, 0.06);
+
+  /* state */
+  --c-status-ok: #1f6640;
+  --c-status-ok-subtle: #e5f4eb;
+  --c-status-partial: #8a5a0f;
+  --c-status-partial-subtle: #fdf3e3;
+  --c-status-fail: #93332c;
+  --c-status-fail-subtle: #fbedec;
+  --c-status-running: #1a58a8;
+  --c-status-running-subtle: #e6eefa;
+  --c-status-skipped: #646d79;
+  --c-status-skipped-subtle: transparent;
+  --c-status-stale: #6b5c8f;
+  --c-status-stale-subtle: #eeeaf4;
+  --c-status-info: #45607a;
+  --c-status-info-subtle: #e9eef3;
+
+  /* gate verdicts — aliases, never new hues */
+  --c-verdict-pass: var(--c-status-ok);
+  --c-verdict-pass-subtle: var(--c-status-ok-subtle);
+  --c-verdict-fail: var(--c-status-fail);
+  --c-verdict-fail-subtle: var(--c-status-fail-subtle);
+  --c-verdict-ungated: var(--c-status-info);
+  --c-verdict-ungated-subtle: var(--c-status-info-subtle);
+  --c-verdict-inconclusive: var(--c-status-partial);
+  --c-verdict-inconclusive-subtle: var(--c-status-partial-subtle);
+
+  /* spacing */
+  --s-0: 0px;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 6px;
+  --s-4: 8px;
+  --s-5: 12px;
+  --s-6: 16px;
+  --s-7: 24px;
+  --s-8: 32px;
+  --s-9: 48px;
+
+  /* radii */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 10px;
+
+  /* layers */
+  --z-base: 0;
+  --z-sticky: 20;
+  --z-popover: 100;
+
+  /* type */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: "Fira Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+
+  --t-display: 600 26px/1.15 var(--font-sans);
+  --t-h1: 600 20px/26px var(--font-sans);
+  --t-h2: 600 13px/20px var(--font-sans);
+  --t-h3: 500 11px/16px var(--font-sans);
+  --t-body: 400 13px/20px var(--font-sans);
+  --t-body-strong: 500 13px/20px var(--font-sans);
+  --t-caption: 400 12px/18px var(--font-sans);
+  --t-mono: 400 12px/19px var(--font-mono);
+  --t-mono-sm: 400 11px/1.4 var(--font-mono);
+
+  /* elevation */
+  --e-flat: none;
+  --e-raised: 0 1px 2px var(--c-shadow);
+  --e-popover: 0 10px 28px -8px var(--c-shadow), 0 2px 6px -2px var(--c-shadow);
+}
+
+/* -----------------------------------------------------------------------------
+   DARK — explicit toggle. Only the tokens that CHANGE are redefined.
+   Scale, radii, layers, type and elevation are theme-independent; the
+   elevation tokens follow the theme because they reference --c-shadow.
+   Keep this block byte-identical to the media-query block below.
+   -------------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --c-bg-canvas: #0f1216;
+  --c-bg-surface: #161a1f;
+  --c-bg-surface-raised: #1e232a;
+  --c-bg-subtle: #1b2027;
+
+  --c-border-default: #2a3038;
+  --c-border-strong: #616c7a;
+  --c-border-focus: #a4b2ff;
+
+  --c-text-primary: #e8ecf0;
+  --c-text-secondary: #adb6c1;
+  --c-text-muted: #939eac;
+  --c-text-inverse: #0f1216;
+
+  --c-accent: #a4b2ff;
+  --c-accent-hover: #c1caff;
+  --c-accent-subtle: #242d50;
+  --c-overlay: rgba(0, 0, 0, 0.58);
+  --c-shadow: rgba(0, 0, 0, 0.55);
+
+  --c-status-ok: #57bd85;
+  --c-status-ok-subtle: #14291d;
+  --c-status-partial: #e0a44b;
+  --c-status-partial-subtle: #2b2110;
+  --c-status-fail: #f0796d;
+  --c-status-fail-subtle: #33191a;
+  --c-status-running: #71a9ee;
+  --c-status-running-subtle: #17263a;
+  --c-status-skipped: #8d97a4;
+  --c-status-skipped-subtle: transparent;
+  --c-status-stale: #a493cf;
+  --c-status-stale-subtle: #231f31;
+  --c-status-info: #93a7bd;
+  --c-status-info-subtle: #1d242c;
+}
+
+@media (prefers-color-scheme: dark) {
+  /* System dark, unless the reader explicitly chose light.
+     Keep byte-identical to :root[data-theme="dark"] above. */
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --c-bg-canvas: #0f1216;
+    --c-bg-surface: #161a1f;
+    --c-bg-surface-raised: #1e232a;
+    --c-bg-subtle: #1b2027;
+
+    --c-border-default: #2a3038;
+    --c-border-strong: #616c7a;
+    --c-border-focus: #a4b2ff;
+
+    --c-text-primary: #e8ecf0;
+    --c-text-secondary: #adb6c1;
+    --c-text-muted: #939eac;
+    --c-text-inverse: #0f1216;
+
+    --c-accent: #a4b2ff;
+    --c-accent-hover: #c1caff;
+    --c-accent-subtle: #242d50;
+    --c-overlay: rgba(0, 0, 0, 0.58);
+    --c-shadow: rgba(0, 0, 0, 0.55);
+
+    --c-status-ok: #57bd85;
+    --c-status-ok-subtle: #14291d;
+    --c-status-partial: #e0a44b;
+    --c-status-partial-subtle: #2b2110;
+    --c-status-fail: #f0796d;
+    --c-status-fail-subtle: #33191a;
+    --c-status-running: #71a9ee;
+    --c-status-running-subtle: #17263a;
+    --c-status-skipped: #8d97a4;
+    --c-status-skipped-subtle: transparent;
+    --c-status-stale: #a493cf;
+    --c-status-stale-subtle: #231f31;
+    --c-status-info: #93a7bd;
+    --c-status-info-subtle: #1d242c;
+  }
+}

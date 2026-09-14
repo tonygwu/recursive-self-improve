@@ -1,0 +1,108 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.12"
+          - os: macos-14
+            python: "3.14"
+    defaults:
+      run:
+        shell: bash
+    env:
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: credential.helper
+      GIT_CONFIG_VALUE_0: ""
+      GIT_CONFIG_KEY_1: core.sshCommand
+      GIT_CONFIG_VALUE_1: "false"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_ASKPASS: /usr/bin/false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.10.10"
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Select a disposable model cache
+        run: printf 'HF_HOME=%s/huggingface\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install frozen dependencies without Git credentials
+        run: |
+          uv sync --extra dashboard --frozen
+          uv run python --version
+          node --version
+      - name: Scan tracked source with the pinned scanner
+        if: runner.os == 'Linux'
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$archive" \
+            | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          uv run python ops/scan-secrets.py \
+            --scanner "$RUNNER_TEMP/gitleaks" \
+            --output "$RUNNER_TEMP/source-audit"
+      - name: Download the public embedding model and record its revision
+        run: |
+          uv run python - <<'PY'
+          import json
+          from self_improve.config import Config
+          from self_improve.embeddings import Embedder
+          cfg = Config()
+          embedder = Embedder(cfg, None)
+          embedder.encode(["Invented CI input"])
+          identity = embedder.provenance
+          assert identity["source"]["revision"] == cfg.embedding_revision
+          print(json.dumps(identity, sort_keys=True))
+          PY
+      - name: Run the full suite, including dashboard and wheel tests
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: uv run pytest -q -ra
+      - name: Check the data-boundary acceptance marker
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: uv run pytest -q tests/test_data_boundary.py && printf 'DATA_BOUNDARY_OK\n'
+      - name: Build and install the wheel outside the checkout
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          uv build --out-dir "$RUNNER_TEMP/dist"
+          uv venv "$RUNNER_TEMP/wheel-env"
+          wheels=("$RUNNER_TEMP"/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --python "$RUNNER_TEMP/wheel-env/bin/python" "${wheels[0]}[dashboard]"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-env/bin/selfimprove" eval-retrieval --synthetic --json

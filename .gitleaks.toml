@@ -1,0 +1,102 @@
+# Gitleaks 8.30.1. Keep default rules; exceptions require BOTH the exact
+# reviewed value and its fixture path. No file, directory, or commit is skipped.
+# See docs/SECRET_SCAN.md for review evidence and rule-verification commands.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "self-improve-short-figma-token"
+description = "Figma credential shape below the generic entropy floor"
+regex = '''\b(figd_[A-Za-z0-9_-]{12,})\b'''
+secretGroup = 1
+keywords = ["figd_"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["aws-access-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_filter_incidents\\.py$", "(^|/)tests/test_prefilter\\.py$", "(^|/)tests/test_redact\\.py$"]
+regexes = ["^[A]KIAABCDEFGHIJKLMNOP$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["gcp-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[A]IzaSyA1234567890abcdefghijklmnopqrstuv$"]
+
+[[allowlists]]
+description = "Invented grader sign-off marker, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)evals/regression/seed\\-2026\\-08\\-silent\\-implementation\\-choices\\.yaml$"]
+regexes = ["^[Z]K7\\-QUIET\\-TAIL\\.$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[f]igd_AbCdEf12\\-34_gh56IjKl78$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_render\\.py$"]
+regexes = ["^[s]k\\-plantedsecret1234567890abc$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["github-oauth"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[g]ho_SYNTHETIC0123456789ABCDEFGHIJKLMNOPQ$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["private-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[\\-]\\-\\-\\-\\-BEGIN RSA PRIVATE KEY\\-\\-\\-\\-\\-\\\\n\"\\\n    \"MIIEowIBAAKCAQEA7fake0keyMaterial\\\\n\"\\\n    \"abc123def456\\\\n\"\\\n    \"\\-\\-\\-\\-\\-END RSA PRIVATE KEY\\-\\-\\-\\-\\-$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["self-improve-short-figma-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[f]igd_AbCdEf12\\-34_gh56Ij$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["self-improve-short-figma-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[f]igd_AbCdEf12\\-34_gh56IjKl78$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["self-improve-short-figma-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[f]igd_shortbutstillatoken12$"]
+
+[[allowlists]]
+description = "Invented redaction input, exact value only"
+targetRules = ["slack-bot-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_redact\\.py$"]
+regexes = ["^[x]oxb\\-2444333222111\\-1234567890123\\-AbCdEfGhIjKlMnOpQrStUvWx$"]
+

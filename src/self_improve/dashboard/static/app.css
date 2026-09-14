@@ -1,0 +1,2393 @@
+/* =============================================================================
+   app.css — components for the self-improve dashboard.
+   Depends on tokens.css. Load tokens.css FIRST.
+
+   Density first. This is a tool for one operator reading real numbers, not a
+   marketing page. Panels have a subtle shadow and hairline borders; floating
+   layers have stronger elevation; there is one accent hue and five reserved state hues.
+
+   -----------------------------------------------------------------------------
+   THE STATE CONTRACT — read this before writing markup
+   -----------------------------------------------------------------------------
+   Put data-state or data-verdict on an element and it dresses itself: ink,
+   fill, border and a GLYPH. Colour is never the only channel.
+
+     data-state="ok"                ran, stage succeeded          glyph OK tick
+     data-state="partial"           ran WITH FAILURES             glyph !
+     data-state="failed"            stage failed                  glyph x
+     data-state="error"             run status 'error'            glyph x
+     data-state="running"           still running / never
+                                    reported completion           glyph >
+     data-state="skipped"           DID NOT RUN. Empty fill,
+                                    dashed border, no glyph.
+     data-state="abandoned"         closed by the stale-run
+                                    reaper                        glyph slashed O
+     data-state="budget_exhausted"  stopped on the call budget    glyph crossed O
+     data-state="refused"           asked, reported no failures
+                                    and produced nothing: the
+                                    budget refused it             glyph minus O
+     data-state="info"              neutral note                  glyph i
+
+     data-verdict="gated_pass"      gate passed                   glyph OK tick
+     data-verdict="gated_fail"      HELD                          glyph x
+     data-verdict="ungated"         no qualifying pass/fail
+                                    evidence                      glyph ~
+     data-verdict="inconclusive"    no passing/failing majority    glyph not-equal
+
+   Any OTHER value fails loud: a dashed 2px alarm outline and a "?" glyph, so
+   an unmapped state is visible instead of silently rendering as neutral.
+
+   The glyph is CSS generated content and assistive technology may skip it.
+   Every cell, swatch and icon-only badge MUST also carry a title and an
+   aria-label in the markup.
+
+   Elements that honour the contract: .cell, .swatch, .dot, .badge, .banner,
+   .tile, .empty, .rate, .nav-item__count.
+
+   -----------------------------------------------------------------------------
+   COMPONENT INDEX — class names are the contract with the markup
+   -----------------------------------------------------------------------------
+   SHELL      .app .nav .nav__brand .nav__group .nav-item .nav-item__count
+              .workspace .workspace--split .main .inspector
+   VIEW       .view .view__head .view__title .view__desc .view__actions
+              .panel .panel__head .panel__title .panel__meta .panel__body
+              .panel__body--flush .panel__foot .cols .cols--2 .cols--3
+   HEADLINE   .statusline .statusline__sub .banner .banner__title .banner__body
+   METRICS    .tiles .tile .tile__label .tile__value .tile__unit .tile__sub
+   BACKLOG    .rates .rate .rate__value .rate__label .rate__sep .rate--net
+              .race .race__label .race__value .meter .meter__fill
+   RUN GRID   .run-grid .run-grid--numbers .run-grid__corner .run-grid__night
+              .run-grid__mon .run-grid__day .run-grid__runs .run-grid__stage
+              .cell .cell__n .legend .legend__item .swatch
+   TABLES     .data .data--zebra .data--wrap .num .mono .id .trunc
+              th[aria-sort] tr[aria-selected]
+   SEARCH     .search .search__glyph .search__input .search__meta .kbd
+   INSPECTOR  .inspector__head .inspector__title .inspector__body
+              .section .section__title .field .field--stack .field__label
+              .field__value .kv
+   FAILURES   .failures .failure .failure__name .failure__count .failure__note
+              .failure--fixed
+   TREND      .matrix .matrix__row-label .spark .spark__bar
+   ATOMS      .badge .badge--lg .dot .chip .btn .btn--primary .btn--quiet
+              .tabs .tab .infotip .infotip__btn .infotip__pop
+   STATES     .empty .empty__glyph .empty__title .empty__body .empty__reason
+              .novalue .loading .loading__bar .error-state
+   UTILITIES  .scroll-x .scroll-x--tall .footnote .caption .muted .strong
+              .row .stack .spacer .visually-hidden
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   Layout metrics. Not design tokens; they are this application's furniture.
+   -------------------------------------------------------------------------- */
+:root {
+  --nav-w: 240px;
+  --inspector-w: 364px;
+  --cell: 26px;
+  --cell-gap: 3px;
+
+  /* Set per element by the markup: style="--pct: 42" on a .meter__fill,
+     style="--v: 68" on a .spark__bar. A meter always draws a MEASURED number.
+     If there is no number, render .novalue or .empty instead of a meter at
+     zero: 0 here means "nothing to draw", never "we did not measure". */
+  --pct: 0;
+  --v: 0;
+}
+
+/* Run detail follows the reference's header, stage panel, cap notice, and
+   artifact panels. Native stage counters occupy one readable column. */
+.view.run-page { display: flex; flex-direction: column; gap: 14px; }
+.run-breadcrumb { font: var(--t-caption); color: var(--c-text-secondary); }
+.run-heading { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; margin: 0; }
+.run-heading .view__title { font-size: 20px; line-height: 26px; letter-spacing: -0.2px; }
+.run-heading p { margin: 4px 0; overflow-wrap: anywhere; }
+.run-heading__meta { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: 100%; font: var(--t-caption); }
+.run-heading__meta select { width: 330px; max-width: 100%; padding: 6px; color: var(--c-text-primary); background: var(--c-bg-surface); border: 1px solid var(--c-border-strong); border-radius: var(--r-sm); }
+.run-stage-table { table-layout: fixed; width: 100%; min-width: 660px; border-collapse: collapse; font: var(--t-body); }
+.run-stage-table th, .run-stage-table td { padding: 11px 18px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--c-border-default); }
+.run-stage-table thead { font: var(--t-caption); background: var(--c-bg-subtle); }
+.run-stage-table th:first-child { width: 110px; }
+.run-stage-table th:nth-child(2) { width: 44%; }
+.run-stage-table td { overflow-wrap: anywhere; }
+.run-stage-table p { margin: 0 0 6px; }
+.run-stage-table tr[aria-selected="true"] { background: var(--c-accent-subtle); }
+.run-stage-table tr:focus { outline: 2px solid var(--c-border-focus); outline-offset: -2px; }
+.run-notice { padding: 14px 18px; background: var(--c-status-partial-subtle); color: var(--c-text-primary); border: 1px solid var(--c-border-default); border-radius: 10px; }
+.run-notice p { margin: 4px 0; }
+.run-page .panel { border-radius: 10px; }
+.run-record { padding: 10px 0; border-bottom: 1px solid var(--c-border-default); overflow-wrap: anywhere; }
+.run-record summary { cursor: pointer; overflow-wrap: anywhere; }
+.run-record > a { display: inline-block; margin-top: 8px; }
+.run-choices { padding-left: 20px; }
+.run-choices li { padding: 8px 0; overflow-wrap: anywhere; }
+.run-grid__link { display: flex; align-items: center; justify-content: center; position: absolute; inset: 0; z-index: 1; color: inherit; text-decoration: none; border-radius: var(--r-sm); }
+.run-grid__link:focus-visible { outline: 2px solid var(--c-border-focus); outline-offset: 2px; }
+.run-grid .cell { position: relative; }
+
+.review-member-list { display: grid; gap: 12px; margin-block: 14px; }
+.review-member { border: 1px solid var(--c-border-default); border-radius: 8px; padding: 14px; min-width: 0; }
+.review-member__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.review-member__head label { display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.review-member code { overflow-wrap: anywhere; }
+.review-full-record { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 360px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
+.review-evidence-entry { margin-block: 12px; border-left: 2px solid var(--c-border-default); padding-left: 12px; }
+.review-selected-preview { margin-block: 12px; min-width: 0; }
+.review-selected-preview h4 { font-size: 13px; margin-block: 10px; }
+.review-selected-preview .review-budget { display: block; }
+.review-targets > summary { cursor: pointer; }
+.review-card__actions .btn:disabled { opacity: .5; cursor: wait; }
+.review-selected-preview .review-targets__head { text-transform: none; font: var(--t-mono); letter-spacing: 0; overflow-wrap: anywhere; }
+.review-selected-preview .review-targets > p,
+.review-selected-preview .review-targets > details { margin: 10px 14px; }
+
+/* -----------------------------------------------------------------------------
+   Base. The shell owns the scrolling: <body> never scrolls, in either axis, so
+   the page can never scroll horizontally. Wide content scrolls inside its own
+   .scroll-x container.
+   -------------------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--c-bg-canvas);
+  color: var(--c-text-primary);
+  font: var(--t-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+figure {
+  margin: 0;
+  padding: 0;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+a {
+  color: var(--c-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--c-accent-hover);
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--c-border-focus);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+::selection {
+  background: var(--c-accent-subtle);
+  color: var(--c-text-primary);
+}
+
+/* Thin native scrollbars: this UI has many nested scroll regions. */
+.main,
+.scroll-x,
+.inspector__body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-border-strong) transparent;
+}
+
+/* -----------------------------------------------------------------------------
+   Utilities
+   -------------------------------------------------------------------------- */
+.scroll-x {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  max-width: 100%;
+}
+
+/* Give a long table a height so its sticky head has something to stick to. */
+.scroll-x--tall {
+  max-height: 62vh;
+  overflow-y: auto;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.mono {
+  font: var(--t-mono);
+}
+
+.id {
+  font: var(--t-mono-sm);
+  color: var(--c-text-secondary);
+}
+
+.trunc {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.caption {
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.muted {
+  color: var(--c-text-muted);
+}
+
+.strong {
+  font: var(--t-body-strong);
+}
+
+.footnote {
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+  max-width: 92ch;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  min-width: 0;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  min-width: 0;
+}
+
+.spacer {
+  margin-left: auto;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* -----------------------------------------------------------------------------
+   Shell
+   -------------------------------------------------------------------------- */
+.app {
+  display: grid;
+  grid-template-columns: var(--nav-w) minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+  padding: 20px 16px;
+  background: var(--c-bg-surface);
+  border-right: 1px solid var(--c-border-default);
+  overflow-y: auto;
+}
+
+.nav__brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav__brand strong {
+  font: var(--t-h1);
+  letter-spacing: -0.01em;
+}
+
+.nav__brand span {
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+.nav__group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nav__footer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: auto;
+  padding: 0 10px;
+  overflow-wrap: anywhere;
+}
+
+.nav__footer .btn { align-self: flex-start; margin-top: 6px; }
+
+/* The reference uses the same simple square for each destination. */
+.nav-item__icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  border-radius: 3px;
+  background: currentColor;
+  opacity: .75;
+}
+
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: var(--z-popover);
+  padding: 10px 16px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-surface);
+  transform: translateY(-200%);
+}
+.skip-link:focus { transform: translateY(0); }
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  color: var(--c-text-secondary);
+  font: var(--t-body-strong);
+  text-decoration: none;
+}
+
+.nav-item:hover {
+  background: var(--c-bg-subtle);
+  color: var(--c-text-primary);
+  text-decoration: none;
+}
+
+.nav-item[aria-current="page"] {
+  background: var(--c-accent-subtle);
+  color: var(--c-accent);
+  font: var(--t-body-strong);
+}
+
+.nav-item__count {
+  margin-left: auto;
+  min-width: 22px;
+  padding: 0 var(--s-3);
+  border-radius: 999px;
+  background: var(--c-bg-subtle);
+  color: var(--c-text-secondary);
+  font: var(--t-mono-sm);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.nav-item__count[data-state] {
+  background: var(--st-fill);
+  color: var(--st-ink);
+  border: 1px solid var(--st-line);
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* An inspector is docked, full height, and scrolls on its own. */
+.workspace--split,
+.workspace:has(> .inspector) {
+  grid-template-columns: minmax(0, 1fr) var(--inspector-w);
+}
+
+.main {
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* -----------------------------------------------------------------------------
+   View and panel
+   -------------------------------------------------------------------------- */
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding: 24px 28px;
+}
+
+.view__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-5);
+  min-width: 0;
+}
+
+.view__heading { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+
+.view__title {
+  font: var(--t-h1);
+  letter-spacing: -0.01em;
+}
+
+.view__desc {
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+.view__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+}
+
+.panel {
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-md);
+  box-shadow: var(--e-raised);
+  min-width: 0;
+  /* Never clip: an .infotip popover has to escape its panel. */
+  overflow: visible;
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-5) var(--s-6);
+  border-bottom: 1px solid var(--c-border-default);
+}
+
+.panel__title {
+  font: var(--t-h2);
+}
+
+.panel__meta {
+  margin-left: auto;
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+.panel__body {
+  padding: var(--s-6);
+  min-width: 0;
+}
+
+.panel__body--flush {
+  padding: 0;
+}
+
+.panel__foot {
+  padding: var(--s-4) var(--s-6);
+  border-top: 1px solid var(--c-border-default);
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+.cols {
+  display: grid;
+  gap: var(--s-6);
+  min-width: 0;
+}
+
+.cols--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.cols--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* -----------------------------------------------------------------------------
+   THE STATE MAP. One place. Every component below consumes --st-*.
+   --st-ink      text, glyph and border colour
+   --st-fill     background fill
+   --st-line     border colour, derived from the ink
+   --st-glyph    generated-content glyph
+   --st-texture  background texture; a second, non-colour channel
+   -------------------------------------------------------------------------- */
+
+/* Fail loud: an unmapped value is alarming, not neutral. */
+[data-state],
+[data-verdict] {
+  --st-ink: var(--c-status-fail);
+  --st-fill: transparent;
+  --st-line: var(--c-status-fail);
+  --st-glyph: "?";
+  --st-texture: none;
+  --st-alarm: 2px dashed var(--c-status-fail);
+}
+
+[data-state="ok"],
+[data-verdict="gated_pass"] {
+  --st-ink: var(--c-status-ok);
+  --st-fill: var(--c-status-ok-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-ok) 42%, transparent);
+  --st-glyph: "\2713"; /* check mark */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+/* Ran, but not cleanly. Amber is also the "needs a human" hue, so the held
+   verdict 'inconclusive' shares it. The 45-degree hatch is the second channel:
+   a red-green colourblind reader separates this from 'ok' by texture. */
+[data-state="partial"],
+[data-verdict="inconclusive"] {
+  --st-ink: var(--c-status-partial);
+  --st-fill: var(--c-status-partial-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-partial) 45%, transparent);
+  --st-glyph: "!";
+  --st-texture: repeating-linear-gradient(
+    45deg,
+    color-mix(in srgb, var(--c-status-partial) 22%, transparent) 0 2px,
+    transparent 2px 5px
+  );
+  --st-alarm: 0;
+}
+
+[data-verdict="inconclusive"] {
+  /* NOT "?" — that is this design system's mark for a value it has never been
+     taught (see the unmapped fallback above), and `inconclusive` is a real,
+     known verdict. Sharing the glyph left the two separated only by the alarm
+     outline, a weaker signal than the mark sitting next to it. "\2260" reads as
+     "no conclusive majority"; errors without informative votes can also
+     produce this verdict. */
+  --st-glyph: "\2260"; /* not equal to */
+}
+
+/* The run finished and a whole stage produced nothing. It shares the failure
+   palette because that is what it is, but keeps its own glyph: the cell is
+   reporting the RUN's verdict, not a count this stage recorded. */
+[data-state="degraded"] {
+  --st-ink: var(--c-status-fail);
+  --st-fill: var(--c-status-fail-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-fail) 55%, transparent);
+  --st-glyph: "\2193"; /* downwards arrow */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+/* Ctrl-C or a shutdown. Stale-coloured like `abandoned` — both mean the run
+   stopped without deciding anything — with a glyph that says stopped. */
+[data-state="interrupted"] {
+  --st-ink: var(--c-status-stale);
+  --st-fill: var(--c-status-stale-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-stale) 45%, transparent);
+  --st-glyph: "\25A0"; /* black square */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="failed"],
+[data-state="error"],
+[data-verdict="gated_fail"] {
+  --st-ink: var(--c-status-fail);
+  --st-fill: var(--c-status-fail-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-fail) 55%, transparent);
+  --st-glyph: "\2715"; /* multiplication x */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="running"] {
+  --st-ink: var(--c-status-running);
+  --st-fill: var(--c-status-running-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-running) 45%, transparent);
+  --st-glyph: "\25B6"; /* black right-pointing triangle */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+/* Did not run. Empty and dashed, so absence reads as absence and never as a
+   neutral pass. There is deliberately no glyph and no fill. */
+[data-state="skipped"] {
+  --st-ink: var(--c-status-skipped);
+  --st-fill: var(--c-status-skipped-subtle);
+  --st-line: var(--c-border-strong);
+  --st-glyph: "";
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="abandoned"] {
+  --st-ink: var(--c-status-stale);
+  --st-fill: var(--c-status-stale-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-stale) 45%, transparent);
+  --st-glyph: "\2298"; /* circled division slash */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="budget_exhausted"] {
+  --st-ink: var(--c-status-partial);
+  --st-fill: var(--c-status-partial-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-partial) 45%, transparent);
+  --st-glyph: "\2297"; /* circled times */
+  --st-texture: none;
+  /* A second channel against `refused`, which shares this whole amber palette.
+     The glyph alone is one channel, and one channel is what the audit found
+     collapsing. Dotted here, solid there. */
+  --st-line-style: dotted;
+  --st-alarm: 0;
+}
+
+/* A budget refusal is a recorded outcome with no evaluation verdict.
+   Use a distinct glyph within the shared budget palette, not an unknown-state
+   alarm or a trial-failure treatment. */
+[data-state="refused"] {
+  --st-ink: var(--c-status-partial);
+  --st-fill: var(--c-status-partial-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-partial) 45%, transparent);
+  --st-glyph: "\2296"; /* circled minus: asked, produced nothing */
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="info"],
+[data-verdict="ungated"] {
+  --st-ink: var(--c-status-info);
+  --st-fill: var(--c-status-info-subtle);
+  --st-line: var(--c-border-default);
+  --st-line: color-mix(in srgb, var(--c-status-info) 45%, transparent);
+  --st-glyph: "~";
+  --st-texture: none;
+  --st-alarm: 0;
+}
+
+[data-state="info"] {
+  --st-glyph: "i";
+}
+
+/* -----------------------------------------------------------------------------
+   Status line and banner
+   -------------------------------------------------------------------------- */
+.statusline {
+  font: var(--t-h1);
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--c-text-primary);
+  max-width: 78ch;
+}
+
+.statusline strong {
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.statusline__sub {
+  margin-top: var(--s-3);
+  font: var(--t-body);
+  color: var(--c-text-secondary);
+}
+
+/* Data-as-of / staleness banner. Default tone is neutral; add data-state. */
+.banner {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-4);
+  padding: var(--s-4) var(--s-5);
+  border: 1px solid var(--c-border-default);
+  border-left: 3px solid var(--c-border-strong);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-subtle);
+  color: var(--c-text-primary);
+}
+
+.banner[data-state] {
+  background: var(--st-fill);
+  border-color: var(--st-line);
+  border-left-color: var(--st-ink);
+  outline: var(--st-alarm);
+}
+
+.banner[data-state]::before {
+  content: var(--st-glyph, "");
+  color: var(--st-ink);
+  font: var(--t-body-strong);
+  line-height: 1.45;
+}
+
+.banner__title {
+  font: var(--t-body-strong);
+}
+
+.banner__body {
+  font: var(--t-body);
+  color: var(--c-text-secondary);
+}
+
+/* -----------------------------------------------------------------------------
+   Stat tiles
+   -------------------------------------------------------------------------- */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
+  gap: var(--s-5);
+  min-width: 0;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  min-width: 0;
+  padding: var(--s-5) var(--s-6);
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-md);
+}
+
+.tile[data-state] {
+  border-left: 3px solid var(--st-ink);
+  outline: var(--st-alarm);
+}
+
+.tile__label {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.tile__value {
+  font: var(--t-display);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  color: var(--c-text-primary);
+}
+
+.tile__unit {
+  margin-left: var(--s-2);
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+  letter-spacing: 0;
+}
+
+.tile__sub {
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+.tile__sub[data-state] {
+  color: var(--st-ink);
+}
+
+/* -----------------------------------------------------------------------------
+   Backlog: two rates side by side, never a countdown.
+   -------------------------------------------------------------------------- */
+.rates {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-3) var(--s-5);
+  min-width: 0;
+}
+
+.rate {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+}
+
+.rate__value {
+  font: var(--t-h1);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  color: var(--c-text-primary);
+}
+
+.rate__label {
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.rate__sep {
+  color: var(--c-text-muted);
+  user-select: none;
+}
+
+.rate--net .rate__value,
+.rate--net .rate__label {
+  color: var(--st-ink, var(--c-text-primary));
+}
+
+.rate--net .rate__value::before {
+  content: var(--st-glyph, "");
+  margin-right: var(--s-2);
+  font: var(--t-body-strong);
+  vertical-align: 1px;
+}
+
+/* The race: arrivals against mine capacity, both on the accent hue so the
+   comparison is about length, not colour. */
+.race {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-3) var(--s-5);
+  margin-top: var(--s-5);
+  min-width: 0;
+}
+
+.race__label {
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.race__value {
+  font: var(--t-mono-sm);
+  color: var(--c-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--c-bg-subtle);
+  border: 1px solid var(--c-border-default);
+  overflow: hidden;
+}
+
+.meter__fill {
+  display: block;
+  height: 100%;
+  width: calc(var(--pct, 0) * 1%);
+  background: var(--c-accent);
+}
+
+.meter__fill--capacity {
+  background: color-mix(in srgb, var(--c-accent) 38%, transparent);
+}
+
+/* -----------------------------------------------------------------------------
+   Run x stage grid. Rows are stages, columns are nights. One cell per night,
+   showing that night's WORST outcome across however many runs it holds.
+   Markup: <div class="scroll-x"><table class="run-grid"> ... </table></div>
+   -------------------------------------------------------------------------- */
+.run-grid {
+  border-collapse: separate;
+  border-spacing: var(--cell-gap);
+  table-layout: fixed;
+  /* max-content, never 100%. A table left to fill its container compresses
+     its columns instead of overflowing: measured at 60 nights the cells fell
+     from 26px to 15.1px and the .scroll-x never scrolled. The grid must look
+     the same at 2 columns and at 90, so it keeps its natural width and lets
+     the .scroll-x wrapper scroll. */
+  width: max-content;
+}
+
+.run-grid th,
+.run-grid td {
+  padding: 0;
+}
+
+.run-grid__corner,
+.run-grid__stage {
+  position: sticky;
+  left: 0;
+  z-index: var(--z-sticky);
+  width: 108px;
+  padding-right: var(--s-5);
+  text-align: left;
+  background: var(--c-bg-surface);
+  /* A rule line, so the scrolled cells do not slide up against the labels. */
+  border-right: 1px solid var(--c-border-default);
+  font: var(--t-h3);
+  color: var(--c-text-secondary);
+  white-space: nowrap;
+}
+
+.run-grid__stage {
+  font: var(--t-body);
+  color: var(--c-text-primary);
+}
+
+.run-grid__night {
+  width: var(--cell);
+  font: var(--t-mono-sm);
+  color: var(--c-text-secondary);
+  font-weight: 400;
+  line-height: 1.15;
+  vertical-align: bottom;
+  padding-bottom: var(--s-2);
+}
+
+.run-grid__mon {
+  display: block;
+  color: var(--c-text-muted);
+  font-size: 9px;
+}
+
+.run-grid__day {
+  display: block;
+  color: var(--c-text-secondary);
+}
+
+/* A night that holds more than one run says so, because the cell shows the
+   worst of them. Give the markup a title ("6 runs"): the bare number is
+   ambiguous on its own. The fixed height keeps the day numbers aligned across
+   columns even when a night holds exactly one run and this line is empty. */
+.run-grid__runs {
+  display: block;
+  height: 11px;
+  font-size: 9px;
+  line-height: 11px;
+  color: var(--c-text-muted);
+}
+
+.cell {
+  width: var(--cell);
+  height: var(--cell);
+  border-radius: var(--r-sm);
+  /* Fallbacks on every --st-* consumer. Without them a cell that reaches this
+     class with no [data-state] renders as nothing at all — transparent fill,
+     currentColor border, no outline — which is a silent failure in the one
+     place this design system is meant to alarm. The fallbacks are the unmapped
+     treatment, so a stateless cell shouts instead of disappearing. */
+  background-color: var(--st-fill, transparent);
+  background-image: var(--st-texture, none);
+  border: 1px var(--st-line-style, solid) var(--st-line, var(--c-status-fail));
+  outline: var(--st-alarm, dashed 2px var(--c-status-fail));
+  color: var(--st-ink, var(--c-status-fail));
+  text-align: center;
+  vertical-align: middle;
+  line-height: 1;
+  cursor: default;
+}
+
+.cell::before {
+  content: var(--st-glyph, "");
+  font: var(--t-body-strong);
+  font-size: 12px;
+  line-height: var(--cell);
+}
+
+/* Did not run: dashed and empty. */
+.cell[data-state="skipped"] {
+  border-style: dashed;
+  background-color: transparent;
+}
+
+/* A failure is the one state that also carries extra weight. */
+/* 1.5px rounded away to 1px at DPR 1 — measured in Chrome, a failed cell and
+   an ok cell both reported "1px" — so the extra weight this rule claims to
+   carry was never drawn on a standard display. */
+.cell[data-state="failed"],
+.cell[data-state="error"] {
+  border-width: 2px;
+}
+
+/* Runs this cell's colour does not show. The colour is the worst RECORDED
+   outcome, so a run that never reported completion can sit inside a cell drawn
+   `ok` when the same night also holds finished runs. The corner wedge is the
+   second channel that says so; the tooltip names the count and the statuses. */
+.cell[data-hidden-runs] {
+  position: relative;
+}
+
+.cell[data-hidden-runs]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 0;
+  height: 0;
+  border-top: 6px solid var(--c-status-running);
+  border-left: 6px solid transparent;
+  border-top-right-radius: var(--r-sm);
+}
+
+.cell[title] {
+  cursor: help;
+}
+
+/* Numbers are off by default (90 columns must stay readable) and revealed by
+   putting .run-grid--numbers on the table. */
+.cell__n {
+  display: none;
+  font: var(--t-mono-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.run-grid--numbers {
+  --cell: 52px;
+}
+
+/* The glyph STAYS in numbers mode. Hiding it left `ok` and `failed` separated
+   by hue alone — the exact pair a red-green colourblind reader cannot tell
+   apart — and made `refused` and `budget_exhausted` render pixel-identically,
+   since the glyph was their only difference. Both contradict tokens.css's
+   "COLOUR IS NEVER THE ONLY CHANNEL". Found 2026-08-23 by audit, measured in
+   Chrome: ok and failed both came back with glyphDisplay "none", no texture
+   and an identical 1px solid border.
+   The cell is 52px wide in this mode, so the glyph sits as a small corner mark
+   above the number rather than competing with it. */
+.run-grid--numbers .cell::before {
+  display: block;
+  position: absolute;
+  top: 1px;
+  right: 2px;
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.75;
+}
+
+.run-grid--numbers .cell {
+  position: relative;
+}
+
+.run-grid--numbers .cell__n {
+  display: block;
+  line-height: var(--cell);
+  color: var(--st-ink);
+}
+
+.run-grid--numbers .run-grid__night {
+  font-size: 11px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3) var(--s-6);
+  margin-top: var(--s-5);
+}
+
+.legend__item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background-color: var(--st-fill, transparent);
+  background-image: var(--st-texture, none);
+  border: 1px var(--st-line-style, solid) var(--st-line, var(--c-status-fail));
+  color: var(--st-ink, var(--c-status-fail));
+  text-align: center;
+  line-height: 12px;
+  font-size: 9px;
+}
+
+.swatch::before {
+  content: var(--st-glyph, "");
+}
+
+.swatch[data-state="skipped"] {
+  border-style: dashed;
+}
+
+/* -----------------------------------------------------------------------------
+   Data tables. Numeric columns are right-aligned with tabular figures, and so
+   are their headers.
+   -------------------------------------------------------------------------- */
+.data {
+  width: 100%;
+  border-collapse: collapse;
+  font: var(--t-body);
+}
+
+/* A table whose columns must not compress opts into .data--wide and scrolls
+   inside its .scroll-x wrapper instead. Plain .data wraps its text columns,
+   which is the right default: max-content on a column of rule text produces
+   an absurdly wide table. */
+.data--wide {
+  min-width: max-content;
+}
+
+/* The current Rules table has seven columns. With an inspector open, let
+   its existing scroll region carry those columns instead of crushing the
+   rule into one word per line. All content remains reachable. */
+.data--wrap { min-width: 920px; }
+
+.data th {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  padding: 9px 12px;
+  background: var(--c-bg-subtle);
+  border-bottom: 1px solid var(--c-border-default);
+  font: var(--t-h3);
+  color: var(--c-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+/* An absolute file path has no break opportunities, so auto table layout gave
+   the Target column nearly twice the width of the rule text and pushed a Rules
+   row to 393px tall with the inspector open. `.field__value` already sets this
+   for the same reason; the pattern existed and was not applied here. */
+.data td.mono {
+  overflow-wrap: anywhere;
+  /* ...but not to the point of one path segment per line. A floor keeps the
+     path readable while still letting it break rather than pushing the rule
+     text out of the way. */
+  min-width: 18ch;
+}
+
+/* The rule text is what the reader came for. Give it a floor so a path can
+   never win the negotiation, and a ceiling so it does not crush the path. */
+.data--wrap th:first-child,
+.data--wrap td:first-child {
+  width: 38%;
+}
+
+.data td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--c-border-default);
+  vertical-align: middle;
+}
+
+.data--wrap td {
+  vertical-align: top;
+}
+
+.data th.num,
+.data td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  white-space: nowrap;
+}
+
+.data tbody tr:hover {
+  background: var(--c-bg-subtle);
+}
+
+.data--zebra tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--c-bg-subtle) 55%, transparent);
+}
+
+.data tbody tr[aria-selected="true"] {
+  background: var(--c-accent-subtle);
+  box-shadow: inset 2px 0 0 0 var(--c-accent);
+}
+
+.data tbody tr[aria-selected="true"]:hover {
+  background: var(--c-accent-subtle);
+}
+
+.data th[aria-sort] {
+  cursor: pointer;
+  user-select: none;
+}
+
+.data th[aria-sort]::after {
+  content: "\2195"; /* up-down arrow */
+  margin-left: var(--s-2);
+  color: var(--c-text-muted);
+}
+
+.data th[aria-sort="ascending"]::after {
+  content: "\25B4";
+  color: var(--c-text-primary);
+}
+
+.data th[aria-sort="descending"]::after {
+  content: "\25BE";
+  color: var(--c-text-primary);
+}
+
+.data caption {
+  padding: var(--s-4) var(--s-5);
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+  text-align: left;
+}
+
+/* -----------------------------------------------------------------------------
+   Search — the entry point of the Rules view, not a filter chip.
+   -------------------------------------------------------------------------- */
+.search {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  height: 32px;
+  padding: 0 var(--s-5);
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  min-width: 0;
+}
+
+.search:focus-within {
+  border-color: var(--c-border-focus);
+  box-shadow: 0 0 0 2px var(--c-accent-subtle);
+}
+
+.search__glyph {
+  color: var(--c-text-muted);
+  flex: 0 0 auto;
+}
+
+.search__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--c-text-primary);
+  font: var(--t-body);
+}
+
+.search__input::placeholder {
+  color: var(--c-text-muted);
+}
+
+.search__input:focus {
+  outline: none;
+}
+
+.search__meta {
+  flex: 0 0 auto;
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 var(--s-2);
+  border: 1px solid var(--c-border-default);
+  border-bottom-width: 2px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-subtle);
+  color: var(--c-text-secondary);
+  font: var(--t-mono-sm);
+  text-align: center;
+}
+
+/* -----------------------------------------------------------------------------
+   Inspector — progressive disclosure lives here.
+   -------------------------------------------------------------------------- */
+.inspector {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--c-bg-surface-raised);
+  border-left: 1px solid var(--c-border-default);
+}
+
+.inspector__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-5) var(--s-6);
+  border-bottom: 1px solid var(--c-border-default);
+}
+
+.inspector__title {
+  font: var(--t-h2);
+  min-width: 0;
+}
+
+.inspector__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-5) var(--s-6) var(--s-8);
+}
+
+.section {
+  padding: var(--s-5) 0;
+  border-top: 1px solid var(--c-border-default);
+}
+
+.section:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.section__title {
+  font: var(--t-h3);
+  color: var(--c-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: var(--s-4);
+}
+
+.field {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: var(--s-2) var(--s-5);
+  padding: var(--s-3) 0;
+}
+
+/* A unified diff. Monospace, its own horizontal scroll container so a long
+   line never widens the page, and +/- lines carry the status ink so an add and
+   a delete are not separated by colour alone. */
+.diff {
+  font: var(--t-mono-sm);
+  background: var(--c-bg-subtle);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  padding: var(--s-3) var(--s-4);
+  margin: var(--s-2) 0 0;
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.field--stack {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.field__label {
+  font: var(--t-caption);
+  color: var(--c-text-secondary);
+}
+
+.field__value {
+  font: var(--t-body);
+  color: var(--c-text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--s-2) var(--s-5);
+  font: var(--t-mono-sm);
+  color: var(--c-text-secondary);
+}
+
+/* -----------------------------------------------------------------------------
+   Failure panel — plain-language names, and fixed classes stay visible but quiet.
+   -------------------------------------------------------------------------- */
+.failures {
+  display: flex;
+  flex-direction: column;
+}
+
+.failure {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--s-2) var(--s-5);
+  padding: var(--s-4) 0;
+  border-bottom: 1px solid var(--c-border-default);
+}
+
+.failure:last-child {
+  border-bottom: 0;
+}
+
+.failure__name {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  font: var(--t-body);
+  color: var(--c-text-primary);
+  min-width: 0;
+}
+
+.failure__count {
+  font: var(--t-body-strong);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.failure__note {
+  grid-column: 1 / -1;
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+}
+
+/* Muted, not faded: the text keeps its contrast. */
+.failure--fixed .failure__name,
+.failure--fixed .failure__count {
+  color: var(--c-text-muted);
+  font-weight: 400;
+}
+
+/* -----------------------------------------------------------------------------
+   Trend matrix — one row per signal type, months as columns, each row scaled
+   to its own peak. Small multiples in one hue; deliberately not a stacked
+   chart with a categorical palette.
+   -------------------------------------------------------------------------- */
+.matrix {
+  border-collapse: collapse;
+  font: var(--t-caption);
+}
+
+.matrix th {
+  font: var(--t-h3);
+  color: var(--c-text-secondary);
+  text-align: left;
+  padding: var(--s-2) var(--s-4);
+  white-space: nowrap;
+}
+
+.matrix td {
+  padding: var(--s-1) var(--s-2);
+  vertical-align: bottom;
+}
+
+.matrix__row-label {
+  text-align: left;
+  color: var(--c-text-primary);
+  padding-right: var(--s-5);
+}
+
+.spark {
+  display: flex;
+  align-items: flex-end;
+  width: 30px;
+  height: 28px;
+  background: var(--c-bg-subtle);
+  border-radius: 2px;
+}
+
+.spark__bar {
+  display: block;
+  width: 100%;
+  min-height: 1px;
+  height: calc(var(--v, 0) * 1%);
+  background: var(--c-accent);
+  border-radius: 2px;
+}
+
+/* -----------------------------------------------------------------------------
+   Atoms: badge, dot, chip, button, tabs, infotip
+   -------------------------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 1px var(--s-3);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-subtle);
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+  white-space: nowrap;
+}
+
+.badge[data-state],
+.badge[data-verdict] {
+  background: var(--st-fill);
+  border-color: var(--st-line);
+  color: var(--st-ink);
+  outline: var(--st-alarm);
+}
+
+.badge[data-state]::before,
+.badge[data-verdict]::before {
+  content: var(--st-glyph, "");
+  font-weight: 700;
+}
+
+.badge[data-state="skipped"] {
+  border-style: dashed;
+}
+
+.badge--lg {
+  padding: var(--s-2) var(--s-4);
+  font: var(--t-body-strong);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--st-ink, var(--c-text-muted));
+  border: 1px solid var(--st-line, var(--c-border-strong));
+  vertical-align: 0;
+}
+
+.dot[data-state="skipped"] {
+  background: transparent;
+  border-style: dashed;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 1px var(--s-3);
+  border: 1px solid var(--c-border-default);
+  border-radius: 999px;
+  background: var(--c-bg-surface);
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+  white-space: nowrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: 28px;
+  padding: 0 var(--s-5);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-surface);
+  color: var(--c-text-primary);
+  font: var(--t-body-strong);
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: var(--c-bg-subtle);
+}
+
+.btn--primary {
+  background: var(--c-accent);
+  border-color: var(--c-accent);
+  color: var(--c-text-inverse);
+}
+
+.btn--primary:hover {
+  background: var(--c-accent-hover);
+  border-color: var(--c-accent-hover);
+}
+
+.btn--quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--c-text-secondary);
+}
+
+.btn--quiet:hover {
+  background: var(--c-bg-subtle);
+  color: var(--c-text-primary);
+}
+
+.btn[disabled] {
+  color: var(--c-text-muted);
+  background: var(--c-bg-subtle);
+  border-color: var(--c-border-default);
+  cursor: not-allowed;
+}
+
+.tabs {
+  display: flex;
+  gap: var(--s-2);
+  border-bottom: 1px solid var(--c-border-default);
+}
+
+.tab {
+  padding: var(--s-3) var(--s-4);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--c-text-primary);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--c-text-primary);
+  border-bottom-color: var(--c-accent);
+  font: var(--t-body-strong);
+}
+
+/* A (?) whose popover explains a term in plain language. No ancestor of an
+   .infotip may set overflow:hidden, or the popover is clipped. */
+.infotip {
+  position: relative;
+  display: inline-flex;
+}
+
+.infotip__btn {
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--c-text-secondary);
+  font: var(--t-mono-sm);
+  line-height: 13px;
+  cursor: help;
+}
+
+.infotip__btn:hover {
+  color: var(--c-text-primary);
+  border-color: var(--c-text-secondary);
+}
+
+.infotip__pop {
+  display: none;
+  position: absolute;
+  top: calc(100% + var(--s-3));
+  left: 0;
+  z-index: var(--z-popover);
+  width: 300px;
+  padding: var(--s-5);
+  background: var(--c-bg-surface-raised);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-lg);
+  box-shadow: var(--e-popover);
+  font: var(--t-body);
+  color: var(--c-text-primary);
+  text-align: left;
+  white-space: normal;
+}
+
+.infotip[data-open="true"] .infotip__pop,
+.infotip:focus-within .infotip__pop {
+  display: block;
+}
+
+/* -----------------------------------------------------------------------------
+   Designed states. This product has several empty states that are TRUE
+   answers, not failures: a gap the pipeline cannot fill yet, or an inbox that
+   is legitimately clear. They must look intentional.
+   -------------------------------------------------------------------------- */
+.empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-7);
+  border: 1px dashed var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: transparent;
+}
+
+.empty[data-state] {
+  border-color: var(--st-ink);
+  background: var(--st-fill);
+  outline: var(--st-alarm);
+}
+
+.empty__glyph {
+  font: var(--t-body-strong);
+  font-size: 15px;
+  color: var(--c-text-muted);
+}
+
+.empty[data-state] .empty__glyph {
+  color: var(--st-ink);
+}
+
+/* With no data-state the glyph slot falls back to the em dash, the same
+   mark .novalue uses for "there is no value here". */
+.empty__glyph:empty::before {
+  content: var(--st-glyph, "\2014");
+}
+
+.empty__title {
+  font: var(--t-body-strong);
+  color: var(--c-text-primary);
+}
+
+.empty__body {
+  font: var(--t-body);
+  color: var(--c-text-secondary);
+  max-width: 62ch;
+}
+
+/* WHY it is empty, and what would fill it. Never omit this. */
+.empty__reason {
+  font: var(--t-caption);
+  color: var(--c-text-muted);
+  max-width: 72ch;
+}
+
+.empty--inline {
+  padding: var(--s-5);
+}
+
+/* A value that does not exist. NEVER use this for a real zero: rendering 0
+   would assert "measured, and it is nothing". */
+.novalue {
+  color: var(--c-text-muted);
+  font-variant-numeric: normal;
+}
+
+.novalue[title] {
+  border-bottom: 1px dotted var(--c-border-strong);
+  cursor: help;
+}
+
+.loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  padding: var(--s-6);
+}
+
+.loading__bar {
+  height: 10px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-subtle);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.loading__bar:nth-child(2) {
+  width: 72%;
+}
+
+.loading__bar:nth-child(3) {
+  width: 46%;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.error-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-6);
+  border: 1px solid var(--c-status-fail);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  background: var(--c-status-fail-subtle);
+  color: var(--c-text-primary);
+}
+
+.error-state__detail {
+  font: var(--t-mono-sm);
+  color: var(--c-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   V3 · Review queue — the only view that writes.
+
+   The card leads with WHY it needs a person, because that is the question the
+   operator is answering (PRD §7 V3). The rule text is second and larger; the
+   diff is last and monospaced. Approve and Reject are the same size and weight
+   on purpose: making Approve the prettier button is how a review queue turns
+   into a rubber stamp.
+   -------------------------------------------------------------------------- */
+
+.view__count {
+  color: var(--c-text-muted);
+  font: var(--t-h2);
+  margin-left: var(--s-2);
+}
+
+.view__sub {
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  margin: var(--s-2) 0 0;
+  max-width: 60ch;
+}
+
+.review-card {
+  border-bottom: 1px solid var(--c-border-default);
+  padding: var(--s-4);
+}
+
+.review-card:last-child {
+  border-bottom: 0;
+}
+
+.review-card--selected {
+  background: var(--c-bg-subtle);
+  box-shadow: inset 3px 0 0 var(--c-accent);
+}
+
+.review-card__why {
+  color: var(--c-status-partial);
+  font: var(--t-body-strong);
+  margin: 0 0 var(--s-2);
+}
+
+.review-card__rule {
+  font: var(--t-h3);
+  margin: 0 0 var(--s-2);
+}
+
+.review-card__reason {
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  margin: var(--s-2) 0;
+  max-width: 70ch;
+}
+
+.review-card__proposals,
+.review-card__targets {
+  list-style: none;
+  margin: var(--s-2) 0;
+  padding: 0;
+}
+
+.review-card__targets {
+  color: var(--c-text-muted);
+  font: var(--t-caption);
+}
+
+.review-proposal {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  padding: var(--s-1) 0;
+}
+
+.review-proposal__why {
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+}
+
+.review-card__diff {
+  background: var(--c-bg-subtle);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  font: var(--t-mono-sm);
+  margin: var(--s-3) 0;
+  max-height: 18rem;
+  overflow: auto;
+  padding: var(--s-3);
+  white-space: pre;
+}
+
+.review-card__actions {
+  display: flex;
+  gap: var(--s-3);
+  margin-top: var(--s-3);
+}
+
+.btn--approve,
+.btn--reject {
+  background: var(--c-bg-surface-raised);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-sm);
+  color: var(--c-text-primary);
+  cursor: pointer;
+  font: var(--t-body-strong);
+  padding: var(--s-2) var(--s-4);
+}
+
+.btn--approve:hover {
+  background: var(--c-status-ok-subtle);
+  border-color: var(--c-status-ok);
+}
+
+.btn--reject:hover {
+  background: var(--c-status-fail-subtle);
+  border-color: var(--c-status-fail);
+}
+
+.btn--approve:focus-visible,
+.btn--reject:focus-visible {
+  outline: 2px solid var(--c-border-focus);
+  outline-offset: 2px;
+}
+
+/* D1: the Rules inspector's one way into the review queue. A link, never a
+   button — this view does not mutate. */
+.review-link {
+  color: var(--c-accent);
+  font: var(--t-body-strong);
+  text-decoration: none;
+}
+
+.review-link:hover {
+  text-decoration: underline;
+}
+
+/* Review families use one open card with expandable evidence and edits.
+   Compact rows keep the other families available for selection.
+   Every color uses a theme token. */
+
+.review-layout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-6);
+}
+
+.review-card--open {
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-bottom: 1px solid var(--c-border-default);
+  border-radius: var(--r-lg);
+  box-shadow: none;
+  overflow: hidden;
+  padding: 0;
+}
+
+/* The lead line. Tinted by the REASON, so the two situations the operator
+   most often confuses -- "no eval ran" and "an eval ran and failed" -- do not
+   look identical at a glance. */
+.review-card__why {
+  align-items: baseline;
+  background: var(--c-status-info-subtle);
+  border-bottom: 1px solid var(--c-border-default);
+  color: var(--c-status-info);
+  display: flex;
+  flex-wrap: wrap;
+  font: var(--t-body);
+  gap: var(--s-2);
+  margin: 0;
+  padding: var(--s-4) var(--s-6);
+}
+
+.review-card__why-label {
+  font: var(--t-body-strong);
+}
+
+.review-card__why--pending,
+.review-card__why--ungated {
+  background: var(--c-status-partial-subtle);
+  color: var(--c-status-partial);
+}
+
+.review-card__why--gated_fail {
+  background: var(--c-status-fail-subtle);
+  color: var(--c-status-fail);
+}
+
+.review-card__why--inconclusive {
+  background: var(--c-status-partial-subtle);
+  color: var(--c-status-partial);
+}
+
+.review-card__why--held,
+.review-card__why--gated_pass {
+  background: var(--c-status-info-subtle);
+  color: var(--c-status-info);
+}
+
+.review-card__why--convert_to_hook,
+.review-card__why--delete_human_line,
+.review-card__why--resolve_rollback,
+.review-card__why--reapply,
+.review-card__why--recover_rule {
+  background: var(--c-status-stale-subtle);
+  color: var(--c-status-stale);
+}
+
+.review-card__body {
+  padding: var(--s-6);
+}
+
+.review-card--open .review-card__rule {
+  font: var(--t-h2);
+  margin: 0 0 var(--s-4);
+}
+
+.review-card__evidence {
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  margin: 0 0 var(--s-2);
+}
+
+.review-card__summary,
+.review-card__means,
+.review-card__eval {
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  margin: 0 0 var(--s-3);
+  /* No max-width. Capping prose at 78ch while the targets table and budget bar
+     beside it ran the full card width made the card look ragged and broken --
+     visible only by rendering it, which is why AGENTS.md says to. */
+}
+
+/* The eval's own sentence reads as evidence, so it gets the surface the diff
+   used to occupy: bordered, quiet, and impossible to mistake for our prose. */
+.review-card__eval {
+  background: var(--c-bg-subtle);
+  border-left: 3px solid var(--c-border-strong);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  color: var(--c-text-primary);
+  max-width: none;
+  padding: var(--s-4) var(--s-5);
+}
+
+.review-card__eval--never_reproduced,
+.review-card__eval--both_arms_failed,
+.review-card__eval--no_trial_ran {
+  border-left-color: var(--c-status-partial);
+}
+
+.review-card__eval--tested {
+  border-left-color: var(--c-status-ok);
+}
+
+.review-card__eval--no_arms {
+  border-left-color: var(--c-status-skipped);
+}
+
+.review-card__eval--unknown_outcome {
+  border-left-color: var(--c-status-stale);
+}
+
+.review-card__eval-split {
+  color: var(--c-status-partial);
+  font: var(--t-body);
+  margin: 0 0 var(--s-3);
+}
+
+/* Targets: which files, and how many proposals collapse into each. */
+.review-targets {
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-md);
+  margin: var(--s-5) 0;
+  overflow: hidden;
+}
+
+.review-targets__head {
+  background: var(--c-bg-subtle);
+  border-bottom: 1px solid var(--c-border-default);
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+  margin: 0;
+  padding: var(--s-3) var(--s-5);
+  text-transform: uppercase;
+}
+
+.review-targets__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.review-target {
+  align-items: baseline;
+  border-bottom: 1px solid var(--c-border-default);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-4);
+  padding: var(--s-3) var(--s-5);
+}
+
+.review-target:last-child {
+  border-bottom: 0;
+}
+
+.review-target__path {
+  font: var(--t-mono-sm);
+}
+
+.review-target__count {
+  color: var(--c-accent);
+  font: var(--t-body-strong);
+}
+
+.review-target__note {
+  color: var(--c-text-muted);
+  font: var(--t-caption);
+}
+
+/* Line budget. Drawn only where a budget is DECLARED. */
+.review-budget {
+  align-items: center;
+  background: var(--c-bg-subtle);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-4);
+  margin: var(--s-5) 0;
+  padding: var(--s-4) var(--s-5);
+}
+
+.review-budget--over {
+  background: var(--c-status-partial-subtle);
+}
+
+.review-budget--error {
+  background: var(--c-status-partial-subtle);
+  color: var(--c-status-partial);
+  display: block;
+}
+
+.review-budget__label {
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+  text-transform: uppercase;
+}
+
+.review-budget__track {
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-sm);
+  display: inline-block;
+  height: 8px;
+  overflow: hidden;
+  width: 180px;
+}
+
+.review-budget__fill {
+  background: var(--c-accent);
+  display: block;
+  height: 100%;
+}
+
+.review-budget--over .review-budget__fill {
+  background: var(--c-status-partial);
+}
+
+.review-budget__text {
+  color: var(--c-text-secondary);
+  font: var(--t-caption);
+}
+
+/* Disclosures: the evidence and the diff, opened on demand. */
+.review-disclose {
+  border-top: 1px solid var(--c-border-default);
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+}
+
+.review-disclose > summary {
+  color: var(--c-accent);
+  cursor: pointer;
+  font: var(--t-body-strong);
+}
+
+.review-disclose > summary:focus-visible {
+  outline: 2px solid var(--c-border-focus);
+  outline-offset: 2px;
+}
+
+.review-incidents {
+  list-style: none;
+  margin: var(--s-4) 0 0;
+  padding: 0;
+}
+
+.review-incident {
+  border-left: 2px solid var(--c-border-default);
+  margin-bottom: var(--s-5);
+  padding-left: var(--s-5);
+}
+
+.review-incident__meta {
+  color: var(--c-text-muted);
+  display: block;
+  font: var(--t-caption);
+  margin-bottom: var(--s-2);
+}
+
+.review-incident__text {
+  background: var(--c-bg-subtle);
+  border-radius: var(--r-sm);
+  font: var(--t-mono-sm);
+  margin: 0;
+  max-height: 12rem;
+  overflow: auto;
+  padding: var(--s-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.review-card__consequence {
+  margin-top: var(--s-3);
+}
+
+.review-card__decided {
+  color: var(--c-status-ok);
+  font: var(--t-body-strong);
+  margin: var(--s-4) 0 0;
+}
+
+/* Lower half: what is next, and what can never auto-apply. */
+.review-lower {
+  display: grid;
+  gap: var(--s-6);
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+}
+
+@media (max-width: 900px) {
+  .review-lower {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.review-next,
+.review-carveouts {
+  background: var(--c-bg-surface);
+  border: 1px solid var(--c-border-default);
+  border-radius: var(--r-lg);
+  padding: var(--s-6);
+}
+
+.review-next h3,
+.review-carveouts h3 {
+  font: var(--t-h3);
+  margin: 0 0 var(--s-2);
+}
+
+.review-carveouts p {
+  color: var(--c-text-secondary);
+  font: var(--t-body);
+  margin: 0 0 var(--s-4);
+}
+
+.review-next__list,
+.review-carveouts__list {
+  list-style: none;
+  margin: var(--s-4) 0 0;
+  padding: 0;
+}
+
+.review-carveouts__list li {
+  align-items: center;
+  color: var(--c-text-secondary);
+  display: flex;
+  font: var(--t-body);
+  gap: var(--s-3);
+  padding: var(--s-2) 0;
+}
+
+.review-carveouts__list .dot {
+  background: var(--c-status-ok);
+  border-radius: 50%;
+  height: 6px;
+  width: 6px;
+}
+
+.review-row {
+  border-top: 1px solid var(--c-border-default);
+}
+
+.review-row:first-child {
+  border-top: 0;
+}
+
+.review-row__open {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  display: block;
+  padding: var(--s-4) var(--s-2);
+  text-align: left;
+  width: 100%;
+}
+
+.review-row__open:hover {
+  background: var(--c-bg-subtle);
+}
+
+.review-row__open:focus-visible {
+  outline: 2px solid var(--c-border-focus);
+  outline-offset: -2px;
+}
+
+.review-row__rule {
+  color: var(--c-text-primary);
+  display: block;
+  font: var(--t-body-strong);
+  margin-bottom: var(--s-2);
+}
+
+.review-row__meta {
+  color: var(--c-text-muted);
+  display: block;
+  font: var(--t-caption);
+}
+
+.review-row--selected .review-row__open {
+  box-shadow: inset 3px 0 0 var(--c-accent);
+}
+
+.review-breakdown {
+  border-top: 1px solid var(--c-border-default);
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+}
+
+/* Durable delivery results use the same Review surface and disclosures. */
+#review-delivery { margin-top: 24px; }
+.delivery-command { border-top: 1px solid var(--c-border-default); padding: 18px 0; }
+.delivery-command:first-child { border-top: 0; }
+.delivery-command > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.delivery-command h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.delivery-command h4 { margin: 16px 0 8px; font-size: 12px; }
+.delivery-command details { margin: 10px 0; }
+.delivery-command summary { cursor: pointer; color: var(--c-accent); }
+.delivery-targets { padding-left: 18px; }
+.delivery-targets li { padding: 10px 0; }
+.delivery-targets p { margin: 6px 0; }
+.delivery-path { overflow-wrap: anywhere; }
+.delivery-actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.delivery-error { color: var(--c-status-fail); overflow-wrap: anywhere; }
+
+/* The exposure inspector keeps UTC intervals and long version identities readable. */
+.exposure-form { display: grid; gap: 12px; margin-bottom: 24px; }
+.exposure-form label { display: grid; gap: 6px; min-width: 0; font: var(--t-caption); }
+.exposure-form input, .exposure-form select {
+  box-sizing: border-box; width: 100%; min-width: 0; padding: 8px;
+  color: var(--c-text-primary); background: var(--c-bg-surface); border: 1px solid var(--c-border-strong);
+  border-radius: 6px; font: inherit;
+}
+.exposure-form input:focus-visible, .exposure-form select:focus-visible { outline: 2px solid var(--c-border-focus); outline-offset: 2px; }
+
+.inspector__body summary { cursor: pointer; overflow-wrap: anywhere; }

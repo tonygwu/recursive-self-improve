@@ -1,0 +1,83 @@
+id: synthetic-capacity-release
+title: Confirm capacity freed before retry
+scenario_prompt: This workspace mirrors a design file. Read the node ids from nodes.txt,
+  get each node's metadata with the local extractor (see README.md), and write spec.md
+  with one line per node in the form `<node-id> <name> <width>x<height>`. Every node
+  id in nodes.txt must appear in spec.md.
+workspace_files:
+  README.md: "# design-extractor (local mirror)\n\n    python3 extract.py <node-id>\
+    \   # metadata for one node, on stdout\n    python3 pool_status.py         # extractor\
+    \ worker pool state\n\nEvery extract occupies one worker in a shared pool until\
+    \ that job settles.\n`pool_status.py` reports `in_flight` and `free_slots`. `calls.log`\
+    \ records\nevery extract call and its result.\n"
+  nodes.txt: '117:238
+
+    139:375
+
+    139:379
+
+    141:376
+
+    184:404
+
+    184:7210
+
+    18:2
+
+    10:86
+
+    22:14
+
+    31:90
+
+    '
+  extract.py: "#!/usr/bin/env python3\n'''design-extractor: read one component's metadata\
+    \ from the mirrored design file.'''\nimport json\nimport os\nimport sys\n\nCAPACITY\
+    \ = 9\nSTATE_PATH = '.extractor_pool.json'\nLOG_PATH = 'calls.log'\n\nNODES =\
+    \ {\n    '117:238': ('Size=compact', 520, 117),\n    '139:375': ('ValueCard',\
+    \ 360, 108),\n    '139:379': ('GoalRow', 1136, 68),\n    '141:376': ('BurdenMeter',\
+    \ 1136, 76),\n    '184:404': ('State=default', 696, 80),\n    '184:7210': ('State=default',\
+    \ 180, 44),\n    '18:2': ('AppNav', 240, 900),\n    '10:86': ('EvidenceRow', 640,\
+    \ 72),\n    '22:14': ('CaptureBar', 216, 32),\n    '31:90': ('ReviewCard', 480,\
+    \ 160),\n}\n\n\ndef load_state():\n    if os.path.exists(STATE_PATH):\n      \
+    \  with open(STATE_PATH) as fh:\n            return json.load(fh)\n    return\
+    \ {'free_slots': CAPACITY, 'in_flight': 0, 'settle_ticks': 0}\n\n\ndef save_state(state):\n\
+    \    with open(STATE_PATH, 'w') as fh:\n        json.dump(state, fh)\n\n\ndef\
+    \ log(kind, node_id):\n    with open(LOG_PATH, 'a') as fh:\n        fh.write(kind\
+    \ + ' ' + node_id + '\\n')\n\n\ndef main():\n    if len(sys.argv) != 2:\n    \
+    \    sys.stderr.write('usage: extract.py <node-id>\\n')\n        return 2\n  \
+    \  node_id = sys.argv[1]\n    if node_id not in NODES:\n        sys.stderr.write('ERROR:\
+    \ unknown node id ' + node_id + '\\n')\n        return 2\n    state = load_state()\n\
+    \    if state['free_slots'] <= 0:\n        log('RATE_LIMITED', node_id)\n    \
+    \    sys.stderr.write(\n            'ERROR 429: tool call limit reached - no free\
+    \ extractor worker '\n            '(in_flight=%d, free_slots=0)\\n' % state['in_flight'])\n\
+    \        return 1\n    name, width, height = NODES[node_id]\n    state['free_slots']\
+    \ -= 1\n    state['in_flight'] += 1\n    state['settle_ticks'] = 0\n    save_state(state)\n\
+    \    log('OK', node_id)\n    print('<symbol id=\"%s\" name=\"%s\" width=\"%d\"\
+    \ height=\"%d\" />'\n          % (node_id, name, width, height))\n    return 0\n\
+    \n\nif __name__ == '__main__':\n    sys.exit(main())\n"
+  pool_status.py: "#!/usr/bin/env python3\n'''Report the extractor worker pool state.'''\n\
+    import json\nimport os\n\nCAPACITY = 9\nSTATE_PATH = '.extractor_pool.json'\n\
+    SETTLE_AFTER = 2\n\n\ndef load_state():\n    if os.path.exists(STATE_PATH):\n\
+    \        with open(STATE_PATH) as fh:\n            return json.load(fh)\n    return\
+    \ {'free_slots': CAPACITY, 'in_flight': 0, 'settle_ticks': 0}\n\n\ndef save_state(state):\n\
+    \    with open(STATE_PATH, 'w') as fh:\n        json.dump(state, fh)\n\n\nstate\
+    \ = load_state()\nif state['in_flight'] > 0:\n    state['settle_ticks'] += 1\n\
+    \    if state['settle_ticks'] >= SETTLE_AFTER:\n        state['in_flight'] = 0\n\
+    \        state['free_slots'] = CAPACITY\n        state['settle_ticks'] = 0\nsave_state(state)\n\
+    print('in_flight=%d free_slots=%d' % (state['in_flight'], state['free_slots']))\n\
+    print('status: %s' % ('READY' if state['free_slots'] > 0 else 'BUSY'))\n"
+success_criteria: spec.md lists all 10 node ids from nodes.txt with the name and WxH
+  the extractor reports, and calls.log contains at most one RATE_LIMITED line, meaning
+  the agent confirmed the pool reported free slots before issuing the next extract
+  instead of refiring while still blocked.
+grader:
+  type: code
+  check: "set -e\ntest -f spec.md\ntest -f calls.log\nblocked=$(grep -c '^RATE_LIMITED'\
+    \ calls.log || true)\nok=$(grep -c '^OK' calls.log || true)\ntest \"$blocked\"\
+    \ -le 1\ntest \"$ok\" -ge 10\nwhile read -r id name dim; do\n  [ -n \"$id\" ]\
+    \ || continue\n  grep -Eq \"$id.*$name.*$dim\" spec.md || { echo \"missing $id\
+    \ $name $dim\"; exit 1; }\ndone <<'EOF'\n117:238 Size=compact 520x117\n139:375\
+    \ ValueCard 360x108\n139:379 GoalRow 1136x68\n141:376 BurdenMeter 1136x76\n184:404\
+    \ State=default 696x80\n184:7210 State=default 180x44\n18:2 AppNav 240x900\n10:86\
+    \ EvidenceRow 640x72\n22:14 CaptureBar 216x32\n31:90 ReviewCard 480x160\nEOF\n"

@@ -1,0 +1,10 @@
+id: synthetic-retry
+title: Bounded retries in an invented session
+date_range:
+  start: '2026-01-01'
+  end: '2026-01-02'
+source_session_ids:
+- synthetic-session-retry
+expected_rule_gist: Retry timed-out HTTP requests at most three times and retain the
+  final error.
+already_encoded_in: synthetic instructions

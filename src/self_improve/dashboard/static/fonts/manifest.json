@@ -1,0 +1,32 @@
+{
+  "InterVariable.woff2": {
+    "source": "https://raw.githubusercontent.com/rsms/inter/e3a3d4c57d5ecc01453a575621882a384c1995a3/docs/font-files/InterVariable.woff2",
+    "bytes": 352240,
+    "sha256": "693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3"
+  },
+  "InterVariable-Italic.woff2": {
+    "source": "https://raw.githubusercontent.com/rsms/inter/e3a3d4c57d5ecc01453a575621882a384c1995a3/docs/font-files/InterVariable-Italic.woff2",
+    "bytes": 387976,
+    "sha256": "e564f652916db6c139570fefb9524a77c4d48f30c92928de9db19b6b5c7a262a"
+  },
+  "Inter-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/rsms/inter/e3a3d4c57d5ecc01453a575621882a384c1995a3/LICENSE.txt",
+    "bytes": 4380,
+    "sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a"
+  },
+  "FiraMono-Regular.woff": {
+    "source": "https://raw.githubusercontent.com/mozilla/Fira/fd8c8c0a3d353cd99e8ca1662942d165e6961407/woff/FiraMono-Regular.woff",
+    "bytes": 86572,
+    "sha256": "bb55b79743fded6903446a3514d0fb39ed5f24e776f476f8a64c0d0160928cbe"
+  },
+  "FiraMono-Bold.woff": {
+    "source": "https://raw.githubusercontent.com/mozilla/Fira/fd8c8c0a3d353cd99e8ca1662942d165e6961407/woff/FiraMono-Bold.woff",
+    "bytes": 94732,
+    "sha256": "f3785fb4f4aa7f62b91afce3d2fd72b424148e2cd9655724001587b106e5f63c"
+  },
+  "FiraMono-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/mozilla/Fira/fd8c8c0a3d353cd99e8ca1662942d165e6961407/LICENSE",
+    "bytes": 4479,
+    "sha256": "99bfb7c1e845b79d1031fcf37e678178eb4a8c7cc74a3f218ddf7223083a6fcd"
+  }
+}

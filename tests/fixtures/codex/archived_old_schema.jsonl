@@ -1,0 +1,2 @@
+{"timestamp":"2026-02-21T09:15:39.000Z","type":"session_meta","payload":{"id":"eeeeeeee-eeee-7eee-8eee-eeeeeeeeeeee","timestamp":"2026-02-21T09:15:39.000Z","cwd":"/Users/redacted/Code/old-project","originator":"Codex Desktop","source":"vscode","cli_version":"0.0.0","git":null,"base_instructions":null,"model_provider":"redacted"}}
+{"timestamp":"2026-02-21T09:15:40.000Z","type":"event_msg","payload":{"type":"user_message","message":"Redacted archived human text.","images":null,"local_images":[],"text_elements":[]}}

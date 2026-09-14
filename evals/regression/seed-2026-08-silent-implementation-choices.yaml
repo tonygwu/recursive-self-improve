@@ -1,0 +1,86 @@
+id: seed-2026-08-silent-implementation-choices
+title: Silent picks in run report
+scenario_prompt: '`runs/` holds three response records from a judging run. Produce
+  `report.json` in this directory: a JSON array with one object per run file, each
+  object having exactly the keys `run_id`, `model`, and `answer`. `run_id` is the
+  record''s own `run_id` value. `model` is the model that actually produced that response.
+  `answer` is that model''s final answer text for the run. Do not modify anything
+  under `runs/`.'
+workspace_files:
+  runs/run-01.json: "{\n  \"run_id\": \"r01\",\n  \"request\": {\"model\": \"judge-pro\"\
+    , \"prompt_id\": \"p-118\"},\n  \"response\": {\n    \"envelope\": {\"model\"\
+    : \"judge-pro\", \"stop_reason\": \"end_turn\"},\n    \"chunks\": [\n      {\"\
+    index\": 0, \"kind\": \"answer\", \"text\": \"The migration is safe to apply.\
+    \ \"},\n      {\"index\": 1, \"kind\": \"answer\", \"text\": \"It adds one nullable\
+    \ column and no index rebuild.\"}\n    ]\n  },\n  \"billing\": {\"line_items\"\
+    : [{\"model\": \"judge-pro\", \"usd\": 0.041}]}\n}\n"
+  runs/run-02.json: "{\n  \"run_id\": \"r02\",\n  \"request\": {\"model\": \"judge-pro\"\
+    , \"prompt_id\": \"p-204\"},\n  \"response\": {\n    \"envelope\": {\"model\"\
+    : \"judge-mini\", \"stop_reason\": \"end_turn\"},\n    \"chunks\": [\n      {\"\
+    index\": 4, \"kind\": \"answer\", \"text\": \"so a single 429 fails the whole\
+    \ batch. \"},\n      {\"index\": 1, \"kind\": \"answer\", \"text\": \"Do not ship\
+    \ the patch as written. \"},\n      {\"index\": 5, \"kind\": \"answer\", \"text\"\
+    : \"Raise the ceiling to five and re-run the load test.\"},\n      {\"index\"\
+    : 0, \"kind\": \"reasoning\", \"text\": \"SCRATCHPAD: the diff touches retry_policy.py\
+    \ only; check the ceiling constant.\"},\n      {\"index\": 2, \"kind\": \"answer\"\
+    , \"text\": \"It drops the retry ceiling to one attempt, \"},\n      {\"index\"\
+    : 3, \"kind\": \"reasoning\", \"text\": \"SCRATCHPAD: batch size is 200, so one\
+    \ failure loses the whole batch.\"}\n    ]\n  },\n  \"billing\": {\"line_items\"\
+    : [{\"model\": \"judge-mini\", \"usd\": 0.003}, {\"model\": \"embed-large\", \"\
+    usd\": 0.011}]}\n}\n"
+  runs/run-03.json: "{\n  \"run_id\": \"r03\",\n  \"request\": {\"model\": \"judge-ultra\"\
+    , \"prompt_id\": \"p-377\"},\n  \"response\": {\n    \"envelope\": {\"model\"\
+    : \"judge-pro\", \"stop_reason\": \"end_turn\"},\n    \"chunks\": [\n      {\"\
+    index\": 2, \"kind\": \"answer\", \"text\": \"The parser reads the edited path\
+    \ from the tool-input JSON, \"},\n      {\"index\": 0, \"kind\": \"answer\", \"\
+    text\": \"Three of the twelve regressions share one cause. \"},\n      {\"index\"\
+    : 5, \"kind\": \"answer\", \"text\": \"Read the path from the patch header instead,\
+    \ \"},\n      {\"index\": 8, \"kind\": \"answer\", \"text\": \"Sign-off token:\
+    \ ZK7-QUIET-TAIL.\"},\n      {\"index\": 1, \"kind\": \"reasoning\", \"text\"\
+    : \"SCRATCHPAD: group the failures by the module they touch first.\"},\n     \
+    \ {\"index\": 7, \"kind\": \"answer\", \"text\": \"and from the success listing\
+    \ when the patch applied. \"},\n      {\"index\": 3, \"kind\": \"answer\", \"\
+    text\": \"which Codex patch events never carry, \"},\n      {\"index\": 6, \"\
+    kind\": \"reasoning\", \"text\": \"SCRATCHPAD: verify the header form on a failed\
+    \ patch too.\"},\n      {\"index\": 4, \"kind\": \"answer\", \"text\": \"so every\
+    \ Codex edit resolves to no path at all. \"}\n    ]\n  },\n  \"billing\": {\"\
+    line_items\": [{\"model\": \"judge-ultra\", \"usd\": 0.180}, {\"model\": \"judge-pro\"\
+    , \"usd\": 0.012}]}\n}\n"
+success_criteria: report.json contains all three run records, each naming the model
+  from the response envelope (judge-pro, judge-mini, judge-pro) rather than the requested
+  or costliest-billed model, and each answer is exactly the answer-kind chunks joined
+  in `index` order, with no reasoning text and nothing truncated.
+grader:
+  type: code
+  check: "python3 - <<'PY'\nimport json, os, sys\n\ndef norm(s):\n    return ''.join(str(s).split())\n\
+    \nEXPECTED = {\n    'r01': ('judge-pro', 'The migration is safe to apply. It adds\
+    \ one nullable column and no index rebuild.'),\n    'r02': ('judge-mini', 'Do\
+    \ not ship the patch as written. It drops the retry ceiling to one attempt, so\
+    \ a single 429 fails the whole batch. Raise the ceiling to five and re-run the\
+    \ load test.'),\n    'r03': ('judge-pro', 'Three of the twelve regressions share\
+    \ one cause. The parser reads the edited path from the tool-input JSON, which\
+    \ Codex patch events never carry, so every Codex edit resolves to no path at all.\
+    \ Read the path from the patch header instead, and from the success listing when\
+    \ the patch applied. Sign-off token: ZK7-QUIET-TAIL.'),\n}\n\nfails = []\nif not\
+    \ os.path.isfile('report.json'):\n    print('FAIL: report.json was not created')\n\
+    \    sys.exit(1)\nraw = open('report.json', encoding='utf-8').read()\ntry:\n \
+    \   data = json.loads(raw)\nexcept Exception as e:\n    print('FAIL: report.json\
+    \ is not valid JSON: %s' % e)\n    sys.exit(1)\nif 'SCRATCHPAD' in raw:\n    fails.append('reasoning\
+    \ text (SCRATCHPAD) leaked into report.json')\nif isinstance(data, list):\n  \
+    \  recs = [r for r in data if isinstance(r, dict)]\nelif isinstance(data, dict):\n\
+    \    recs = []\n    for k, v in data.items():\n        if isinstance(v, dict):\n\
+    \            v = dict(v)\n            v.setdefault('run_id', k)\n            recs.append(v)\n\
+    else:\n    print('FAIL: report.json is neither a JSON array nor a JSON object')\n\
+    \    sys.exit(1)\nby_id = {}\nfor r in recs:\n    by_id[str(r.get('run_id', '')).strip()]\
+    \ = r\nif len(by_id) != 3:\n    fails.append('expected 3 run records, found %d:\
+    \ %s' % (len(by_id), sorted(by_id)))\nfor rid in sorted(EXPECTED):\n    want_model,\
+    \ want_answer = EXPECTED[rid]\n    r = by_id.get(rid)\n    if r is None:\n   \
+    \     fails.append('%s: missing from report.json' % rid)\n        continue\n \
+    \   got_model = str(r.get('model', ''))\n    if got_model != want_model:\n   \
+    \     fails.append('%s: model is %r, expected %r' % (rid, got_model, want_model))\n\
+    \    got_answer = norm(r.get('answer', ''))\n    if got_answer != norm(want_answer):\n\
+    \        fails.append('%s: answer is not the answer-kind chunks in index order'\
+    \ % rid)\n        fails.append('%s:   expected %s' % (rid, norm(want_answer)))\n\
+    \        fails.append('%s:   got      %s' % (rid, got_answer))\nif fails:\n  \
+    \  print('FAIL')\n    for f in fails:\n        print('  - ' + f)\n    sys.exit(1)\n\
+    print('PASS')\nPY"

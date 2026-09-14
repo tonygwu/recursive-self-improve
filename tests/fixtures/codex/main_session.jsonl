@@ -1,0 +1,18 @@
+{"timestamp":"2026-08-05T10:00:00.000Z","type":"session_meta","payload":{"id":"aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","session_id":"aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","timestamp":"2026-08-05T10:00:00.000Z","cwd":"/Users/redacted/Code/project-y","originator":"Codex Desktop","source":"vscode","cli_version":"0.0.0","model_provider":"redacted","base_instructions":null,"history_mode":"persistent"}}
+{"timestamp":"2026-08-05T10:00:00.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":1,"started_at":"2026-08-05T10:00:00.100Z"}}
+{"timestamp":"2026-08-05T10:00:00.200Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-1","content":[{"type":"input_text","text":"<environment_context>redacted</environment_context>"}]}}
+{"timestamp":"2026-08-05T10:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}
+{"timestamp":"2026-08-05T10:00:05.000Z","type":"event_msg","payload":{"type":"user_message","message":"Redacted human request text.","images":null,"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-08-05T10:00:08.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"gAAAAABredactedreasoning"}}
+{"timestamp":"2026-08-05T10:00:10.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Redacted assistant reply.","phase":"final","memory_citation":null}}
+{"timestamp":"2026-08-05T10:00:12.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","id":"fc-1","arguments":"{\"cmd\":\"redacted-command\"}"}}
+{"timestamp":"2026-08-05T10:00:13.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","id":"fo-1","output":"Chunk ID: 000000\nWall time: 0.0100 seconds\nProcess exited with code 0\n\nredacted stdout"}}
+{"timestamp":"2026-08-05T10:00:15.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-2","id":"ct-1","status":"completed","input":"// redacted js source"}}
+{"timestamp":"2026-08-05T10:00:16.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-2","id":"co-1","output":[{"type":"input_text","text":"Script failed\nredacted error detail"}]}}
+{"timestamp":"2026-08-05T10:00:18.000Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-3","turn_id":"turn-2","status":"failed","success":false,"stdout":"","stderr":"redacted patch failure","changes":{}}}
+{"timestamp":"2026-08-05T10:00:19.000Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-4","turn_id":"turn-2","status":"completed","success":true,"stdout":"Success. Updated the following files:\nM redacted_file.py","stderr":"","changes":{}}}
+{"timestamp":"2026-08-05T10:00:20.000Z","type":"event_msg","payload":{"type":"user_me
+{"timestamp":"2026-08-05T10:00:21.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}
+{"timestamp":"2026-08-05T11:00:00.000Z","type":"session_meta","payload":{"id":"bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","session_id":"bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","timestamp":"2026-08-05T11:00:00.000Z","cwd":"/Users/redacted/Code/project-z","originator":"codex_exec","source":"exec","cli_version":"0.0.0","model_provider":"redacted"}}
+{"timestamp":"2026-08-05T11:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Redacted exec prompt.","images":null,"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-08-05T11:00:02.000Z","type":"world_state","payload":{"full":true,"state":{}}}

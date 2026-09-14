@@ -1,0 +1,7 @@
+{"_meta": {"docs": 6, "learnings": 3, "rule_units": 3, "instruction_files": [], "docs_redacted": 0, "rule_units_skipped_under_3_tokens": 0, "payload_sha256": "7bb793151ca98ce4c05c85bb531def6042d0d2f0c28c9583907b2b51aea2661b"}}
+{"doc_id": "doc:70bee526ea1da077", "kind": "learning", "text": "When an HTTP request times out, retry at most three times and keep the last error.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}
+{"doc_id": "doc:ee1de797ac101d1b", "kind": "rule_unit", "text": "Retry timed-out HTTP calls at most three times; record the final error.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}
+{"doc_id": "doc:a6231a8f2871022f", "kind": "learning", "text": "When changing the database schema, back up the database before applying the migration.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}
+{"doc_id": "doc:8d764d654198b90a", "kind": "rule_unit", "text": "Before a schema migration, make a database backup.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}
+{"doc_id": "doc:9bcab6fc013258ff", "kind": "rule_unit", "text": "A missing configuration key must raise an error.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}
+{"doc_id": "doc:8efcf9ce71700b95", "kind": "learning", "text": "Do not infer a missing setting; raise an error for the missing key.", "why": "", "category": "", "status": "", "source_ref": "synthetic", "observed_as": ""}

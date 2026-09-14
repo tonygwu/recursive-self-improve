@@ -1,0 +1,35 @@
+{
+  "contract_version": 1,
+  "decision": {
+    "account": "codex",
+    "provider": "codex",
+    "reason": "Synthetic routing decision for adapter tests.",
+    "score": 0.18,
+    "binding_window": "7d",
+    "regime": "B",
+    "fits": true,
+    "meets_policy": true,
+    "available_at": null,
+    "sticky": false
+  },
+  "exec": {
+    "env": {}
+  },
+  "ranked": [
+    {
+      "account": "codex",
+      "score": 0.18,
+      "min_slack": -0.125,
+      "binding_window": "7d",
+      "remaining": 0.18,
+      "eligible": true,
+      "source": "cache",
+      "age_s": 2.5,
+      "fits": true
+    }
+  ],
+  "excluded": [],
+  "degraded": [],
+  "warnings": [],
+  "generated_at": "2026-01-01T00:00:00Z"
+}
