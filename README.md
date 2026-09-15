@@ -63,6 +63,17 @@ outcomes together before making a decision.*
 retries, rejection and rollback. Project delivery may create a commit on its
 recorded delivery branch rather than change the checked-out file.
 
+## Evals & Trends
+
+![Figma v2 Evals and Trends with invented monthly signal rates, evaluation outcomes, and paired-trial history](docs/images/dashboard-evals-trends-v2.png)
+
+Explore monthly signal rates by detector version, then open an evaluation to inspect
+its source rule, scenarios, paired trials, and served models. Review historical
+outcomes and missing coverage before deciding whether to test a rule again.
+
+*Figma v2 design preview with invented data; trends and example verdicts do not
+establish real-world improvement.*
+
 ## Follow instructions across working copies
 
 The Project page brings together sessions, linked lessons, instruction inventories,
