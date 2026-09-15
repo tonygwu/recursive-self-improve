@@ -6,6 +6,7 @@ database is not a production worker queue.
 
 For your own data, use one explicit private config for the dashboard and worker.
 Review its state directory and instruction targets before invoking a writer.
+For an existing installation, complete the [database upgrade](UPGRADING.md) first.
 
 ```sh
 uv run selfimprove --config /absolute/private/config.toml status

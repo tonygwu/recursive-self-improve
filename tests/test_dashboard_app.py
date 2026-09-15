@@ -56,6 +56,9 @@ API_PATHS = (
     "/api/incident-rate",
     "/api/project-exposure",
     "/api/review-queue",
+    "/api/eval-attempts",
+    "/api/eval-results",
+    "/api/eval-health",
 )
 
 WRITE_VERBS = ("POST", "PUT", "PATCH", "DELETE")
@@ -517,7 +520,10 @@ def test_a_non_numeric_window_is_refused_not_coerced(tmp_path):
         assert client.get("/api/overview", params={"window_days": "fortnight"}).status_code == 422
 
 
-def test_projects_reports_the_two_caps_it_applied(tmp_path):
+def test_projects_uses_retained_context_and_ignores_legacy_walk_parameters(tmp_path, monkeypatch):
+    def forbidden(**kwargs):
+        raise AssertionError('Web reader attempted a live context walk')
+    monkeypatch.setattr(dashboard_app, '_context_weigher', forbidden)
     _fixture_db(tmp_path)
     app = _app(tmp_path)
     with TestClient(app) as client:
@@ -526,12 +532,13 @@ def test_projects_reports_the_two_caps_it_applied(tmp_path):
     assert request["weigh_top_n"] == dashboard_app.DEFAULT_WEIGH_TOP_N
     assert request["scan_other_md"] is False
     assert "other_md" in request["cut"]
-    # The cap the envelope advertises is the cap `queries` actually received.
-    assert payload["context_weight_capped"] == {
-        "measured": 1,
-        "skipped": 0,
-        "reason": f"caller passed weigh_top_n={dashboard_app.DEFAULT_WEIGH_TOP_N}",
-    }
+    assert payload["context_source"] == "recorded_inventory"
+    assert payload["context_weight_capped"] is None
+    assert payload["rows"][0]["context_weight"]["reason"] == "no_inventory_observations"
+    with TestClient(app) as client:
+        other = client.get("/api/projects?weigh_top_n=1&other_md=1").json()
+    assert other["rows"] == payload["rows"]
+    assert other["request"]["scan_other_md"] is False
     assert payload["rows"][0]["project_key"] == "github:1"
     assert payload["rows"][0]["clones"] == 1
     assert payload["rows"][0]["benefit"]["value"] == queries.NOT_COMPUTABLE

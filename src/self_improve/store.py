@@ -790,6 +790,67 @@ CREATE INDEX scan_incident_links_occurrence ON scan_incident_links(occurrence_id
         "0027_scan_run_index",
         "CREATE INDEX scan_observations_run ON scan_observations(run_id, observed_at, id);",
     ),
+    (
+        # Reserved by Codex: immutable delivered revisions and actual copy observations.
+        "0024_rule_availability",
+        """
+CREATE TABLE rule_revisions (
+    id TEXT PRIMARY KEY, learning_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
+    application_id TEXT NOT NULL, application_event_id TEXT NOT NULL,
+    project_key TEXT NOT NULL, content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL, record_json TEXT NOT NULL, record_hash TEXT NOT NULL,
+    UNIQUE(application_event_id, learning_id)
+);
+CREATE INDEX rule_revisions_project ON rule_revisions(project_key, learning_id);
+CREATE TABLE rule_availability_observations (
+    id TEXT PRIMARY KEY, rule_revision_id TEXT NOT NULL, project_key TEXT NOT NULL,
+    working_copy_id TEXT NOT NULL, observed_at TEXT NOT NULL, status TEXT NOT NULL,
+    run_id TEXT NOT NULL, record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX rule_availability_history ON rule_availability_observations(rule_revision_id, working_copy_id, observed_at, id);
+CREATE INDEX rule_availability_project ON rule_availability_observations(project_key, observed_at, id);
+CREATE TABLE rule_availability_collections (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+    status TEXT NOT NULL, record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX rule_availability_collection_run ON rule_availability_collections(run_id, observed_at, id);
+""",
+    ),
+    (
+        "0028_instruction_inventory",
+        """
+CREATE TABLE instruction_inventories (
+    id TEXT PRIMARY KEY, project_key TEXT NOT NULL, working_copy_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL, run_id TEXT NOT NULL, status TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX instruction_inventory_copy ON instruction_inventories(project_key, working_copy_id, observed_at, id);
+""",
+    ),
+    (
+        # Reserved Codex identifier; append without changing published migrations.
+        "0023_eval_attempts",
+        """
+CREATE TABLE eval_attempts (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, proposal_id TEXT NOT NULL,
+    learning_id TEXT NOT NULL, run_id TEXT NOT NULL, command_id TEXT NOT NULL,
+    source_revision_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE UNIQUE INDEX eval_attempt_command ON eval_attempts(command_id) WHERE command_id != '';
+CREATE INDEX eval_attempt_proposal ON eval_attempts(proposal_id, created_at, id);
+CREATE INDEX eval_attempt_learning ON eval_attempts(learning_id, created_at, id);
+CREATE INDEX eval_attempt_run ON eval_attempts(run_id, created_at, id);
+CREATE TABLE eval_attempt_events (
+    id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES eval_attempts(id),
+    event_key TEXT NOT NULL, kind TEXT NOT NULL, scenario_index INTEGER NOT NULL,
+    arm TEXT NOT NULL, trial_index INTEGER NOT NULL, created_at TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL,
+    UNIQUE(attempt_id, event_key)
+);
+CREATE INDEX eval_attempt_events_owner ON eval_attempt_events(attempt_id, created_at, id);
+""",
+    ),
 ]
 
 

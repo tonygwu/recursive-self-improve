@@ -81,6 +81,7 @@ def rerun_applied(
     fallback_spec_dir: Path | None = None,
     model_grader: Callable[[str, str], bool] | None = None,
     work_dir: Path | None = None,
+    run_id: str = '',
 ) -> dict:
     """Re-run applied rules' regression evals WITHOUT the rule; propose prunes.
 
@@ -105,8 +106,8 @@ def rerun_applied(
 
     Each processed learning persists one ``eval_results`` row (kind='ab',
     subject_id=learning id, TrialStats accounting + taxonomy, metrics_json
-    with the arm stats and verdict). That is the ONLY table this function
-    writes: prunable rules yield proposal dicts in the returned result —
+    with the arm stats and verdict). Attempt, spec, trial and call provenance
+    also publishes through eval_history. Prunable rules yield proposal dicts in the returned result —
     ``{learning_id, target_path, action: 'delete', marker_id,
     eval_result_id}`` — for the pipeline/CLI to persist through the normal
     proposal machinery (propose/apply), never written here.
@@ -129,13 +130,13 @@ def rerun_applied(
     # after a rollback keeps its most recent target_path), oldest applied
     # rules first so long-standing rules are re-tested before fresh ones.
     rows = store.query(
-        "SELECT l.id AS learning_id, p.target_path, p.applied_at "
+        "SELECT l.id AS learning_id, p.id AS proposal_id, p.target_path, p.applied_at "
         "FROM learnings l JOIN proposals p ON p.learning_id = l.id "
         "WHERE l.status = 'applied' AND p.status = 'applied' "
         "AND p.applied_at = ("
         "  SELECT MAX(p2.applied_at) FROM proposals p2 "
         "  WHERE p2.learning_id = l.id AND p2.status = 'applied') "
-        "ORDER BY p.applied_at ASC, l.id ASC"
+        "ORDER BY p.applied_at ASC, l.id ASC, p.id ASC"
     )
     candidates: list[dict] = []
     seen: set[str] = set()
@@ -165,25 +166,49 @@ def rerun_applied(
         if counts["attempted"] >= cfg.ab_prune_max_rules_per_run:
             counts["deferred"] += 1
             continue
+        from .. import eval_history
+        learning = store.query_one('SELECT * FROM learnings WHERE id=?',(lid,))
+        proposal = store.query_one('SELECT * FROM proposals WHERE id=?',(cand['proposal_id'],))
+        history = eval_history.begin(store,cfg,learning,proposal,run_id=run_id,kind='without_rule_rerun')
+        history.event('scenario:0:with:skipped','arm_skipped',
+                      {'reason':'without_rule_only_rerun'},scenario=0,arm='with')
         spec_path = find_spec(lid, regression_dir, fallback_dir=fallback_spec_dir)
         if spec_path is None:
             counts["skipped_no_spec"] += 1
+            history.event('skip:missing_spec','attempt_stopped',
+                          {'code':'MissingSpecification','detail':'No retained specification was available.'})
             continue
-        spec = load_spec(spec_path)
-        if spec.id != lid:
-            raise SpecError(
-                f"{spec_path}: spec id {spec.id!r} does not match learning id {lid!r}"
-            )
+        try:
+            spec = load_spec(spec_path)
+            if spec.id != lid:
+                raise SpecError(
+                    f"{spec_path}: spec id {spec.id!r} does not match learning id {lid!r}"
+                )
+        except BaseException as exc:
+            history.stop(exc)
+            raise
+        from .harness import spec_to_dict
+        spec_record=spec_to_dict(spec)
+        history.event('scenario:0:spec','specification',
+                      {'spec':spec_record,'spec_revision':eval_history.digest(spec_record),
+                       'origin':str(spec_path)},scenario=0)
 
         started = utc_now_iso()
-        stats = run_trials(
-            spec,
-            None,  # WITHOUT-rule arm: does the current model still need the rule?
-            agent_runner,
-            cfg.eval_trials,
-            model_grader,
-            work_dir=(Path(work_dir) / lid if work_dir is not None else None),
-        )
+        arm_history=history.arm(0,'without')
+        bind=getattr(agent_runner,'with_history',None)
+        try:
+            stats = run_trials(
+                spec,
+                None,  # WITHOUT-rule arm: does the current model still need the rule?
+                bind(arm_history) if bind else agent_runner,
+                cfg.eval_trials,
+                model_grader,
+                work_dir=(Path(work_dir) / lid if work_dir is not None else None),
+                history=arm_history,
+            )
+        except BaseException as exc:
+            history.stop(exc)
+            raise
         graded_failures = stats.errors.get("graded_fail", 0)
         infra_errors = sum(n for k, n in stats.errors.items() if k != "graded_fail")
         if graded_failures >= cfg.gate_without_min_failures:
@@ -196,9 +221,7 @@ def rerun_applied(
         counts[verdict] += 1
 
         eval_result_id = new_id()
-        store.insert(
-            "eval_results",
-            {
+        row = {
                 "id": eval_result_id,
                 "kind": "ab",
                 "subject_id": lid,
@@ -222,9 +245,12 @@ def rerun_applied(
                     ensure_ascii=False,
                 ),
                 "verdict": verdict,
-            },
-        )
-        store.commit()  # per-rule durability: a crash mid-run keeps finished rows
+            }
+        with store.transaction(write=True):
+            store.insert('eval_results',row)
+            history.link_result(0,row)
+            eval_history.append(store,history.id,event_key='result',kind='attempt_result',
+                                data={'verdict':verdict,'eval_result_id':eval_result_id,'scenarios_run':1})
 
         if verdict == "prunable":
             proposals.append(

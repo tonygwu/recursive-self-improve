@@ -87,11 +87,12 @@ def _note(event):
         raise RollbackError('InvalidApplication', f"Application event {event['id']} has an unreadable record.",409) from exc
 
 
-def _application_source(store,cfg,proposal_id):
-    """Use the last recorded application, including after a later human decision."""
+def _application_source(store,cfg,proposal_id,*,event_id=None):
+    """Use the requested application event, or the latest when no ID is given."""
     current=store.query_one('SELECT * FROM proposals WHERE id=?',(proposal_id,))
     if current is None:raise RollbackError('ProposalNotFound', f'no proposal with id {proposal_id!r}',404)
-    event=latest_application(store,proposal_id)
+    event=(store.query_one("SELECT * FROM proposal_events WHERE id=? AND proposal_id=? AND event='applied'", (event_id,proposal_id))
+           if event_id is not None else latest_application(store,proposal_id))
     if event is None:
         if current['status']=='applied' and not current['snapshot_commit_before']:
             raise RollbackError('MissingSnapshot', f'proposal {proposal_id} has no snapshot_commit_before',409)
@@ -166,9 +167,9 @@ def _application_source(store,cfg,proposal_id):
             'snapshot_before':note['snapshot_before'],'snapshot_after':note['snapshot_after']}
 
 
-def application_source(store,cfg,proposal_id):
+def application_source(store,cfg,proposal_id,*,event_id=None):
     try:
-        return _application_source(store,cfg,proposal_id)
+        return _application_source(store,cfg,proposal_id,event_id=event_id)
     except (DestinationError,OSError,UnicodeError,PatchConflict) as exc:
         raise RollbackError('ApplicationUnavailable',f'The recorded application cannot be verified: {exc}',409) from exc
 

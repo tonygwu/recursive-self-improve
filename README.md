@@ -40,6 +40,12 @@ See [installation and package checks](docs/DISTRIBUTION.md).
 
 ## Supported workflow
 
+The latest preview adds a dedicated Project page, recorded instruction inventories,
+per-copy rule availability, monthly signal trends, and complete evaluation history.
+Evaluation details retain the frozen rule, scenarios, trial outcomes, and served
+models. These records support inspection without claiming real-world improvement.
+Existing installations need the [database upgrade](docs/UPGRADING.md).
+
 Inspect runs, rules and evidence; review the exact proposed revision; approve it;
 run the instruction worker explicitly; inspect its result; and request a
 conflict-aware rollback. Scoped rejection can suppress one target or a lesson.
@@ -83,8 +89,8 @@ disable provider tools; prompts are not an enforced permission boundary.
 
 The selected workflow is verified with invented histories and stubbed provider
 responses. That scope does not establish real-provider effectiveness. Full
-diagnosis, availability and benefit metrics, complete provenance UI and full Figma
-parity remain [backlog](docs/RESEARCH_PREVIEW.md).
+diagnosis, session receipt, benefit metrics, quality assessments, policy controls,
+and full Figma parity remain [backlog](docs/RESEARCH_PREVIEW.md).
 
 ## Develop and inspect
 

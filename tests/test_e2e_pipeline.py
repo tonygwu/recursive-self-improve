@@ -595,9 +595,10 @@ def _capture_gate_wiring(monkeypatch, *, verdict="ungated"):
     return calls
 
 
-def test_pipeline_asks_for_every_configured_scenario(corpus, monkeypatch):
+@pytest.mark.parametrize("verdict", ["ungated", "gated_pass", "gated_fail"])
+def test_pipeline_asks_for_every_configured_scenario(corpus, monkeypatch, verdict):
     """Sabotage: `scenarios=1` in pipeline.py. Only one scenario runs; fails."""
-    calls = _capture_gate_wiring(monkeypatch)
+    calls = _capture_gate_wiring(monkeypatch, verdict=verdict)
     llm = ScriptedLLM(mine_responses=[mine_payload(f"**R{i}**") for i in range(8)])
     run_pipeline(
         corpus.cfg, corpus.store, review_only=True, _llm_factory=llm.factory()
@@ -658,7 +659,7 @@ def test_pipeline_records_the_scenario_split_for_the_report(corpus, monkeypatch)
     assert splits, "gate produced no per-scenario split for the report"
     for row in splits:
         assert set(row["tally"]) == {"gated_pass", "gated_fail", "ungated", "error"}
-        assert row["scenarios_run"] >= 1
+        assert row["scenarios_run"] == corpus.cfg.eval_scenarios
 
 
 # ----------------------------------------------------------------------
@@ -1472,6 +1473,25 @@ def test_gate_proposal_records_the_transition_in_the_audit_trail(corpus, monkeyp
     # that question unanswerable. The mapping is store.ACTOR_FOR_EVENT.
     assert events[0]["actor"] == "auto"
     assert "pending -> ungated" in events[0]["note"]
+
+
+def test_regating_retains_every_configured_scenario_after_two_failures(corpus, monkeypatch):
+    from self_improve.pipeline import gate_existing_proposal
+
+    calls = _capture_gate_wiring(monkeypatch, verdict="gated_fail")
+    pid, _ = _existing_proposal(corpus.store)
+    target = corpus.root / "manual-rule.md"
+    target.write_text("invented unchanged instruction\n")
+    corpus.store.update("proposals", "id", pid, {"target_path": str(target)})
+    corpus.store.commit()
+    stats = gate_existing_proposal(corpus.cfg, corpus.store, pid,
+                                   _llm_factory=ScriptedLLM(mine_responses=[]).factory())
+    assert [c["scenario"] for c in calls["generate"]] == list(range(corpus.cfg.eval_scenarios))
+    assert len(calls["gate"]) == corpus.cfg.eval_scenarios
+    split = stats["gate"]["scenario_splits"][0]
+    assert split["scenarios_run"] == split["tally"]["gated_fail"] == corpus.cfg.eval_scenarios
+    assert stats["gate_proposal"]["status_after"] == "gated_fail"
+    assert target.read_text() == "invented unchanged instruction\n"
 
 
 def test_gate_proposal_bills_only_the_gate_pool(corpus, monkeypatch):

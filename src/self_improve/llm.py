@@ -336,6 +336,7 @@ class LLMResult:
     account: str = ""       # quotapick account id that served (or failed) it
     error: str = ""         # taxonomy detail; "repicked_from=<acct>" on ok-after-repick
     call_id: str = ""       # Exact durable llm_calls row, retained across journal replay.
+    provider_attempts: int | None = None  # Unknown for legacy/injected executions.
 
 
 @dataclass
@@ -414,6 +415,7 @@ class LLMRunner:
         expect_json: bool,
         cwd: str | None = None,
         sandbox_dir: str | None = None,
+        call_trace=None,
     ) -> LLMResult:
         """Route one prompt via quotapick and return the parsed result.
 
@@ -426,7 +428,8 @@ class LLMRunner:
         repo root; installed wheels default to the caller's working directory.
         """
         return self._run_call(
-            stage, model_class, prompt, expect_json, cwd=cwd, sandbox_dir=sandbox_dir
+            stage, model_class, prompt, expect_json, cwd=cwd, sandbox_dir=sandbox_dir,
+            call_trace=call_trace,
         )
 
     def call_agentic(
@@ -480,6 +483,7 @@ class LLMRunner:
         cwd: str | None = None,
         agentic: bool = False,
         sandbox_dir: str | None = None,
+        call_trace=None,
     ) -> LLMResult:
         """Shared budget/audit wrapper behind call() and call_agentic()."""
         # Stage selects the gate's separate pool. Model tier alone would let
@@ -496,16 +500,26 @@ class LLMRunner:
             raise BudgetExhausted(pool, cap, self._refused[pool])
         self._made[pool] += 1
 
+        def trace_data(cid):
+            return {'run_id':self.run_id, 'stage':stage, 'model_class':model_class,
+                    'prompt_sha':hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+                    'expect_json':expect_json, 'cwd':cwd, 'sandbox_dir':sandbox_dir,
+                    'raw_artifact_prefix':str(self.raw_dir/cid),
+                    'timeout_seconds':self.cfg.llm_timeout_seconds}
+
         call_id = new_id()
         if self.call_journal is not None:
             call_id, recorded = self.call_journal.reserve(pool, {
                 'stage':stage,'model_class':model_class,'prompt_sha':hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
                 'expect_json':expect_json,'cwd':cwd,'agentic':agentic,'sandbox_dir':sandbox_dir,
-            })
+            }, **({'on_reserved':lambda cid:call_trace.reserve(self.store,cid,trace_data(cid))}
+                  if call_trace is not None else {}))
             if recorded is not None:
                 result = _ExecResult(**{**recorded, 'call_id':call_id})
                 self._outcomes[result.outcome] = self._outcomes.get(result.outcome,0)+1
                 return result
+        if call_trace is not None and self.call_journal is None:
+            call_trace.start(self.store, call_id, trace_data(call_id))
         started = time.monotonic()
         result = self._execute(
             call_id, stage, model_class, prompt, expect_json, cwd=cwd,
@@ -532,13 +546,20 @@ class LLMRunner:
                 "created_at": utc_now_iso(),
             }
         if self.call_journal is None:
-            self.store.insert('llm_calls',row)
-            self.store.commit()
+            if call_trace is None:
+                self.store.insert('llm_calls',row)
+                self.store.commit()
+            else:
+                with self.store.transaction(write=True):
+                    self.store.insert('llm_calls',row)
+                    call_trace.finish(self.store,row,provider_attempts=result.provider_attempts)
         else:
             from dataclasses import asdict
             with self.store.transaction(write=True):
                 self.store.insert('llm_calls',row)
                 self.call_journal.complete(call_id,asdict(result))
+                if call_trace is not None:
+                    call_trace.finish(self.store,row,provider_attempts=result.provider_attempts)
         return result
 
     def stats(self) -> dict:
@@ -716,6 +737,7 @@ class LLMRunner:
                     provider=pick.provider,
                     account=pick.account,
                     error=f"quota failure on {failed_account}; re-pick failed: {pick2_err}",
+                    provider_attempts=attempt_no,
                 )
             # This path exists to recover a failed call FAST, so a
             # not-meets-policy re-pick is treated like no capacity — no sleep.
@@ -733,6 +755,7 @@ class LLMRunner:
                         f"quota failure on {failed_account}; re-pick has no capacity",
                         pick2,
                     ),
+                    provider_attempts=attempt_no,
                 )
             repicked_from = failed_account
             pick = pick2
@@ -748,13 +771,14 @@ class LLMRunner:
                     call_id, attempt_no, pick, model_class, prompt, cwd=cwd, agentic=agentic, sandbox_dir=sandbox_dir
                 )
 
-        return self._finalize(
+        from dataclasses import replace
+        return replace(self._finalize(
             attempt,
             pick,
             expect_json,
             oauth_retried=oauth_retried,
             repicked_from=repicked_from,
-        )
+        ), provider_attempts=attempt_no)
 
     def _finalize(
         self,
@@ -1331,6 +1355,7 @@ class _ExecResult(LLMResult):
         text: str = "",
         tokens_in: int = 0,
         tokens_out: int = 0,
+        provider_attempts: int = 0,
     ) -> "_ExecResult":
         return cls(
             ok=False,
@@ -1343,6 +1368,7 @@ class _ExecResult(LLMResult):
             error=error,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            provider_attempts=provider_attempts,
         )
 
 

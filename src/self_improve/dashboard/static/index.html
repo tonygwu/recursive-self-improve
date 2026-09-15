@@ -48,6 +48,10 @@
         <span class="nav-item__icon" aria-hidden="true"></span>
         Projects
       </a>
+      <a class="nav-item" id="nav-evals" href="#/evals">
+        <span class="nav-item__icon" aria-hidden="true"></span>
+        <span>Evals &amp; trends</span>
+      </a>
     </div>
 
     <div class="nav__footer">
@@ -205,6 +209,9 @@
       </div>
 
       <!-- ============================ V4 · PROJECTS ======================= -->
+      <section class="view project-page" id="project-detail" style="display:none" aria-label="Project detail">
+        <div id="project-detail-body"></div>
+      </section>
       <div class="view" id="view-projects" style="display:none">
         <header class="view__head">
           <div class="view__heading">
@@ -225,13 +232,13 @@
                   <tr>
                     <th scope="col">Repo</th>
                     <th scope="col">Identity</th>
-                    <th scope="col" class="num">Sessions</th>
+                    <th scope="col" class="num">Indexed transcripts</th>
                     <th scope="col" class="num">Clones</th>
                     <th scope="col" class="num">Queue incidents</th>
                     <th scope="col" class="num">Signals /100k lines · 30d</th>
                     <th scope="col">Top signal</th>
-                    <th scope="col" class="num">Rules written</th>
-                    <th scope="col">Context weight</th>
+                    <th scope="col" class="num">Lessons contributed</th>
+                    <th scope="col">Observed instructions</th>
                     <th scope="col" class="num">Benefit</th>
                   </tr>
                 </thead>
@@ -249,6 +256,18 @@
           <div class="panel__body" id="projects-notes"></div>
         </section>
       </div>
+
+      <div class="view trends-page" id="view-evals" style="display:none">
+        <header class="view__head">
+          <div class="view__heading">
+            <h1 class="view__title">Evals &amp; trends</h1>
+            <p class="view__desc">What the recorded signals and evaluations can tell us about the loop.</p>
+          </div>
+        </header>
+        <div id="trends-body"></div>
+      </div>
+
+      <section class="view evaluation-page" id="evaluation-detail" style="display:none" aria-label="Evaluation detail"></section>
 
       <!-- Review records commands and displays delivery and operation history. -->
       <div class="view" id="view-review" style="display:none">

@@ -55,6 +55,9 @@ class Config:
     global_claude_md: str = str(HOME / ".claude" / "CLAUDE.md")
     codex_global_agents_md: str = str(HOME / ".codex" / "AGENTS.md")
     skills_dir: str = str(HOME / ".claude" / "skills")
+    # Empty derives .agents/skills beside the configured Codex home. Override
+    # when the user's skill root and CODEX_HOME do not share a parent.
+    codex_skills_dir: str = ""
     # Line budget for the global CLAUDE.md: at/over budget an addition must be
     # paired with a deletion proposal or demoted to a skill.
     global_claude_md_line_budget: int = 250
@@ -149,7 +152,7 @@ class Config:
     max_strong_calls_per_run: int = 10
     # The default is sized for 63 calls across three maximum-cost proposal gates
     # (3 scenarios x (1 generation + 2 x 3 trials)) and 15 for the A/B sweep.
-    # Both use this pool. Actual calls depend on early exits and failures;
+    # Both use this pool. Actual calls depend on skipped arms and failures;
     # increasing one stage's work does not reserve capacity for the other.
     max_gate_calls_per_run: int = 78
     # Stages billed to the gate pool rather than the mining pool. eval_gen is

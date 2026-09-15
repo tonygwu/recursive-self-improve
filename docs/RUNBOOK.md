@@ -2,6 +2,7 @@
 
 Use an explicit private configuration and keep operational state outside Git.
 Start with [the workflow guide](WORKFLOW.md) for review, delivery and rollback.
+Existing installations need the [explicit database upgrade](UPGRADING.md).
 
 ```sh
 uv run selfimprove --config /absolute/private/config.toml status
@@ -39,6 +40,17 @@ SI_STATE_DIR=/absolute/private/state ops/inspect-gate-verdicts.sh RUN_ID
 Replace RUN_ID with the intended identifier. Inspect trial outputs, error causes
 and served-model identity. A harness failure is not a rule verdict. Inspection
 output can contain private evidence; do not paste it into public issues.
+
+To refresh recorded instruction inventories and rule availability without model calls:
+
+```sh
+uv run selfimprove --config /absolute/private/config.toml observe-availability
+```
+
+This command reads known working copies and configured global instruction files.
+It writes observations to the selected state database. It does not write instruction
+targets. The Project page reads those retained observations. Availability does not
+establish that a session loaded a rule or that the rule improved its behavior.
 
 Back up a database consistently before maintenance. The tracked-checkout backup
 tool does not back up SQLite. Read [the data boundary](DATA_BOUNDARY.md) before
