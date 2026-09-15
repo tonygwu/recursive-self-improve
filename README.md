@@ -8,11 +8,14 @@ you inspect runs, rules, evidence and proposed edits. The research question is
 whether feedback from earlier agent work can improve instructions for later work.
 No general improvement rate is claimed.
 
-![Figma design of the Review queue with invented proposals](docs/images/dashboard-review.png)
+![Figma v2 Overview with an example pipeline, stage history, and decisions waiting for review](docs/images/dashboard-overview-v2.png)
 
-*Review queue — native Figma design export with invented examples. Screenshots
-show the intended interface, not proof that every depicted feature is implemented.
-See [preview scope](docs/RESEARCH_PREVIEW.md).*
+*Overview — Figma v2 design with invented data. The pipeline, stage history, and
+review queue show how the pieces fit together.*
+
+The images below are **design previews** with invented examples. Their counts,
+trends, and trial outcomes are illustrative. See [preview scope](docs/RESEARCH_PREVIEW.md)
+for implemented behavior, and try the disposable demo for the current UI.
 
 ## Try it without personal history
 
@@ -51,13 +54,33 @@ run the instruction worker explicitly; inspect its result; and request a
 conflict-aware rollback. Scoped rejection can suppress one target or a lesson.
 Automatic classes start off. Review decisions alone do not write instruction files.
 
-![Figma design of Rules and its evidence inspector](docs/images/dashboard-rules.png)
+![Figma v2 Review detail showing a proposed instruction diff, invented source excerpts, paired trials, and approval controls](docs/images/dashboard-review-detail-v2.png)
 
-*Rules browser — native Figma design export with invented examples.*
+*Review detail — inspect the proposed edit, its source evidence, and example trial
+outcomes together before making a decision.*
 
 [The workflow guide](docs/WORKFLOW.md) explains explicit delivery, stale previews,
 retries, rejection and rollback. Project delivery may create a commit on its
 recorded delivery branch rather than change the checked-out file.
+
+## Follow instructions across working copies
+
+The Project page brings together sessions, linked lessons, instruction inventories,
+and recorded rule availability. Working copies share one repository identity.
+
+![Figma v2 Project detail with example rules, instruction files, symlinks, and three working copies](docs/images/dashboard-project-detail-v2.png)
+
+*Project detail — Figma v2 design showing example instructions, file links, and
+working copies. The examples do not establish that an agent read or followed a rule.*
+
+<details>
+<summary>More: Rules browser and evidence inspector</summary>
+
+![Figma design of Rules and its evidence inspector](docs/images/dashboard-rules.png)
+
+*Rules browser — an earlier Figma design export with invented examples.*
+
+</details>
 
 ## Use your own sessions deliberately
 
