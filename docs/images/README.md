@@ -1,31 +1,63 @@
 # Dashboard design screenshots
 
-Exported from Figma on September 13, 2026 (Pacific time). Each PNG is a native
-1440 × 1024 render of a separate copy of an original dashboard frame.
+## Current README exports: Figma v2
 
-- `dashboard-review.png`: Review queue, with a combined proposal and evaluation evidence.
-- `dashboard-rules.png`: Rules browser, with the evidence inspector open.
+Exported on September 15, 2026 (UTC). Each PNG is a native 1440 × 1024 render
+of a separate copy of a dashboard v2 frame.
 
-The copies preserve the original layout, typography, and colors. Their project
-names, session references, rule text, dates, counts, and evaluation examples are
-invented. Text and status labels fit the existing columns. All 241 text nodes,
-including hidden older content, were checked against the replacement inventory.
-Neither frame contains uploaded images or video fills. The final PNGs were
-visually inspected; the original design text was checked and remains unchanged.
+- `dashboard-overview-v2.png`: pipeline summary, stage history, and pending decisions.
+- `dashboard-review-detail-v2.png`: proposed edit, source evidence, example trials, and review controls.
+- `dashboard-project-detail-v2.png`: instruction files, recorded rules, and working copies of one repository.
 
-These images show the intended design. They do not establish implemented
-behavior or measured model performance. The [preview scope](../RESEARCH_PREVIEW.md)
+These three screens give the README a sequence: understand the loop, inspect a
+change, then see where instructions are available. The earlier Rules image remains
+in an expandable section. The v2 Evals design depicts policy thresholds that differ
+from the public preview, so it is not included.
+
+The copies preserve the original layout, typography, and colors. Example counts,
+identifiers, excerpts, rules, trial outcomes, and operational messages are invented.
+Each copy is labeled as a synthetic design preview. The Project chart uses bar
+lengths proportional to its example file sizes.
+
+All 287 text nodes were checked against the replacement inventory, including
+hidden content. The frames contain no uploaded image or video fills. The original
+screens remain unchanged. Each final PNG was visually inspected for readable text,
+clipping, and layout problems.
+
+## Earlier exports
+
+Exported on September 13, 2026 (Pacific time), also at native 1440 × 1024 size.
+
+- `dashboard-review.png`: Review queue with a combined proposal and evaluation evidence.
+- `dashboard-rules.png`: Rules browser with the evidence inspector open.
+
+These copies use invented project names, session references, rule text, dates,
+counts, and evaluation examples. All 241 text nodes were checked against their
+replacement inventory. Neither frame contains uploaded images or video fills.
+The final PNGs were visually inspected, and the original design text remains unchanged.
+The earlier Review image is retained here as a reference.
+
+## Interpretation and refresh
+
+These images show intended designs. Their numbers and trial outcomes do not
+establish measured model performance. The [preview scope](../RESEARCH_PREVIEW.md)
 records implementation status. The disposable demo runs the implemented UI and
 does not reproduce these Figma exports.
 
-The private audit retains the Figma file reference, original and copied node
-IDs, and exact text replacements. That reference is not a public sharing link.
-To refresh an image, export its sanitized copy at native size and review every
-changed text node and the resulting PNG before committing it.
+The private audit retains the Figma file reference, original and copied node IDs,
+text inventories, replacements, export hashes, and selection notes. That reference
+is not a public sharing link.
 
-SHA-256 of the reviewed exports:
+To refresh an image, export its reviewed copy at native size. Check every changed
+text node and inspect the final PNG before committing it. Keep example data and
+policy wording consistent with the captions and current preview scope.
+
+## SHA-256 of the reviewed exports
 
 ```text
+c3cf6cf61a47aec6444880939bb7a3c4983d8a7c3fcac09e46bab66626631fb0  dashboard-overview-v2.png
+d856faeb2917b5b1ae91d9de77521db232bd0705e94adf939fe27d8b6536b30f  dashboard-review-detail-v2.png
+072d4f35fb6aa29c44d730c9c63d492ce4388922b93cabfb903529995fb6aa57  dashboard-project-detail-v2.png
 d14e6f98c9505ca6167b2f9068bab7f7c6d5fa9be9ce194173c216dfb1bc5318  dashboard-review.png
 3684f647a2761608d14fa7bc7885fc97c77d5f95173f7ff8c56df5c9f6922bd6  dashboard-rules.png
 ```
