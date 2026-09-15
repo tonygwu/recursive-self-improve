@@ -96,6 +96,34 @@
 /* Run detail follows the reference's header, stage panel, cap notice, and
    artifact panels. Native stage counters occupy one readable column. */
 .view.run-page { display: flex; flex-direction: column; gap: 14px; }
+.project-page #project-detail-body { display: flex; flex-direction: column; gap: 14px; }
+.project-page .panel { border-radius: 10px; min-width: 0; }
+.project-page .panel__body > :first-child { margin-top: 0; }
+.project-page .panel__body > :last-child { margin-bottom: 0; }
+.project-columns { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr); gap: 14px; align-items: start; }
+.project-primary, .project-secondary { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.project-page .project-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.project-page .tabs { flex-wrap: wrap; }
+.project-page p, .project-page .mono, .project-page summary { overflow-wrap: anywhere; }
+.project-page details { margin: 10px 0; }
+.project-page summary { cursor: pointer; }
+.project-page select { color: var(--c-text-primary); background: var(--c-bg-surface); border: 1px solid var(--c-border-strong); border-radius: var(--r-sm); padding: 5px; max-width: 100%; font: var(--t-caption); }
+.project-record { padding: 12px 0; border-bottom: 1px solid var(--c-border-default); }
+.project-record:first-child { padding-top: 0; }
+.project-record h3 { margin: 0 0 6px; font: var(--t-body-strong); }
+.project-record p { margin: 6px 0; white-space: pre-wrap; }
+.project-file { margin: 12px 0; }
+.project-file > div:first-child { display: flex; justify-content: space-between; gap: 12px; font: var(--t-caption); }
+.project-file > div:first-child > span:last-child { white-space: nowrap; }
+.project-ownership-bar { display: flex; height: 7px; border-radius: 4px; overflow: hidden; background: var(--c-bg-subtle); margin-top: 6px; }
+.project-ownership-bar [data-owner="human_managed"] { background: var(--c-text-muted); }
+.project-ownership-bar [data-owner="machine"] { background: var(--c-accent); }
+.project-ownership-bar [data-owner="edited"] { background: var(--c-status-partial); }
+.project-ownership-bar [data-owner="unknown"] { background: var(--c-status-fail); }
+@media (max-width: 1050px) {
+  .project-columns { grid-template-columns: minmax(0, 1fr); }
+  .project-page .project-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .run-breadcrumb { font: var(--t-caption); color: var(--c-text-secondary); }
 .run-heading { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; margin: 0; }
 .run-heading .view__title { font-size: 20px; line-height: 26px; letter-spacing: -0.2px; }
@@ -1169,6 +1197,17 @@ button {
   white-space: nowrap;
 }
 
+.data tbody th {
+  position: static;
+  z-index: auto;
+  font: var(--t-body-strong);
+  background: transparent;
+  color: var(--c-text-primary);
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+}
+
 /* An absolute file path has no break opportunities, so auto table layout gave
    the Target column nearly twice the width of the rule text and pushed a Rules
    row to 393px tall with the inspector open. `.field__value` already sets this
@@ -1625,6 +1664,15 @@ button {
   display: flex;
   gap: var(--s-2);
   border-bottom: 1px solid var(--c-border-default);
+}
+
+.inspector__body > .tabs {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.inspector__body > .tabs .tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .tab {
@@ -2391,3 +2439,66 @@ button {
 .exposure-form input:focus-visible, .exposure-form select:focus-visible { outline: 2px solid var(--c-border-focus); outline-offset: 2px; }
 
 .inspector__body summary { cursor: pointer; overflow-wrap: anywhere; }
+
+/* Monthly signal matrix: shared Figma bars, with readable units and gaps. */
+.trends-page #trends-body { display: flex; flex-direction: column; gap: 14px; }
+.trends-page .panel { min-width: 0; }
+.trends-page p, .trends-page summary { overflow-wrap: anywhere; }
+.trends-page details { margin-top: 14px; }
+.trends-page summary { cursor: pointer; }
+.trend-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(140px, .7fr) auto; align-items: end; margin-bottom: 0; }
+.trend-form select { width: 100%; }
+.trend-matrix { width: 100%; min-width: 650px; table-layout: fixed; }
+.trend-matrix th:first-child { width: 150px; white-space: normal; }
+.trend-matrix th, .trend-matrix td { padding: 5px; font: var(--t-caption); }
+.trend-matrix td { text-align: right; }
+.trend-matrix .spark { width: 100%; height: 32px; margin-top: 4px; }
+.trend-matrix td[data-small="true"] { background: var(--c-bg-subtle); }
+.trend-matrix td[data-partial="true"] { border-left: 1px dashed var(--c-border-strong); border-right: 1px dashed var(--c-border-strong); }
+.trend-matrix td:focus-visible { outline: 2px solid var(--c-border-focus); outline-offset: -2px; }
+.trend-value { font-variant-numeric: tabular-nums; }
+.trend-gap { justify-content: center; align-items: center; border: 1px dashed var(--c-border-strong); }
+.trend-workload { border-top: 1px solid var(--c-border-default); }
+.trend-version { border-top: 1px solid var(--c-border-default); padding-top: 6px; }
+@media (max-width: 1100px) { .trend-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+
+.trends-page .project-columns { grid-template-columns: minmax(684px, 1.7fr) minmax(260px, 1fr); }
+@media (max-width: 1279px) { .trends-page .project-columns { grid-template-columns: minmax(0, 1fr); } }
+.trend-matrix thead th { white-space: normal; }
+
+/* Evals: retained attempts alongside the monthly matrix; full evidence on a child page. */
+.eval-filter { display: flex; flex-direction: column; gap: 10px; }
+.eval-filter label { display: flex; flex-direction: column; gap: 4px; color: var(--c-text-secondary); font-size: 12px; }
+.eval-filter input, .eval-filter select { box-sizing: border-box; width: 100%; min-width: 0; }
+.eval-filter details { margin-top: 0; }
+.eval-filter .btn { align-self: flex-start; }
+.eval-cards { max-height: 620px; overflow-y: auto; overscroll-behavior: contain; }
+.eval-card { border-top: 1px solid var(--c-border-default); padding: 14px 0; }
+.eval-card h3 { font-size: 13px; font-weight: 500; line-height: 1.55; margin: 0 0 8px; white-space: pre-wrap; }
+.eval-card p { margin: 4px 0 8px; }
+.eval-card a { display: inline-block; font-size: 12px; }
+.eval-pagination { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.evaluation-page { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.evaluation-page p, .evaluation-page summary, .evaluation-page h2, .evaluation-page h3, .eval-call h4 { overflow-wrap: anywhere; }
+.evaluation-page .panel { min-width: 0; }
+.evaluation-page details { margin-top: 14px; }
+.evaluation-page summary { cursor: pointer; }
+.eval-rule { white-space: pre-wrap; font-weight: 500; }
+.eval-notice { padding: 14px 18px; border-radius: 10px; background: var(--c-bg-subtle); }
+.eval-notice p { margin: 4px 0 0; }
+.eval-notice[data-state="ok"] { color: var(--c-status-ok); background: var(--c-status-ok-subtle); }
+.eval-notice[data-state="partial"] { color: var(--c-status-partial); background: var(--c-status-partial-subtle); }
+.eval-notice[data-state="error"] { color: var(--c-status-fail); background: var(--c-status-fail-subtle); }
+.eval-links { display: flex; flex-wrap: wrap; gap: 10px 20px; }
+.eval-call { border-top: 1px solid var(--c-border-default); padding: 12px 0; }
+.eval-call h4 { font-size: 13px; margin: 0 0 6px; }
+.eval-call p { margin: 4px 0; }
+.eval-arm-table { width: 100%; min-width: 620px; }
+.eval-arm-table td { font-variant-numeric: tabular-nums; }
+.eval-comparison { padding: 10px 12px; background: var(--c-bg-subtle); border-radius: 8px; }
+
+.eval-card-arms { margin: 8px 0; font: var(--t-caption); }
+.eval-card-arms div { display: flex; justify-content: space-between; gap: 10px; margin: 4px 0; }
+.eval-card-arms dt { color: var(--c-text-muted); }
+.eval-card-arms dd { margin: 0; font-variant-numeric: tabular-nums; }
+.eval-filter.exposure-form { display: flex; margin: 0 0 8px; }

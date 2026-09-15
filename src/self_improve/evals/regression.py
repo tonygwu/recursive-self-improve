@@ -23,7 +23,6 @@ the separate shared policy; ``ungated`` does not authorize automatic writes.
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import json
 import os
 import tempfile
@@ -65,6 +64,7 @@ def generate_spec(
     out_dir: Path | None = None,
     evidence: str = "",
     scenario: int | None = None,
+    record_prompt=None,
 ) -> EvalSpec:
     """Generate a regression EvalSpec for a learning and write its YAML.
 
@@ -122,6 +122,10 @@ def generate_spec(
         ev or "(no transcript excerpt was retained for this incident)",
     )
 
+    if record_prompt is not None:
+        import hashlib
+        record_prompt({'template':template,'template_sha':hashlib.sha256(template.encode()).hexdigest(),
+                       'prompt':prompt,'prompt_sha':hashlib.sha256(prompt.encode()).hexdigest()})
     response = llm_json(prompt)
     if not isinstance(response, dict):
         raise SpecError(
@@ -202,7 +206,7 @@ def gate(
     *,
     store: Store | None = None,
     work_dir: Path | None = None,
-    checkpoint=None, record_result=None,
+    checkpoint=None, record_result=None, history=None, scenario=0,
 ) -> dict:
     """Gate a rule on its regression eval; returns the verdict + both arms.
 
@@ -222,9 +226,18 @@ def gate(
         raise ValueError("gate requires a non-empty rule_text")
     started = utc_now_iso()
 
+    def arm_options(name):
+        if history is None:
+            return agent_runner, {}
+        arm_history = history.arm(scenario, name)
+        bind = getattr(agent_runner, 'with_history', None)
+        return (bind(arm_history) if bind else agent_runner), {'history':arm_history}
+
+    without_runner, without_options = arm_options('without')
     without = run_trials(
-        spec, None, agent_runner, cfg.eval_trials, model_grader,
+        spec, None, without_runner, cfg.eval_trials, model_grader,
         work_dir=(Path(work_dir) / "without" if work_dir is not None else None),
+        **without_options,
         **({"checkpoint":lambda key,inputs,fn:checkpoint("without:"+key,inputs,fn)} if checkpoint else {}),
     )
     detected = without.errors.get("graded_fail", 0)
@@ -252,9 +265,11 @@ def gate(
     elif detected < cfg.gate_without_min_failures:
         verdict = "ungated"
     else:
+        with_runner, with_options = arm_options('with')
         with_ = run_trials(
-            spec, rule_text, agent_runner, cfg.eval_trials, model_grader,
+            spec, rule_text, with_runner, cfg.eval_trials, model_grader,
             work_dir=(Path(work_dir) / "with" if work_dir is not None else None),
+            **with_options,
             **({"checkpoint":lambda key,inputs,fn:checkpoint("with:"+key,inputs,fn)} if checkpoint else {}),
         )
         verdict = verdict_for(
@@ -268,6 +283,10 @@ def gate(
 
     without_stats = dataclasses.asdict(without)
     with_stats = dataclasses.asdict(with_) if with_ is not None else None
+    if history is not None and with_ is None:
+        history.event(f'scenario:{scenario}:with:skipped','arm_skipped',
+                      {'reason':'without_arm_uninformative' if verdict=='error' else 'mistake_not_reproduced'},
+                      scenario=scenario,arm='with')
     result = {
         "verdict": verdict,
         "without_stats": without_stats,
@@ -306,7 +325,12 @@ def gate(
                 "verdict": verdict,
             }
         if record_result is None:
-            store.insert("eval_results",row)
+            if history is None:
+                store.insert("eval_results",row)
+            else:
+                with store.transaction(write=True):
+                    store.insert('eval_results',row)
+                    history.link_result(scenario,row)
         else:
             result["eval_result_id"]=record_result(row)
         store.commit()
@@ -361,28 +385,6 @@ def majority_verdict(tally: dict) -> str:
     return "inconclusive"
 
 
-def _settled_verdict(tally: dict, remaining: int) -> str | None:
-    """The verdict if no completion of the remaining scenarios could change it.
-
-    Returns ``None`` while the outcome is still open. Enumerating the
-    completions is the only safe way to stop early: a rule of thumb like "stop
-    once two agree" disagrees with the full run whenever a later scenario would
-    have pushed the tally over ``GATE_FAIL_VOTES``. Early exit must save budget
-    and never change an answer.
-    """
-    if remaining <= 0:
-        return majority_verdict(tally)
-    seen: set[str] = set()
-    for combo in itertools.combinations_with_replacement(SCENARIO_OUTCOMES, remaining):
-        future = dict(tally)
-        for outcome in combo:
-            future[outcome] = int(future.get(outcome, 0)) + 1
-        seen.add(majority_verdict(future))
-        if len(seen) > 1:
-            return None
-    return seen.pop() if seen else None
-
-
 def gate_majority(generate, run_gate, *, scenarios: int) -> dict:
     """Gate a rule on a MAJORITY of independently generated scenarios.
 
@@ -391,6 +393,11 @@ def gate_majority(generate, run_gate, *, scenarios: int) -> dict:
     ``i``. ``run_trials`` creates its sandbox with ``exist_ok=False``, so reused
     directories fail. Independent scenarios reduce dependence on one trial's
     stochastic outcome; the gate's majority rule decides the result.
+
+    Run every configured scenario even when earlier outcomes settle the final
+    verdict. The remaining outcomes are required evidence, covered by the
+    caller's full gate reservation. Budget refusal, cancellation, interruption,
+    and execution exceptions still follow their existing control paths.
 
     A generation that raises consumes its scenario and does not abort the rest,
     so one malformed spec cannot collapse the gate. If EVERY scenario raises,
@@ -408,7 +415,6 @@ def gate_majority(generate, run_gate, *, scenarios: int) -> dict:
     per_scenario: list[dict] = []
     results: list[dict] = []
     last_exc: Exception | None = None
-    settled: str | None = None
     used = 0
 
     for index in range(scenarios):
@@ -439,22 +445,12 @@ def gate_majority(generate, run_gate, *, scenarios: int) -> dict:
                     "eval_result_id": result.get("eval_result_id", ""),
                 }
             )
-        settled = _settled_verdict(tally, scenarios - used)
-        if settled is not None:
-            break
 
     if not results:
         # Nothing ran. Propagate the real cause rather than inventing a verdict.
         raise last_exc if last_exc else RuntimeError("no eval spec was generated")
 
-    # Use the SETTLED verdict when the loop exited early, not a fresh reading of
-    # the partial tally. They agree for every reachable tally at the current
-    # thresholds — verified exhaustively in
-    # TestEarlyExitCanNeverChangeTheAnswer — but that is a property of
-    # GATE_PASS_VOTES and GATE_FAIL_VOTES, not of the algorithm, and it would
-    # break silently if either constant moved. Early exit must save budget and
-    # never change an answer, so take the answer it was proven to have.
-    verdict = settled if settled is not None else majority_verdict(tally)
+    verdict = majority_verdict(tally)
     # The deciding scenario is the first that actually reproduced the mistake,
     # since an `ungated` scenario tested nothing. `ab.rerun_applied` later
     # re-tests this rule from one spec, and it should be one that bites.

@@ -79,7 +79,7 @@ class Journal:
         _checkpoint('step_completed')
         return value
 
-    def reserve(self,pool,inputs):
+    def reserve(self,pool,inputs,*,on_reserved=None):
         if self.active is None:raise JobPause('UnscopedCall','A job model call must belong to a frozen step.')
         index=self.index;self.index+=1;stamp=utc_now_iso()
         with self.store.transaction(write=True):
@@ -99,23 +99,29 @@ class Journal:
             cid=new_id()
             self.store.insert('job_calls',{'id':cid,'command_id':self.cid,'step_id':self.active,'call_index':index,
                 'pool':pool,'input_json':_json(inputs),'input_hash':_hash(inputs),'state':'started','created_at':stamp,'updated_at':stamp})
+            if on_reserved is not None:on_reserved(cid)
         _checkpoint('call_reserved')
         return cid,None
 
     def complete(self,cid,result):
         self.store.update('job_calls','id',cid,{'state':'completed','result_json':_json(result),'result_hash':_hash(result),'updated_at':utc_now_iso()})
 
-    def record_eval(self,scenario,row):
+    def record_eval(self,scenario,row,*,history=None):
         content={k:v for k,v in row.items() if k not in {'id','started','finished'}}
         fingerprint=_hash(content)
         with self.store.transaction(write=True):
             old=self.store.query_one('SELECT * FROM job_evaluations WHERE command_id=? AND scenario_index=?',(self.cid,scenario))
             if old:
                 if old['content_hash']!=fingerprint:raise JobPause('EvaluationChanged','A replay produced different evaluation evidence.')
+                if history is not None:
+                    original=self.store.query_one('SELECT * FROM eval_results WHERE id=?',(old['eval_result_id'],))
+                    if original is None:raise JobPause('EvaluationMissing','The recorded scenario result is missing.')
+                    history.link_result(scenario,original)
                 return old['eval_result_id']
             self.store.insert('eval_results',row)
             self.store.insert('job_evaluations',{'id':new_id(),'command_id':self.cid,'scenario_index':scenario,
                 'eval_result_id':row['id'],'content_hash':fingerprint})
+            if history is not None:history.link_result(scenario,row)
         return row['id']
 
 
@@ -144,6 +150,7 @@ def run_once(store,cfg,*,_llm_factory=None):
                 store.update('runs','id',run_id,{'status':'running','finished':''})
             store.update('commands','id',cid,{'state':'running','updated_at':utc_now_iso()})
         saved={**saved,'run_id':run_id}
+        evaluation_history = None
         try:
             from .config import Config
             from .llm import LLMRunner
@@ -156,6 +163,12 @@ def run_once(store,cfg,*,_llm_factory=None):
                 max_strong_calls_per_run=saved['budget']['maximum']['strong'],
                 max_gate_calls_per_run=saved['budget']['maximum']['gate'])
             journal=Journal(store,cid)
+            if saved['action']=='regenerate_eval':
+                from . import eval_history
+                member=saved['members'][0]
+                evaluation_history=eval_history.begin(store,frozen,member['snapshot']['learning'],
+                    member['snapshot']['proposal'],run_id=run_id,command_id=cid,
+                    source_revision_id=member['revision_id'])
             llm=(_llm_factory or LLMRunner)(frozen,store,run_id,run_dir/'raw',call_journal=journal)
             if saved['action']=='propose_recovery':
                 from . import recovery_jobs
@@ -190,10 +203,11 @@ def run_once(store,cfg,*,_llm_factory=None):
                         'updated_at':utc_now_iso(),'error_code':'','error_detail':''})
                     store.update('runs','id',run_id,{'status':'ok','finished':utc_now_iso(),'stats_json':_json({'review_only':True,'command_id':cid})})
             else:
-                _run_evaluation(store,cfg,frozen,run_id,run_dir,llm,journal,saved,cid)
+                _run_evaluation(store,cfg,frozen,run_id,run_dir,llm,journal,saved,cid,history=evaluation_history)
         except (JobPause,Exception) as exc:
             store.conn.rollback()
             code=getattr(exc,'code',type(exc).__name__)
+            if evaluation_history is not None:evaluation_history.stop(exc)
             with store.transaction(write=True):
                 store.update('commands','id',cid,{'state':'cancelled' if code=='JobCancelled' else 'blocked' if isinstance(exc,JobPause) else 'failed',
                     'error_code':code,'error_detail':str(exc),'updated_at':utc_now_iso()})
@@ -202,7 +216,7 @@ def run_once(store,cfg,*,_llm_factory=None):
         return jobs.status(store,store.query_one('SELECT * FROM commands WHERE id=?',(cid,)))
 
 
-def _run_evaluation(store,cfg,frozen,run_id,run_dir,llm,journal,saved,cid):
+def _run_evaluation(store,cfg,frozen,run_id,run_dir,llm,journal,saved,cid,*,history=None):
     from .pipeline import gate_one_proposal,new_gate_stats,_evidence_excerpt
     source=saved['members'][0];proposal=dict(source['snapshot']['proposal']);learning=source['snapshot']['learning']
     proposal['eval_result_id']='';gate=new_gate_stats();taxonomy={}
@@ -210,7 +224,7 @@ def _run_evaluation(store,cfg,frozen,run_id,run_dir,llm,journal,saved,cid):
     gate_one_proposal(store,frozen,llm,learning,proposal,run_dir=run_dir,
         sandbox_state={'ok':None,'error':'','observed':{}},gate_stats=gate,bump_taxonomy=bump,
         evidence_override=_evidence_excerpt(next((i['window_json'] for i in source['snapshot']['evidence'] if i['window_json']),'')),
-        checkpoint=journal)
+        checkpoint=journal,run_id=run_id,source_revision_id=source['revision_id'],history=history)
     store.commit()
     _checkpoint('gate_finished')
     with store.transaction(write=True):

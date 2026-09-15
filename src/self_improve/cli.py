@@ -85,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("scan", help="incremental transcript indexing + filter-incidents only")
     sub.add_parser("status", help="DB and last-run summary")
+    sub.add_parser('observe-availability', help='inspect actual known working copies and persist rule availability; no model calls or target writes')
     p_worker = sub.add_parser("worker", help="recover instruction writes and deliver approved commands using the existing state database")
     worker_mode = p_worker.add_mutually_exclusive_group()
     worker_mode.add_argument("--once", action="store_true", help="process one queued command or interrupted instruction operation, then exit")
@@ -313,6 +314,19 @@ def main(argv: list[str] | None = None) -> int:
             store.close()
         print(json.dumps(stats, indent=2))
         return 0
+
+    if args.command == 'observe-availability':
+        from .rule_availability import collect_availability
+        from .rule_revisions import AvailabilityError
+        try:
+            from contextlib import closing
+            with closing(Store(cfg.state_path('state.db'), migrate=False)) as availability_store:
+                result = collect_availability(availability_store, cfg)
+        except (AvailabilityError, FileNotFoundError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2))
+        return 0 if result['status'] != 'partial' else 1
 
     if args.command in {"worker","jobs"}:
         if args.command=='jobs':

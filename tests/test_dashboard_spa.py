@@ -261,7 +261,7 @@ def test_every_fetch_names_the_get_method(js_text: str):
 def test_app_js_declares_only_the_endpoints_the_product_has(js_text: str):
     """Collection routes and parameterized resource routes are explicit."""
     urls = set(re.findall(r"""["'](/api/[a-z0-9/_-]+)["']""", js_text))
-    assert urls == {"/api/overview", "/api/rules", "/api/projects", "/api/review-queue", "/api/commands", "/api/review-preview", "/api/operations", "/api/incidents", "/api/runs"}, (
+    assert urls == {"/api/overview", "/api/rules", "/api/projects", "/api/review-queue", "/api/commands", "/api/review-preview", "/api/operations", "/api/incidents", "/api/runs", "/api/incident-rate", "/api/eval-attempts", "/api/eval-results", "/api/eval-health"}, (
         f"app.js fetches an unexpected endpoint set: {sorted(urls)}"
     )
     code = _strip_js_comments(js_text)
@@ -813,6 +813,7 @@ const RULES = {
 };
 
 const WEIGHT_OK = {
+  groups: [], observed_at: "2030-01-01T00:00:00Z", selection: "First recorded copy",
   computable: true, path: "/Users/example/Code/demo-service/repo-0",
   repo_path: "/Users/example/Code/demo-service/repo-0",
   resolved_path: "/Users/example/Code/demo-service/repo-0",
@@ -1388,13 +1389,12 @@ if (mode === "ok") {
       "the top-signal count was dropped instead of moved into the tooltip");
   });
 
-  check("context_weight_column_leads_with_what_costs_every_session", () => {
+  check("context_column_shows_observed_bytes_without_session_claims", () => {
     const html_ = el("projects-tbody").html();
-    expect(html_.indexOf("12.0 kB</span><span class=\"caption muted\"> always") !== -1,
-      "the always-loaded number is not the column's headline");
-    expect(html_.indexOf("16.0 kB is in force across 2 file(s)") !== -1,
-      "the in-force total is not carried in the tooltip");
-    expect(html_.indexOf("none yet") !== -1, "a repo with no instruction files is not marked");
+    expect(html_.includes('16.0 kB</span><span class="caption muted"> observed'), 'observed bytes missing');
+    expect(html_.includes('2 physical files observed at 2030-01-01'), 'observation time missing');
+    expect(!html_.includes('loads into every session'), 'invented session receipt');
+    expect(html_.includes('0 B'), 'observed empty inventory is not numeric zero');
   });
 
   check("a_repo_with_no_display_name_falls_back_to_its_key", () => {
@@ -1404,26 +1404,32 @@ if (mode === "ok") {
   });
 
   check("clicking_a_project_opens_the_file_by_file_breakdown", () => {
-    el("main").dispatch("click", { target: rowTarget({ "data-project-key": "github:1000000001" }) });
-    const body = el("inspector-body").html();
-    expect(body.indexOf("AGENTS.md") !== -1, "the file-by-file breakdown is missing");
-    expect(body.indexOf("SKILL.md") !== -1, "the on-demand file is missing");
-    expect(body.indexOf("every session") !== -1, "always-loaded files are not separated");
+    app.state.projectInventory["github:1000000001"] = {loaded:true, records:[{
+      working_copy_id:"fixture-copy",working_copy:{normalized_path:"/fixture"},observed_at:"2030-01-01T00:00:00Z",status:"recorded",profile:"instruction-surfaces/2",issues:[],
+      totals:{files:2,bytes:16000},context:{meaning:"Observed profile; session loading unverified",groups:[{provider:"claude",origin:"all",files:2,observed_bytes:16000,startup_bytes:12000,conditional_bytes:0,on_demand_bytes:4000,unresolved_bytes:0}]},
+      files:WEIGHT_OK.files.map(f=>({...f,aliases:[f.path, "/fixture/CLAUDE.md"],loading_paths:[{provider:"claude",origin:"project",scope:{kind:f.always_loaded?"project_always_loaded":"on_demand"},conditions:[],import_chain:[],path:f.path,eligible_prefix_bytes:f.bytes}]}))
+    }],count:1};
+    el("main").dispatch("click", { target: rowTarget({ "data-project-key": "github:1000000001", "data-focus": "context" }) });
+    const body = el("project-detail-body").html();
+    expect(el("project-detail").visible() && !el("inspector").visible(), "project context did not use the dedicated page");
+    expect(body.includes("Startup candidates"), "startup candidates missing");
+    expect(body.includes("On-demand skill bodies"), "skill body budget missing");
+    expect(!body.includes("every session"), "invented session receipt");
     expect(body.indexOf("12.0 kB") !== -1, "the always-loaded byte count is missing");
   });
 
   check("the_project_topology_tab_names_the_symlink", () => {
-    el("inspector-body").dispatch("click", { target: rowTarget({ "data-tab": "topology" }) });
-    const body = el("inspector-body").html();
-    expect(body.indexOf("CLAUDE.md is a symlink to AGENTS.md") !== -1, "the topology label is missing");
-    expect(body.indexOf("General write target") !== -1, "the write target is missing");
+    el("project-detail-body").dispatch("click", { target: rowTarget({ "data-tab": "topology" }) });
+    const body = el("project-detail-body").html();
+    expect(body.includes("CLAUDE.md") && body.includes("Aliases:"), "recorded alias missing");
+    expect(body.includes("Physical file:") && body.includes("AGENTS.md"), "physical target missing");
   });
 
   check("the_clones_chip_opens_the_working_copies_tab", () => {
     el("main").dispatch("click", {
       target: rowTarget({ "data-project-key": "github:1000000001", "data-focus": "copies" }),
     });
-    const body = el("inspector-body").html();
+    const body = el("project-detail-body").html();
     expect(body.indexOf("2 working copies of one repository") !== -1, "the copies tab did not open");
     expect(body.indexOf("repository breadth used in routing") !== -1, "the reason clones collapse is not stated");
   });
@@ -2281,7 +2287,7 @@ JS_CHECKS = [
     "benefit_is_the_em_dash_the_data_sent_never_a_zero",
     "exposure_distinguishes_missing_observations_and_partial_rates",
     "a_repo_with_no_display_name_falls_back_to_its_key",
-    "context_weight_column_leads_with_what_costs_every_session",
+    "context_column_shows_observed_bytes_without_session_claims",
     "clicking_a_project_opens_the_file_by_file_breakdown",
     "the_project_topology_tab_names_the_symlink",
     "the_clones_chip_opens_the_working_copies_tab",

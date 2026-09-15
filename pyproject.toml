@@ -1,6 +1,6 @@
 [project]
 name = "self-improve"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline trajectory miner: turns Claude Code / Codex session history into eval-gated CLAUDE.md / AGENTS.md / skill / hook improvements"
 readme = "README.md"
 license = "MIT"

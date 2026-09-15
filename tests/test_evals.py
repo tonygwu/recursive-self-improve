@@ -1242,7 +1242,7 @@ class TestMajorityGateRunsEveryScenario:
             }
 
         got = gate_majority(lambda i: self._spec(f"s{i}"), run_gate, scenarios=3)
-        assert seen == [0, 1, 2] or got["verdict"] == "gated_fail"
+        assert seen == [0, 1, 2]
         assert got["verdict"] == "gated_fail"
         assert got["scenario_tally"]["gated_fail"] == 2
 
@@ -1282,30 +1282,27 @@ class TestMajorityGateRunsEveryScenario:
         assert got["scenarios_run"] == 3
         assert [r["verdict"] for r in got["scenarios"]] == ["gated_pass"] * 3
 
-    def test_early_exit_never_changes_the_verdict(self):
-        """Stopping early is a budget optimisation, never a different answer.
+    @pytest.mark.parametrize("third", ["gated_pass", "gated_fail", "ungated", "error"])
+    def test_settled_failure_still_retains_the_final_scenario(self, third):
+        """A fixed verdict does not make the remaining evidence expendable."""
+        from self_improve.evals.regression import gate_majority
 
-        Two fails settle `gated_fail` no matter what a third scenario does, so
-        the gate may stop. Every completion of the unrun scenarios must agree.
-        """
-        from self_improve.evals.regression import gate_majority, majority_verdict
+        generated = []
 
-        ran = []
+        def generate(index):
+            generated.append(index)
+            if index == 2 and third == "error":
+                raise ValueError("invented final scenario error")
+            return self._spec(f"s{index}")
 
-        def run_gate(spec, index):
-            ran.append(index)
-            return {
-                "verdict": "gated_fail", "without_stats": {}, "with_stats": {},
-                "eval_result_id": "e",
-            }
-
-        got = gate_majority(lambda i: self._spec(f"s{i}"), run_gate, scenarios=3)
+        got = gate_majority(generate, self._gate(["gated_fail", "gated_fail", third]), scenarios=3)
         assert got["verdict"] == "gated_fail"
-        assert len(ran) == 2, "two fails settle it; the third scenario is wasted quota"
-        for third in ("gated_pass", "gated_fail", "ungated", "error"):
-            tally = dict(got["scenario_tally"])
-            tally[third] += 1
-            assert majority_verdict(tally) == "gated_fail"
+        assert generated == [0, 1, 2]
+        assert got["scenarios_run"] == 3
+        assert [r["verdict"] for r in got["scenarios"]] == ["gated_fail", "gated_fail", third]
+        assert sum(got["scenario_tally"].values()) == 3
+        if third == "error":
+            assert got["scenarios"][2]["error"] == "invented final scenario error"
 
     def test_a_generation_failure_does_not_lose_the_other_scenarios(self):
         from self_improve.evals.regression import gate_majority
@@ -1687,71 +1684,31 @@ class TestTheReportExplainsOnlyTheDocumentedKey:
         )
 
 
-class TestEarlyExitCanNeverChangeTheAnswer:
-    """Exhaustive, not by example.
+class TestCompleteScenarioEvidence:
+    """Every ordered outcome sequence retains its full evidence and verdict."""
 
-    `gate_majority` stops as soon as no completion of the remaining scenarios
-    could change the verdict. That is only safe if the verdict it reports is
-    the one the full run would have produced. The property is checked over
-    EVERY reachable partial tally for one through five scenarios, rather than
-    over a handful of hand-picked ones, because the interesting cases are the
-    ones nobody thinks to write down.
-    """
-
-    def test_no_partial_tally_disagrees_with_its_settled_verdict(self):
+    def test_all_sequences_through_five_scenarios_keep_every_outcome(self):
         import itertools
+        from self_improve.evals.regression import SCENARIO_OUTCOMES, gate_majority, majority_verdict
+        from types import SimpleNamespace
 
-        from self_improve.evals.regression import (
-            SCENARIO_OUTCOMES,
-            _settled_verdict,
-            majority_verdict,
-        )
-
-        disagreements = []
         for scenarios in range(1, 6):
-            for used in range(1, scenarios + 1):
-                for combo in itertools.combinations_with_replacement(
-                    SCENARIO_OUTCOMES, used
-                ):
-                    tally = {k: combo.count(k) for k in SCENARIO_OUTCOMES}
-                    remaining = scenarios - used
-                    settled = _settled_verdict(tally, remaining)
-                    if settled is None or remaining == 0:
-                        continue
-                    if settled != majority_verdict(tally):
-                        disagreements.append((scenarios, tally, remaining, settled))
-        assert not disagreements, (
-            "early exit would report a different verdict than the full run: "
-            f"{disagreements[:5]}"
-        )
+            for outcomes in itertools.product(SCENARIO_OUTCOMES, repeat=scenarios):
+                visited = []
 
-    def test_a_settled_verdict_holds_for_every_possible_completion(self):
-        """The other direction: when it says settled, it must really be settled."""
-        import itertools
+                def run_gate(spec, index):
+                    visited.append(index)
+                    return {"verdict": outcomes[index], "eval_result_id": f"e{index}"}
 
-        from self_improve.evals.regression import (
-            SCENARIO_OUTCOMES,
-            _settled_verdict,
-            majority_verdict,
-        )
-
-        for used in range(1, 4):
-            for combo in itertools.combinations_with_replacement(SCENARIO_OUTCOMES, used):
-                tally = {k: combo.count(k) for k in SCENARIO_OUTCOMES}
-                for remaining in (1, 2):
-                    settled = _settled_verdict(tally, remaining)
-                    if settled is None:
-                        continue
-                    for future in itertools.combinations_with_replacement(
-                        SCENARIO_OUTCOMES, remaining
-                    ):
-                        full = dict(tally)
-                        for outcome in future:
-                            full[outcome] += 1
-                        assert majority_verdict(full) == settled, (
-                            f"{tally} + {future} gives {majority_verdict(full)}, "
-                            f"but the gate stopped early calling it {settled}"
-                        )
+                result = gate_majority(lambda i: SimpleNamespace(id=f"s{i}"), run_gate,
+                                       scenarios=scenarios)
+                tally = {k: outcomes.count(k) for k in SCENARIO_OUTCOMES}
+                assert visited == list(range(scenarios)), outcomes
+                assert result["scenario_tally"] == tally, outcomes
+                assert result["scenarios_run"] == scenarios
+                assert [r["verdict"] for r in result["scenarios"]] == list(outcomes)
+                assert [r["eval_result_id"] for r in result["scenarios"]] == [f"e{i}" for i in range(scenarios)]
+                assert result["verdict"] == majority_verdict(tally)
 
 
 class TestTheCheckedInSeedCorpusStillParses:
@@ -1882,10 +1839,10 @@ class TestTheWholeGatePathRunsEndToEnd:
         # every scenario got its OWN directory; run_trials builds with
         # exist_ok=False, so a collision would have raised
         dirs = sorted(p.name for p in work.iterdir())
-        assert dirs == ["scenario-0", "scenario-1"] or dirs[0] == "scenario-0", dirs
+        assert dirs == [f"scenario-{i}" for i in range(cfg.eval_scenarios)], dirs
         # and the verdict reached the database, not just the return value
         rows = store.query("SELECT verdict, kind FROM eval_results")
-        assert rows, "no eval_results row was persisted"
+        assert len(rows) == cfg.eval_scenarios, "each scenario must persist its own result"
         assert all(r["kind"] == "regression" for r in rows)
         store.close()
 

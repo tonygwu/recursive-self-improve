@@ -57,12 +57,12 @@ DEFAULT_PORT = 8765
 #: "localhost" is accepted only while it resolves to a loopback address.
 _LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1"})
 
-#: The SPA. Another agent owns these files; this module only serves them.
+#: The SPA assets; this module serves them without invoking instruction writers.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_FILENAME = "index.html"
 
-#: Repos whose context weight is measured per request, ranked by sessions.
-#: `queries.projects` reports the skipped count and the reason.
+#: Historical query default, accepted for URL compatibility. Projects now reads
+#: retained inventories and does not run the old context walker.
 DEFAULT_WEIGH_TOP_N = 25
 
 #: Nights of the run x stage grid returned by default. `None` means every
@@ -244,7 +244,7 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
             "Local views and durable review decisions. The dashboard records "
             "intent; a separate worker delivers instruction edits."
         ),
-        version="0.1.0",
+        version="0.1.1",
         lifespan=lifespan,
     )
     app.state.cfg = cfg
@@ -319,6 +319,43 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
                             content={"error": exc.code, "detail": str(exc)})
 
     # -- API -----------------------------------------------------------------
+
+    from .. import eval_history
+    from . import eval_data
+
+    @app.exception_handler(eval_history.EvalHistoryError)
+    async def _eval_history_error(request, exc):
+        return JSONResponse(status_code=exc.status_code,
+                            content={'error':type(exc).__name__,'detail':str(exc)})
+
+    @app.get('/api/eval-attempts', summary='Retained evaluation sources with explicit run or command identity')
+    async def api_eval_attempts(proposal_id: str | None = None, learning_id: str | None = None,
+                                run_id: str | None = None, command_id: str | None = None,
+                                limit: int = 20, cursor: str | None = None, summary: bool = False):
+        with store().transaction():
+            reader = eval_data.attempts if summary else eval_history.page
+            return _json(reader(store(),proposal_id=proposal_id,learning_id=learning_id,
+                         run_id=run_id,command_id=command_id,limit=limit,cursor=cursor))
+
+    @app.get('/api/eval-attempts/{attempt_id}', summary='Complete retained scenarios, arms, trials and model-call evidence')
+    async def api_eval_attempt(attempt_id: str):
+        with store().transaction():
+            return _json(eval_data.attempt(store(),attempt_id))
+
+    @app.get('/api/eval-results', summary='Historical results without explicit attempt links')
+    async def api_eval_results(limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(eval_data.unlinked(store(),limit=limit,cursor=cursor))
+
+    @app.get('/api/eval-health', summary='Aggregate validated attempt outcomes and unknown historical coverage')
+    async def api_eval_health():
+        with store().transaction():
+            return _json(eval_data.health(store()))
+
+    @app.get('/api/eval-results/{result_id}', summary='Complete retained historical evaluation result')
+    async def api_eval_result(result_id: str):
+        with store().transaction():
+            return _json(eval_data.legacy(store(),result_id))
 
     @app.get("/api", summary="Index of every route this process serves")
     async def api_index():
@@ -705,6 +742,51 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
                 raise CommandError('NoSuchIncident', 'No incident with that ID.', 404)
             return _json(scan_data.history_page(store(), incident_id=incident_id, limit=limit, cursor=cursor))
 
+    from .. import rule_availability
+    from ..rule_revisions import AvailabilityError
+
+    @app.exception_handler(AvailabilityError)
+    async def _availability_error(request, exc):
+        invalid = str(exc).startswith('Invalid availability')
+        return JSONResponse(status_code=400 if invalid else 409,
+                            content={"error": "AvailabilityError", "detail": str(exc)})
+
+    @app.get('/api/project-availability', summary='Recorded rule availability in each known working copy')
+    async def api_project_availability(project_key: str, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(rule_availability.project_availability(store(), project_key=project_key, limit=limit, cursor=cursor))
+
+    from .. import instruction_inventory
+
+    @app.exception_handler(instruction_inventory.InventoryError)
+    async def _inventory_error(request, exc):
+        return JSONResponse(status_code=400 if str(exc).startswith('Invalid inventory') else 409,
+                            content={'error': 'InventoryError', 'detail': str(exc)})
+
+    @app.get('/api/project-inventory', summary='Recorded instruction files, ownership and loading paths per copy')
+    async def api_project_inventory(project_key: str, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(instruction_inventory.project_inventory(store(), project_key=project_key, limit=limit, cursor=cursor))
+
+    from . import project_data
+
+    @app.exception_handler(project_data.ProjectRequestError)
+    async def _project_request_error(request, exc):
+        return JSONResponse(status_code=404 if isinstance(exc, project_data.ProjectNotFound) else 400,
+                            content={'error': type(exc).__name__, 'detail': str(exc)})
+
+    @app.get('/api/project-detail', summary='Canonical project contribution, session and delivery summary')
+    async def api_project_detail(project_key: str):
+        with store().transaction():
+            return _json(project_data.detail(store(), project_key=project_key))
+
+    @app.get('/api/project-records', summary='Complete paginated project contributions, evidence, proposals or deliveries')
+    async def api_project_records(project_key: str, kind: str, learning_id: str | None = None,
+                                  limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(project_data.records(store(), cfg, project_key=project_key, kind=kind,
+                                              learning_id=learning_id, limit=limit, cursor=cursor))
+
     @app.get("/api/project-exposure", summary="Timestamped signal occurrences per physical-line exposure")
     async def api_project_exposure(project_key: str, start: str | None = None,
                                    end: str | None = None, compatibility_key: str | None = None,
@@ -721,29 +803,25 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
         weigh_top_n: int | None = DEFAULT_WEIGH_TOP_N,
         other_md: bool = False,
     ):
-        weigher, weigh_reason = _context_weigher(scan_other_md=other_md)
         with store().transaction():
-            payload = queries.projects(store(), weigh=weigher, weigh_top_n=weigh_top_n, now_utc=now())
+            payload = queries.projects(store(), now_utc=now())
         payload["request"] = {
             "weigh_top_n": weigh_top_n,
             "weigh_top_n_default": DEFAULT_WEIGH_TOP_N,
-            "scan_other_md": bool(other_md),
-            "cut": (
-                "context weight is measured for the top-N repos by session "
-                "count and the rest carry the em-dash and the reason. The "
-                "repo-wide markdown walk (other_md) is off unless other_md=1: "
-                "it is the expensive half, and PRD section 8a says that number "
-                "must never be added into context weight."
-            ),
-            "walker_unavailable_reason": weigh_reason,
+            "scan_other_md": False,
+            "cut": "Reads retained instruction inventories. Legacy weigh_top_n and other_md parameters are accepted but do not trigger filesystem inspection.",
+            "walker_unavailable_reason": "Live context walking is not used by this endpoint.",
         }
         return _json(payload)
 
-    @app.get("/api/incident-rate", summary="Incidents per 100k lines by month (PRD 8b)")
-    async def api_incident_rate(project_key: str | None = None):
-        return _json(
-            queries.incident_rate(store(), now_utc=now(), project_key=project_key)
-        )
+    @app.get("/api/incident-rate", summary="V5 monthly timestamped signals per 100k physical lines")
+    async def api_incident_rate(project_key: str | None = None,
+                                compatibility_key: str | None = None, months: int = 7,
+                                end_month: str | None = None, delivery_cursor: str | None = None):
+        with store().transaction():
+            return _json(queries.incident_rate(store(), now_utc=now(), project_key=project_key,
+                compatibility_key=compatibility_key, months=months, end_month=end_month,
+                delivery_cursor=delivery_cursor))
 
     # -- SPA -----------------------------------------------------------------
 

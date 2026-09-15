@@ -2306,7 +2306,7 @@ def projects(
     store,
     *,
     weigh=None,
-    isdir=os.path.isdir,
+    isdir=None,
     weigh_top_n: int | None = None,
     now_utc=None,
 ) -> dict:
@@ -2419,8 +2419,14 @@ def projects(
         else:
             unattributed.append(entry)
 
-    weigher, weigh_reason = (weigh, "") if weigh else _import_context_weight()
+    # The product reads retained inventories. An explicitly injected walker is
+    # kept for offline compatibility checks; ordinary readers never scan files.
+    weigher, weigh_reason = weigh, ""
+    retained_context = weigher is None
     ranked = sorted(repos.values(), key=lambda r: (-r["sessions"], r["project_key"]))
+    if retained_context:
+        from ..instruction_context import project_summaries
+        context_summaries = project_summaries(store, project_keys=repos)
     weigh_budget = len(ranked) if weigh_top_n is None else max(0, weigh_top_n)
     weight_errors: list[dict] = []
 
@@ -2440,7 +2446,7 @@ def projects(
                 "tie_break": "highest count, then the alphabetically first signal_type",
             }
         clone_paths = sorted(repo["clone_paths"])
-        on_disk = [p for p in clone_paths if p and isdir(p)]
+        on_disk = [p for p in clone_paths if p and isdir and isdir(p)]
         # Most sessions wins, ties broken alphabetically so the answer is
         # stable between runs. `on_disk` is already sorted, so the max() below
         # keeps the first of any tie.
@@ -2448,7 +2454,10 @@ def projects(
             max(on_disk, key=lambda p: repo["clone_paths"].get(p, 0)) if on_disk else ""
         )
 
-        if index >= weigh_budget:
+        if retained_context:
+            weight = context_summaries[key]
+            context_path = weight.get('working_copy', {}).get('normalized_path', '')
+        elif index >= weigh_budget:
             weight = not_computable(
                 f"not measured: the caller capped context-weight measurement at "
                 f"{weigh_budget} repos"
@@ -2473,7 +2482,7 @@ def projects(
                 "sessions": repo["sessions"],
                 "clones": len(clone_paths),
                 "clone_paths": clone_paths,
-                "clones_on_disk": len(on_disk),
+                "clones_on_disk": len(on_disk) if isdir is not None else None,
                 "lines_scanned": repo["lines_scanned"],
                 "incidents": incidents,
                 "exposure": project_exposure(store, project_key=key, now_utc=now_utc),
@@ -2484,7 +2493,7 @@ def projects(
                 "rules_received_detail": received.get(key, []),
                 "context_weight": weight,
                 "context_path": context_path,
-                "context_path_reason": (
+                "context_path_reason": weight.get('selection', 'No retained inventory selection is available.') if retained_context else (
                     "the working copy with the most sessions that is still on disk "
                     f"({repo['clone_paths'].get(context_path, 0)} of "
                     f"{repo['sessions']} sessions), ties broken alphabetically; "
@@ -2529,16 +2538,17 @@ def projects(
             "path (a global CLAUDE.md, say) belongs to no repo"
         ),
         "context_weight_errors": weight_errors,
-        "context_weight_available": weigher is not None,
+        "context_source": "recorded_inventory" if retained_context else "explicit_legacy_walker",
+        "context_weight_available": retained_context or weigher is not None,
         "context_weight_reason": weigh_reason,
-        "context_weight_measured": min(weigh_budget, len(rows)),
+        "context_weight_measured": sum(r['context_weight'].get('computable') is True for r in rows) if retained_context else min(weigh_budget, len(rows)),
         "context_weight_capped": (
             {
                 "measured": min(weigh_budget, len(rows)),
                 "skipped": max(0, len(rows) - weigh_budget),
                 "reason": f"caller passed weigh_top_n={weigh_top_n}",
             }
-            if weigh_top_n is not None
+            if weigh_top_n is not None and not retained_context
             else None
         ),
     }
@@ -2568,103 +2578,15 @@ def _weigh(weigher, path: str, key: str, errors: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def incident_rate(
-    store,
-    *,
-    now_utc,
-    min_sessions: int = MIN_SESSIONS_FOR_MONTH,
-    project_key: str | None = None,
-) -> dict:
-    """Report monthly incidents per 100k lines, with session counts beside them.
-
-    Session lengths can change, so per-session and per-line rates answer different
-    questions. Show lines_per_session to expose that change in the denominator.
-    Mark the incomplete current month and report exclusions below min_sessions.
-    Use the injected UTC clock for month boundaries.
-    """
-    # The month of the caller's explicit clock reading. `_utc_day` is what
-    # refuses a naive datetime, so this inherits that guard rather than
-    # repeating it.
-    partial_month = _utc_day(now_utc)[:7]
-    where_sessions = "first_ts <> ''"
-    where_incidents = "ts <> ''"
-    params: tuple = ()
-    if project_key is not None:
-        where_sessions += " AND project_key = ?"
-        where_incidents += " AND project_key = ?"
-        params = (project_key,)
-    sessions = store.query(
-        "SELECT substr(first_ts, 1, 7) AS month, COUNT(*) AS sessions, "
-        f"SUM(lines_scanned) AS lines FROM sessions WHERE {where_sessions} "
-        "GROUP BY substr(first_ts, 1, 7) ORDER BY substr(first_ts, 1, 7)",
-        params,
-    )
-    incidents = {
-        row["month"]: int(row["n"])
-        for row in store.query(
-            "SELECT substr(ts, 1, 7) AS month, COUNT(*) AS n FROM incidents "
-            f"WHERE {where_incidents} GROUP BY substr(ts, 1, 7)",
-            params,
-        )
-    }
-
-    series, dropped = [], []
-    for row in sessions:
-        month = row["month"]
-        n_sessions = int(row["sessions"])
-        lines = int(row["lines"] or 0)
-        n_incidents = incidents.get(month, 0)
-        if n_sessions < min_sessions:
-            dropped.append(
-                {
-                    "month": month,
-                    "sessions": n_sessions,
-                    "incidents": n_incidents,
-                    "lines": lines,
-                    "reason": (
-                        f"{n_sessions} sessions is under the {min_sessions}-session floor; "
-                        "transcripts age out, so early months are survivorship noise"
-                    ),
-                }
-            )
-            continue
-        per_100k = (n_incidents * 100_000 / lines) if lines > 0 else None
-        series.append(
-            {
-                "month": month,
-                "sessions": n_sessions,
-                "lines": lines,
-                "incidents": n_incidents,
-                "per_100k_lines": per_100k,
-                "per_100_sessions": (n_incidents * 100 / n_sessions) if n_sessions else None,
-                "lines_per_session": (lines / n_sessions) if n_sessions else None,
-                "enough_data": per_100k is not None,
-                "reason": "" if per_100k is not None else "no lines were scanned this month",
-                "partial": month == partial_month,
-                "partial_reason": (
-                    "this month is still in progress, so it is not comparable "
-                    "to the complete months beside it"
-                    if month == partial_month
-                    else ""
-                ),
-            }
-        )
-    months_missing_sessions = sorted(set(incidents) - {row["month"] for row in sessions})
-    return {
-        "partial_month": partial_month,
-        "primary_series": "per_100k_lines",
-        "secondary_series": ["lines_per_session", "per_100_sessions"],
-        "series": series,
-        "dropped_months": dropped,
-        "min_sessions": min_sessions,
-        "project_key": project_key,
-        "incident_months_without_sessions": months_missing_sessions,
-        "denominator_note": (
-            "Per 100k scanned lines, not per session: a per-session rate measures how "
-            "much work happens in a session at least as much as how often mistakes do."
-        ),
-        "zero_line_months": [row["month"] for row in series if row["lines"] == 0],
-    }
+def incident_rate(store, *, now_utc, min_sessions=MIN_SESSIONS_FOR_MONTH,
+                  project_key=None, compatibility_key=None, months=7,
+                  end_month=None, delivery_cursor=None) -> dict:
+    """Version-2 monthly physical-line observations; no legacy session estimate."""
+    _utc_day(now_utc)
+    from .trend_data import monthly_exposure
+    return monthly_exposure(store, now_utc=now_utc, min_sessions=min_sessions,
+                            project_key=project_key, compatibility_key=compatibility_key,
+                            months=months, end_month=end_month, delivery_cursor=delivery_cursor)
 
 
 # ---------------------------------------------------------------------------

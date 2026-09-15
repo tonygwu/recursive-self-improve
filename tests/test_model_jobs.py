@@ -18,16 +18,22 @@ def synthetic_execute(self,call_id,stage,model_class,prompt,expect_json,**kwargs
         value={'title':'Invented formatting check','scenario_prompt':'Write the answer.',
             'workspace_files':{'input.txt':'invented input'},'success_criteria':'A good answer file exists',
             'grader':{'type':'code','check':'test -f good.txt'}}
-        return _ExecResult(ok=True,text=json.dumps(value),parsed=value,outcome='ok',provider='codex',model_reported='gpt-5.6-terra')
+        return _ExecResult(ok=True,text=json.dumps(value),parsed=value,outcome='ok',provider='codex',model_reported='gpt-5.6-terra',provider_attempts=1)
     sandbox=Path(kwargs['sandbox_dir'])
     if (sandbox/'CLAUDE.md').exists():(sandbox/'good.txt').write_text('good')
-    return _ExecResult(ok=True,text='done',parsed=None,outcome='ok',provider='codex',model_reported='gpt-5.6-terra')
+    return _ExecResult(ok=True,text='done',parsed=None,outcome='ok',provider='codex',model_reported='gpt-5.6-terra',provider_attempts=1)
 
 
 @pytest.fixture
 def env(cfg,store,tmp_path,monkeypatch):
     cfg=replace(cfg,eval_sandbox_enabled=False,global_claude_md=str(tmp_path/'global.md'),
-                codex_global_agents_md=str(tmp_path/'AGENTS.md'),skills_dir=str(tmp_path/'skills'))
+                codex_global_agents_md=str(tmp_path/'AGENTS.md'),skills_dir=str(tmp_path/'skills'),
+                codex_skills_dir=str(tmp_path/'codex-skills'),
+                claude_projects_dir=str(tmp_path/'claude-projects'),
+                claude_history_path=str(tmp_path/'claude-history.jsonl'),
+                codex_sessions_dir=str(tmp_path/'codex-sessions'),
+                codex_archived_dir=str(tmp_path/'codex-archive'),
+                production_repo_path=str(tmp_path/'production'))
     target=tmp_path/'rule.md';target.write_text(OLD)
     p=insert_proposal(store,target=target,diff=make_diff(OLD,NEW),status='pending')
     calls=[]
@@ -79,6 +85,45 @@ def test_gate_completes_with_durable_calls_and_no_instruction_delivery(env):
     assert Path(p['target_path']).read_text()==OLD and not cfg.state_path('snapshots').exists()
     assert job_worker.run_once(store,cfg) is None
     assert command_summary(command_status(store,queued['id']))['budget']==result['budget']
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def test_failed_gate_runs_every_scenario_within_its_original_reservation(env, monkeypatch, restart):
+    cfg, store, p, calls = env
+    submit_command(store, cfg, request(env))
+    original = LLMRunner._execute
+
+    def fail_trials(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if args[1] == 'grade':
+            (Path(kwargs['sandbox_dir']) / 'good.txt').unlink(missing_ok=True)
+        return result
+
+    monkeypatch.setattr(LLMRunner, '_execute', fail_trials)
+    if restart:
+        def interrupt_after_two_scenarios(event):
+            if event == 'step_completed' and len(calls) == 14:
+                raise KeyboardInterrupt()
+        monkeypatch.setattr(job_worker, '_checkpoint', interrupt_after_two_scenarios)
+        with pytest.raises(KeyboardInterrupt):
+            job_worker.run_once(store, cfg)
+        monkeypatch.setattr(job_worker, '_checkpoint', lambda _: None)
+
+    with closing(Store(store.db_path, migrate=False)) as fresh:
+        result = job_worker.run_once(fresh, cfg)
+    assert result['state'] == 'completed', result
+    assert result['result']['verdict'] == 'gated_fail'
+    assert len(calls) == len({c[0] for c in calls}) == 21
+    assert result['budget']['consumed']['gate'] == result['budget']['maximum']['gate'] == 21
+    assert len(store.query('SELECT * FROM runs')) == 1
+    evaluations = store.query('SELECT * FROM job_evaluations ORDER BY scenario_index')
+    assert [r['scenario_index'] for r in evaluations] == [0, 1, 2]
+    assert len({r['eval_result_id'] for r in evaluations}) == 3
+    assert len(store.query('SELECT * FROM proposal_eval_history')) == 1
+    split = result['result']['gate']['scenario_splits'][0]
+    assert split['scenarios_run'] == split['tally']['gated_fail'] == 3
+    assert Path(p['target_path']).read_text() == OLD
+    assert job_worker.run_once(store, cfg) is None
 
 
 @pytest.mark.parametrize('initial_status',['approved_user','applied','rejected_user','rolled_back','superseded'])

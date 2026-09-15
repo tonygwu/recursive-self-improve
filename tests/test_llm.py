@@ -456,6 +456,7 @@ class TestOauthRetry:
         res = h.runner.call("mine", "sonnet", PROMPT, expect_json=False)
         assert res.ok is True
         assert res.outcome == "oauth_transient_retried"
+        assert res.provider_attempts == 2
         assert res.text == "OK"
         # Exactly two provider invocations, one pick (no re-pick).
         assert len(h.fake.calls_for(CLAUDE_BIN)) == 2
@@ -482,6 +483,7 @@ class TestOauthRetry:
         assert res.ok is False
         assert res.outcome == "other"
         assert "oauth failure persisted after retry" in res.error
+        assert res.provider_attempts == 2
         # Exactly one retry — never a third attempt.
         assert len(h.fake.calls_for(CLAUDE_BIN)) == 2
         assert one_llm_row(h.store)["outcome"] == "other"
@@ -535,6 +537,7 @@ class TestQuotaRepick:
         assert res.ok is False
         assert res.outcome == "quota_exhausted"
         assert "re-pick has no capacity" in res.error
+        assert res.provider_attempts == 1
         assert one_llm_row(h.store)["outcome"] == "quota_exhausted"
 
     def test_repick_to_other_provider_success(self, tmp_path, monkeypatch):

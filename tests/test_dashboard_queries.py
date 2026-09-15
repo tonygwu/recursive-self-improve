@@ -1473,60 +1473,16 @@ def _monthly_fixture(store):
                       created_at="2026-08-18T00:00:00Z", project_key="k")
 
 
-def test_incident_rate_denominator_is_lines_not_sessions(tmp_path):
-    """Keep both denominators visible when their trends point in opposite directions.
-
-    The invented August rows have more incidents per session and fewer per line
-    than July. Neither series should silently replace the other.
-    """
+def test_legacy_session_and_queue_totals_never_become_observed_trends(tmp_path):
     store, path = _writable(tmp_path)
     _monthly_fixture(store)
     store.close()
-
     trend = q.incident_rate(_read_only(path), now_utc=_NOW_DT)
-    assert trend["primary_series"] == "per_100k_lines"
-    by_month = {point["month"]: point for point in trend["series"]}
-    assert by_month["2026-07"]["per_100k_lines"] == pytest.approx(100.0, abs=1.0)
-    assert by_month["2026-08"]["per_100k_lines"] == pytest.approx(31.25, abs=1.0)
-    assert by_month["2026-08"]["per_100k_lines"] < by_month["2026-07"]["per_100k_lines"], (
-        "the primary series must show August improving, as the work denominator does"
-    )
-    # The per-session series is still carried, beside it, so the change in
-    # working style reads as a change in working style.
-    assert by_month["2026-08"]["per_100_sessions"] > by_month["2026-07"]["per_100_sessions"]
-    assert by_month["2026-08"]["lines_per_session"] > 7 * by_month["2026-07"]["lines_per_session"]
-
-
-def test_incident_rate_guards_division_by_zero(tmp_path):
-    """A session with no scanned lines must not cause division by zero."""
-    store, path = _writable(tmp_path)
-    for index in range(25):
-        _session(store, file_path=f"z{index}", project_key="k", project_display="k",
-                 first_ts="2026-05-05T00:00:00Z", lines=0)
-        _incident(store, session_file=f"z{index}", ts="2026-05-06T00:00:00Z",
-                  created_at="2026-08-18T00:00:00Z", project_key="k")
-    store.close()
-
-    trend = q.incident_rate(_read_only(path), now_utc=_NOW_DT)
-    point = trend["series"][0]
-    assert point["lines"] == 0
-    assert point["per_100k_lines"] is None
-    assert point["enough_data"] is False
-    assert trend["zero_line_months"] == ["2026-05"]
-
-
-def test_incident_rate_drops_small_months_and_reports_what_it_cut(tmp_path):
-    store, path = _writable(tmp_path)
-    _monthly_fixture(store)
-    store.close()
-
-    trend = q.incident_rate(_read_only(path), now_utc=_NOW_DT)
-    assert [point["month"] for point in trend["series"]] == ["2026-06", "2026-07", "2026-08"]
-    assert trend["dropped_months"] == [
-        {"month": "2026-04", "sessions": 2, "incidents": 10, "lines": 900,
-         "reason": trend["dropped_months"][0]["reason"]}
-    ]
-    assert "under the 20-session floor" in trend["dropped_months"][0]["reason"]
+    assert trend["contract_version"] == 2
+    assert trend["primary_series"] == "signal_occurrences_per_100k_physical_lines"
+    assert trend["series"] == [] and trend["dropped_months"] == []
+    assert trend["reason"] == "missing_observations"
+    assert not trend["computable"]
 
 
 # ---------------------------------------------------------------------------
@@ -1649,7 +1605,7 @@ def test_context_path_is_the_busiest_on_disk_clone_not_the_alphabetical_first(tm
     _busy_and_idle_clones(store)
     store.close()
 
-    row = q.projects(_read_only(path), weigh_top_n=0, isdir=lambda p: True)["rows"][0]
+    row = q.projects(_read_only(path), weigh_top_n=0, weigh=lambda path: {}, isdir=lambda p: True)["rows"][0]
     assert row["context_path"] == "/repos/thing/repo-9", (
         "context weight was measured in the alphabetically-first checkout, "
         "which is not what the payload's own reason string promises"
@@ -1663,7 +1619,7 @@ def test_context_path_skips_a_busy_clone_that_is_no_longer_on_disk(tmp_path):
     store.close()
 
     row = q.projects(
-        _read_only(path), weigh_top_n=0,
+        _read_only(path), weigh_top_n=0, weigh=lambda path: {},
         isdir=lambda p: p != "/repos/thing/repo-9",
     )["rows"][0]
     assert row["context_path"] == "/repos/thing/repo-0"
@@ -1678,7 +1634,7 @@ def test_context_path_ties_break_alphabetically_so_the_answer_is_stable(tmp_path
              project_path="/repos/thing/repo-2", lines=1_000)
     store.close()
 
-    row = q.projects(_read_only(path), weigh_top_n=0, isdir=lambda p: True)["rows"][0]
+    row = q.projects(_read_only(path), weigh_top_n=0, weigh=lambda path: {}, isdir=lambda p: True)["rows"][0]
     assert row["context_path"] == "/repos/thing/repo-2"
 
 
@@ -1688,7 +1644,7 @@ def test_the_context_path_reason_describes_what_the_code_actually_does(tmp_path)
     _busy_and_idle_clones(store)
     store.close()
 
-    row = q.projects(_read_only(path), weigh_top_n=0, isdir=lambda p: True)["rows"][0]
+    row = q.projects(_read_only(path), weigh_top_n=0, weigh=lambda path: {}, isdir=lambda p: True)["rows"][0]
     reason = row["context_path_reason"]
     assert "most sessions" in reason
     assert row["context_path"] == "/repos/thing/repo-9", (
@@ -2591,26 +2547,6 @@ def test_the_excluded_project_counts_reconcile(tmp_path):
     assert excluded["count"] == 1, excluded
     assert sum(excluded["by_method"].values()) == excluded["count"], excluded
 
-
-def test_the_current_month_is_marked_partial_not_charted_as_complete(tmp_path):
-    """Keep the current month visible while marking its incomplete denominator."""
-    store, path = _writable(tmp_path)
-    for i in range(30):
-        _session(store, file_path=f"aug{i}.jsonl", project_key="github:1",
-                 first_ts="2026-08-10T00:00:00Z", lines=1000)
-    for i in range(30):
-        _session(store, file_path=f"sep{i}.jsonl", project_key="github:1",
-                 first_ts="2026-09-02T00:00:00Z", lines=50)
-    store.close()
-
-    now = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
-    out = q.incident_rate(_read_only(path), now_utc=now)
-    by_month = {r["month"]: r for r in out["series"]}
-    assert by_month["2026-08"]["partial"] is False, by_month["2026-08"]
-    sep = by_month["2026-09"]
-    assert sep["partial"] is True, sep
-    assert "in progress" in sep["partial_reason"] or "complete" in sep["partial_reason"], sep
-    assert out["partial_month"] == "2026-09", out["partial_month"]
 
 
 def test_incident_rate_refuses_a_naive_clock(tmp_path):

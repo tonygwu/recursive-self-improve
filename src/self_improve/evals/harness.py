@@ -269,7 +269,7 @@ def run_trials(
     model_grader: Callable[[str, str], bool] | None = None,
     *,
     work_dir: Path | None = None,
-    grader_timeout_seconds: float = 600.0, checkpoint=None,
+    grader_timeout_seconds: float = 600.0, checkpoint=None, history=None,
 ) -> TrialStats:
     """Run n independent sandboxed trials of spec and grade each one.
 
@@ -349,8 +349,18 @@ def run_trials(
                 )
 
             return {"outcome":outcome,"error":error,"grader":detail}
-        record=(execute_trial() if checkpoint is None else checkpoint(
-            f'trial:{i}',{'spec':spec_to_dict(spec),'rule_text':rule_text,'work_dir':str(work)},execute_trial))
+        if history is not None:
+            history.started(i, str(work / f'trial-{i:02d}'),spec=spec_to_dict(spec),
+                            rule_text=rule_text,grader_timeout=grader_timeout_seconds)
+        try:
+            record=(execute_trial() if checkpoint is None else checkpoint(
+                f'trial:{i}',{'spec':spec_to_dict(spec),'rule_text':rule_text,'work_dir':str(work)},execute_trial))
+        except BaseException as exc:
+            if history is not None:
+                history.failed(i, exc)
+            raise
+        if history is not None:
+            history.finished(i, record)
         if record['outcome']=='pass':succeeded+=1
         else:errors[record['outcome']]=errors.get(record['outcome'],0)+1
 

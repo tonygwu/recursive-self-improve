@@ -410,6 +410,10 @@ def run_pipeline(
         scan_stats = scan.scan_all(store, cfg, sources, run_id)
         stats["scan"] = scan_stats.as_dict() if hasattr(scan_stats, "as_dict") else vars(scan_stats)
         store.commit()
+        # Collect actual working-copy files before mining. Observation time is
+        # this inspection, never the application event or session timestamp.
+        from .rule_availability import collect_availability
+        stats["availability"] = collect_availability(store, cfg, run_id=run_id)
 
         if not dry_run:
             import dataclasses
@@ -760,10 +764,14 @@ def run_pipeline(
                 apply_stats["taxonomy"][key] = apply_stats["taxonomy"].get(key, 0) + 1
 
             def gate_run(learning: dict, proposal: dict) -> None:
+                # This stage owns source work; publish it before the history
+                # recorder starts short, independent execution transactions.
+                store.commit()
                 gate_one_proposal(
                     store, cfg, llm, learning, proposal,
                     run_dir=run_dir, sandbox_state=sandbox_state,
                     gate_stats=gate_stats, bump_taxonomy=_bump_tax,
+                    run_id=run_id,
                 )
 
             for learning in merged:
@@ -931,6 +939,7 @@ def run_pipeline(
                         f"A/B sweep needs {need_ab} gate calls; {left_ab} left"
                     )
 
+                store.commit()  # Publish stage work before the independent eval recorder.
                 ab_result = ab.rerun_applied(
                     store,
                     cfg,
@@ -939,6 +948,7 @@ def run_pipeline(
                     # Committed specs predate the move to the state dir.
                     fallback_spec_dir=SEED_REGRESSION_DIR,
                     work_dir=run_dir / "ab",
+                    run_id=run_id,
                 )
                 prune_proposals = ab_result.pop("proposals", [])
                 for pp in prune_proposals:
@@ -1168,7 +1178,7 @@ class BudgetExhaustedSignal(Exception):
     pass
 
 
-def _llm_json(llm, stage: str, model_class: str, prompt: str, *, provenance=None) -> dict | None:
+def _llm_json(llm, stage: str, model_class: str, prompt: str, *, provenance=None, call_trace=None) -> dict | None:
     """Adapter: LLMRunner.call -> parsed dict or None on parse failure.
 
     Budget exhaustion propagates as BudgetExhaustedSignal so the pipeline can
@@ -1177,7 +1187,8 @@ def _llm_json(llm, stage: str, model_class: str, prompt: str, *, provenance=None
     from .llm import BudgetExhausted
 
     try:
-        result = llm.call(stage, model_class, prompt, expect_json=True)
+        result = llm.call(stage, model_class, prompt, expect_json=True,
+                          **({'call_trace':call_trace} if call_trace is not None else {}))
     except BudgetExhausted as exc:
         raise BudgetExhaustedSignal(str(exc)) from exc
     from .mining_history import capture
@@ -1312,6 +1323,7 @@ def gate_one_proposal(
     store, cfg, llm, learning: dict, proposal: dict, *,
     run_dir, sandbox_state: dict, gate_stats: dict, bump_taxonomy,
     evidence_override: str | None = None, checkpoint=None,
+    run_id: str = '', source_revision_id: str = '', history=None,
 ) -> None:
     """Run the majority gate for ONE proposal. THE gate call site.
 
@@ -1325,6 +1337,11 @@ def gate_one_proposal(
     INSERTS a new proposal row and the CLI UPDATES an existing one.
     """
     from .evals import regression
+    from . import eval_history
+    from .evals.harness import spec_to_dict
+
+    history = history or eval_history.begin(store,cfg,learning,proposal,run_id=run_id,
+        command_id=checkpoint.cid if checkpoint is not None else '',source_revision_id=source_revision_id)
 
     gate_stats["attempted"] += 1
     try:
@@ -1344,31 +1361,48 @@ def gate_one_proposal(
         _ensure_sandbox(cfg, run_dir, sandbox_state)
         evidence = _learning_evidence(store, learning) if evidence_override is None else evidence_override
         def generate(scenario):
+            history.event(f'scenario:{scenario}:generation:start','generation_started',
+                          {'evidence':evidence},scenario=scenario)
             def build():
-                return regression.generate_spec(learning,
-                    lambda prompt: _llm_json(llm,"eval_gen",cfg.strong_model_class,prompt),
-                    PROMPTS_DIR,out_dir=regression_specs_dir(cfg),evidence=evidence,scenario=scenario)
-            if checkpoint is None:
-                return build()
-            from .evals.harness import spec_from_dict,spec_to_dict
-            frozen=checkpoint.step(f'scenario:{scenario}:spec',{'learning':learning,'evidence':evidence},lambda:spec_to_dict(build()))
-            return spec_from_dict(frozen,origin=f'job:{checkpoint.cid}:scenario:{scenario}')
+                try:
+                    return regression.generate_spec(learning,
+                        lambda prompt: _llm_json(llm,"eval_gen",cfg.strong_model_class,prompt,
+                                                call_trace=history.call_trace(scenario=scenario)),
+                        PROMPTS_DIR,out_dir=regression_specs_dir(cfg),evidence=evidence,scenario=scenario,
+                        record_prompt=lambda data:history.event(f'scenario:{scenario}:prompt','generation_prompt',
+                                                                 data,scenario=scenario))
+                except Exception as exc:
+                    history.event(f'scenario:{scenario}:generation:failed','generation_failed',
+                                  {'code':type(exc).__name__,'detail':str(exc)},scenario=scenario)
+                    raise
+            if checkpoint is None:spec=build()
+            else:
+                from .evals.harness import spec_from_dict
+                frozen=checkpoint.step(f'scenario:{scenario}:spec',{'learning':learning,'evidence':evidence},lambda:spec_to_dict(build()))
+                spec=spec_from_dict(frozen,origin=f'job:{checkpoint.cid}:scenario:{scenario}')
+            spec_record=spec_to_dict(spec)
+            history.event(f'scenario:{scenario}:spec','specification',
+                          {'spec':spec_record,'spec_revision':eval_history.digest(spec_record)},scenario=scenario)
+            return spec
 
         def evaluate(spec,scenario):
             options={}
             if checkpoint is not None:
                 options={'checkpoint':lambda key,inputs,fn:checkpoint.step(f'scenario:{scenario}:{key}',inputs,fn),
-                         'record_result':lambda row:checkpoint.record_eval(scenario,row)}
-            return regression.gate(spec,learning['rule_text'],_make_sandbox_agent_runner(llm,cfg),cfg,
-                store=store,work_dir=run_dir/'trials'/learning['id']/f'scenario-{scenario}',**options)
+                         'record_result':lambda row:checkpoint.record_eval(scenario,row,history=history)}
+            result=regression.gate(spec,learning['rule_text'],_make_sandbox_agent_runner(llm,cfg),cfg,
+                store=store,work_dir=run_dir/'trials'/learning['id']/f'scenario-{scenario}',
+                history=history,scenario=scenario,**options)
+            return result
 
         verdict = regression.gate_majority(generate,evaluate,scenarios=cfg.eval_scenarios)
         proposal["status"] = verdict["verdict"]
         proposal["eval_result_id"] = verdict["eval_result_id"]
         gate_stats[verdict["verdict"]] += 1
-        # eval_results has no run_id column, so the per-scenario
-        # split cannot be joined back from the DB. Carry it in the
-        # run stats or the report can only print the single word.
+        history.event('result','attempt_result',{k:verdict[k] for k in
+                      ('verdict','eval_result_id','scenario_tally','scenarios_run')})
+        # Preserve the native stage tally for reports. Detailed scenario
+        # rows now join to the actual run through eval_attempt_events.
         gate_stats.setdefault("scenario_splits", []).append(
             {
                 "proposal_id": proposal["id"],
@@ -1378,7 +1412,8 @@ def gate_one_proposal(
                 "scenarios_run": verdict.get("scenarios_run", 0),
             }
         )
-    except (BudgetExhaustedSignal, BudgetExhausted):
+    except (BudgetExhaustedSignal, BudgetExhausted) as exc:
+        history.stop(exc)
         # BudgetExhausted arrives RAW from harness.run_trials, which
         # re-raises it rather than burying it as agent_error. Both
         # mean the same thing and must land in the same bucket:
@@ -1390,7 +1425,8 @@ def gate_one_proposal(
         # trial without providing a verdict or evidence of a harness fault.
         gate_stats["refused"] += 1
         bump_taxonomy("gate_budget_exhausted")
-    except SandboxUnverified:
+    except SandboxUnverified as exc:
+        history.stop(exc)
         # NOT gated_fail. The rule was never tested, and recording
         # a verdict about it would repeat the exact mistake this
         # sandbox work exists to fix.
@@ -1398,9 +1434,13 @@ def gate_one_proposal(
         gate_stats["failed"] += 1
         bump_taxonomy("gate_sandbox_unverified")
     except Exception as exc:
+        history.stop(exc)
         proposal["status"] = "pending"
         gate_stats["failed"] += 1
         bump_taxonomy(f"gate_{type(exc).__name__}")
+    except BaseException as exc:
+        history.stop(exc)
+        raise
 
 
 class ProposalNotFound(Exception):
@@ -1461,7 +1501,16 @@ def gate_existing_proposal(cfg, store, proposal_id: str, *, _llm_factory=None) -
         from .llm import LLMRunner
 
         _llm_factory = LLMRunner
-    llm = _llm_factory(cfg, store, run_id, run_dir / "raw")
+    from . import eval_history
+    history=eval_history.begin(store,cfg,learning,proposal,run_id=run_id,source_revision_id=source_revision_id)
+    try:
+        llm = _llm_factory(cfg, store, run_id, run_dir / "raw")
+    except BaseException as exc:
+        history.stop(exc)
+        with store.transaction(write=True):
+            store.update('runs','id',run_id,{'status':'error' if isinstance(exc,Exception) else 'interrupted',
+                         'finished':utc_now_iso(),'stats_json':json.dumps({'gate_initialization_error':str(exc)})})
+        raise
     gate_stats = new_gate_stats()
     taxonomy: dict[str, int] = {}
 
@@ -1477,6 +1526,7 @@ def gate_existing_proposal(cfg, store, proposal_id: str, *, _llm_factory=None) -
         run_dir=run_dir, sandbox_state=sandbox_state,
         gate_stats=gate_stats, bump_taxonomy=bump,
         evidence_override=_evidence_excerpt(next((i['window_json'] for i in source['snapshot']['evidence'] if i['window_json']), '')),
+        run_id=run_id,source_revision_id=source_revision_id,history=history,
     )
     store.commit()  # Finish trial persistence before reserving the decision write.
     with store.transaction(write=True):
@@ -1575,7 +1625,7 @@ def _make_sandbox_agent_runner(llm, cfg: Config):
     is what puts a kernel boundary around the whole agent, file tools included.
     """
 
-    def run(prompt: str, sandbox_dir: Path) -> str:
+    def run(prompt: str, sandbox_dir: Path, *, call_trace=None) -> str:
         result = llm.call(
             "grade",
             cfg.cheap_model_class,
@@ -1583,11 +1633,13 @@ def _make_sandbox_agent_runner(llm, cfg: Config):
             expect_json=False,
             cwd=str(sandbox_dir),
             sandbox_dir=str(sandbox_dir),
+            **({'call_trace':call_trace} if call_trace is not None else {}),
         )
         if not result.ok:
             raise RuntimeError(f"eval agent call failed: {result.outcome}")
         return result.text
 
+    run.with_history = lambda history: lambda prompt, sandbox: run(prompt,sandbox,call_trace=history.call_trace())
     return run
 
 

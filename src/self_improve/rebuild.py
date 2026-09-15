@@ -223,6 +223,25 @@ def rebuild_state(
 def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, reason: str) -> dict:
     """Read, export, verify, and delete under the caller's owned transaction."""
 
+    # Execution history is not a reproducible mining cache. Its source rows
+    # remain referenced by durable command and operation records. Until the
+    # rebuild can preserve their full dependency closure, refuse before export
+    # or deletion instead of failing halfway through on a foreign key.
+    execution_records = {}
+    from . import eval_history
+    if eval_history.available(store):
+        count=store.query_one('SELECT COUNT(*) AS n FROM eval_attempts')['n']
+        if count:execution_records['eval_attempts']=count
+    for migration, table in (('0010_dashboard_commands', 'commands'),
+                             ('0012_instruction_operations', 'instruction_operations'),
+                             ('0010_dashboard_commands', 'proposal_revisions')):
+        if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (migration,)):
+            count = store.query_one(f'SELECT COUNT(*) AS n FROM {table}')['n']
+            if count: execution_records[table] = count
+    if execution_records:
+        raise ValueError('Rebuild unavailable: retained execution history references source rows; '
+                         'selective execution-history preservation is required. Retained rows: '+str(execution_records))
+
     orphan_sessions = _orphaned_sessions(store)
     orphan_files = {s["file_path"] for s in orphan_sessions}
     orphan_incidents = [
@@ -240,6 +259,14 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         store.query_one("SELECT name FROM schema_migrations WHERE name = ?", (SCAN_MIGRATION,))
     )
     scan = _scan_retention(store, orphan_files) if has_scan else None
+    from .rule_revisions import MIGRATION as AVAILABILITY_MIGRATION, TABLES as AVAILABILITY_TABLES, require_schema as require_availability
+    has_availability = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (AVAILABILITY_MIGRATION,)))
+    if has_availability:
+        require_availability(store)
+    from . import instruction_inventory
+    has_inventory = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (instruction_inventory.MIGRATION,)))
+    if has_inventory:
+        instruction_inventory.require_schema(store)
     derived_tables=tuple(t for t in _DERIVED_TABLES if t!='mining_history' or has_history)
     counts = {
         t: store.query_one(f"SELECT COUNT(*) AS n FROM {t}")["n"]
@@ -298,6 +325,13 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         payload['mining_history']=store.query('SELECT * FROM mining_history ORDER BY created_at,id')
     if scan is not None:
         payload["scan_observations"] = _scan_export(store, scan)
+    if has_availability:
+        # Delivered revisions and actual-copy observations survive a derived-data
+        # rebuild. Export them too, so their links remain auditable after it.
+        payload['rule_availability'] = {table: store.query(f'SELECT * FROM {table} ORDER BY id')
+                                        for table in AVAILABILITY_TABLES}
+    if has_inventory:
+        payload['instruction_inventories'] = store.query('SELECT * FROM instruction_inventories ORDER BY id')
     manifest = backup_rebuild_rows(payload, export_path)
     stats["backup_sha256"] = manifest["sha256"]
 

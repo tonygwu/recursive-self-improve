@@ -3,7 +3,7 @@ from datetime import date
 import json
 
 from . import queries, scan_data
-from .. import scan_reporting
+from .. import scan_reporting, availability_reporting
 
 
 class RunDataError(ValueError):
@@ -92,6 +92,8 @@ def detail(store, run_id):
         'command_ids':_commands(store,run_id),
         'missing_job_schemas':[migration for migration in JOB_SCHEMAS.values() if not _available(store,migration)],
         'scan_summary':scan_reporting.summary(stats.get('scan'), owner='run '+run_id+'.scan'),
+        'availability_summary': availability_reporting.summary(
+            stats.get('availability'), owner='run '+run_id+'.availability'),
         'provenance_note':'Calls and job results use explicit run links. Current proposal references are labeled separately from historical execution.'}
 
 
@@ -125,6 +127,9 @@ def _records(store, run_id, kind, stats):
             raise RunDataError('run '+run_id+': applied delivery is not a completed automatic operation')
         return result,reason
     refs={}
+    from .. import eval_history
+    for link in eval_history.result_links(store,run_id=run_id):
+        refs.setdefault(link['eval_result_id'],[]).append(link)
     history = store.query('SELECT * FROM proposal_eval_history WHERE run_id=? ORDER BY created_at,id',(run_id,)) if _available(store, '0010_dashboard_commands') else []
     for row in history:
         if row['eval_result_id']:

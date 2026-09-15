@@ -975,6 +975,22 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         out.append("No scan failures were recorded in this run's taxonomy.")
     out.append("")
 
+    from .availability_reporting import summary as availability_summary
+    availability = availability_summary(stats.get('availability'), owner=f'run {run_id}.availability')
+    out.extend(['### Working-copy rule availability', ''])
+    if not availability['recorded']:
+        out.append(availability['reason'])
+    else:
+        out.append(f"Collection: **{availability['status']}**, observed {availability['observed_at']}.")
+        out.append(_table(['Measurement', 'Count'], [[m['label'], m['count']] for m in availability['metrics']]))
+        out.append(_table(['Outcome', 'Count'], list(availability['outcomes'].items())))
+        out.append('#### Availability coverage and failures by cause')
+        out.append(_table(['Cause', 'Count'], list(availability['causes'].items())) if availability['causes'] else 'No coverage failures or unavailable matches were recorded.')
+        for error in availability['errors']:
+            out.append(f"- {error['subject']}: {error['cause']} — {error['detail']}")
+        out.append(availability['meaning'])
+    out.append('')
+
     # --- project identity -------------------------------------------------
     # Rendered rather than left to the appendix: a run resolved mostly by
     # remote_url still collapses clones, but fractures the moment a repo is

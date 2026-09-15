@@ -21,6 +21,9 @@ export const API = Object.freeze({
   operations: "/api/operations",
   incidents: "/api/incidents",
   runs: "/api/runs",
+  evalAttempts: "/api/eval-attempts",
+  evalResults: "/api/eval-results",
+  evalHealth: "/api/eval-health",
 });
 
 /** Compatibility decision route, built from the proposal identifier. */
@@ -38,7 +41,7 @@ export const DECISIONS = Object.freeze({
   reject: "Rejected. This rule will not be applied.",
 });
 
-export const VIEWS = Object.freeze(["overview", "rules", "projects", "review"]);
+export const VIEWS = Object.freeze(["overview", "rules", "projects", "review", "evals"]);
 
 /** The four gate verdicts, in the order the trust model reads them. */
 export const GATE_VERDICTS = Object.freeze([
@@ -1288,16 +1291,17 @@ export function renderRuleDiffs(row) {
 }
 
 export function renderRuleVerdicts(row) {
+  const historyLink = `<p><a href="${esc(ruleEvaluationHref(row.id))}">Every recorded evaluation attempt →</a></p>`;
   const targets = row.targets || [];
   if (targets.length === 0) {
-    return emptyState(
+    return historyLink + emptyState(
       "Not routed anywhere yet",
       row.target_summary || "No proposal has been created for this rule.",
       "A learning is what was learned; a proposal is one edit to one file. One learning can produce zero proposals or several.",
       { inline: true }
     );
   }
-  return targets
+  return historyLink + targets
     .map((target) => {
       const evaluation = target.eval;
       const verdict = evaluation
@@ -1411,21 +1415,9 @@ export function renderProjectExposure(measure, entry = {}) {
 }
 
 export function renderContextWeightCell(weight) {
-  if (!weight || weight.computable !== true) return novalue(weight, "context weight was not measured");
-  if (!weight.has_instruction_files) {
-    return `<span class="novalue" title="a lesson routed here creates the first instruction file">none yet</span>`;
-  }
-  // Only the always-loaded number costs every session, so that is the number in
-  // the column. The in-force total and the file count sit in the tooltip and in
-  // the detail view, which is where a second number belongs.
-  const detail =
-    `${bytes(weight.always_loaded_bytes)} loads into every session in this repo; ` +
-    `${bytes(weight.total_bytes)} is in force across ${weight.file_count} file(s), ` +
-    `the rest read on demand`;
-  return (
-    `<span class="strong" title="${esc(detail)}">${esc(bytes(weight.always_loaded_bytes))}</span>` +
-    `<span class="caption muted"> always</span>`
-  );
+  if (!weight || weight.computable !== true || !weight.groups) return novalue(weight, "No current source-profile inventory is retained");
+  const detail = `${weight.file_count} physical files observed at ${weight.observed_at}. ${weight.selection} This is not session-loaded context.`;
+  return `<span class="strong" title="${esc(detail)}">${esc(bytes(weight.total_bytes))}</span><span class="caption muted"> observed</span>`;
 }
 
 export function renderProjectRows(rows, selectedKey) {
@@ -1551,108 +1543,113 @@ export function renderProjectNotes(payload) {
 }
 
 const PROJECT_TABS = Object.freeze([
+  { id: "summary", label: "Project overview" },
+  { id: "inventory", label: "Instruction ownership" },
+  { id: "availability", label: "Availability" },
   { id: "exposure", label: "Exposure" },
-  { id: "context", label: "Context weight" },
+  { id: "context", label: "Instruction context" },
   { id: "topology", label: "Topology" },
   { id: "copies", label: "Working copies" },
   { id: "rules", label: "Rules" },
 ]);
 
-export function renderProjectInspector(row, tab, exposureEntry = {}) {
+export function renderProjectInventory(entry) {
+  const owners = {human_managed: "Human-managed", machine: "Exact machine text", edited: "Edited marker", unknown: "Unknown marker"};
+  let html = `<h3>Instruction ownership</h3><p>Unmarked text is human-managed. This protects it from automatic deletion; it does not prove who wrote it. Machine ownership requires an exact retained delivery.</p>`;
+  if (entry.error) html += `<p class="error-state" role="alert">${esc(entry.error)}</p>`;
+  if (entry.loading) html += `<p role="status">Reading recorded inventories…</p>`;
+  if (entry.reason === "schema_unavailable") html += `<p>This database predates instruction inventories. An explicit database upgrade is required.</p>`;
+  else if (entry.loaded && !entry.records?.length) html += `<p>No instruction inventory has been collected for this project. Its ownership is unknown.</p>`;
+  html += `<p id="inventory-status" tabindex="-1" class="caption" aria-live="polite">${entry.loaded ? `${num(entry.records.length)} shown · ${entry.count == null ? "copy count unknown" : `${num(entry.count)} working copies`}` : "No recorded inventories loaded yet"}</p>`;
+  for (const record of entry.records || []) {
+    const name = record.working_copy.normalized_path.split("/").filter(Boolean).pop();
+    html += `<article class="run-record"><details ${reviewDisclosure("inventory:" + record.working_copy_id)}><summary>${esc(name)} · ${esc(record.status)} · ${esc(record.observed_at)}</summary>` +
+      `<p class="mono">${esc(record.working_copy.normalized_path)}</p>`;
+    if (record.status === "conflicting") {
+      html += `<p class="error-state">Different inventories share this timestamp. Ownership is unknown.</p>` + runDisclosure("inventory-conflict:" + record.working_copy_id, "Conflicting retained observations", record.observations) + `</details></article>`;
+      continue;
+    }
+    html += `<p>${num(record.totals.files)} physical files · ${esc(bytes(record.totals.bytes))} observed · ${num(record.totals.lines)} lines. Symlink and import aliases count once.</p>`;
+    if (!record.files.length) html += `<p>${record.status === "recorded" ? "No supported instruction files were found at this observation." : "No files could be counted completely; inspect the coverage issues below."}</p>`;
+    html += `<div class="scroll-x"><table class="data"><thead><tr><th scope="col">Ownership</th><th scope="col" class="num">Lines</th><th scope="col" class="num">Bytes</th></tr></thead><tbody>` +
+      Object.entries(owners).map(([key,label]) => `<tr><th scope="row">${label}</th><td class="num">${num(record.totals.ownership[key].lines)}</td><td class="num">${num(record.totals.ownership[key].bytes)}</td></tr>`).join("") + `</tbody></table></div>`;
+    html += `<h4>Provider and loading scope</h4><p class="footnote">Scopes can share files, so these rows must not be added together. Eligible bytes follow the observed source profile; session loading remains unverified.</p>` +
+      record.scopes.map(scope => `<p>${esc(scope.provider)} · ${esc(scope.scope.replaceAll("_", " "))}: ${num(scope.files)} file(s), ${esc(bytes(scope.eligible_prefix_bytes))} eligible of ${esc(bytes(scope.observed_bytes))} observed.</p>`).join("");
+    html += `<h4>File ownership and wiring</h4>`;
+    for (const file of record.files) {
+      html += `<details ${reviewDisclosure("inventory-file:" + record.working_copy_id + ":" + file.real_path)}><summary><span class="mono">${esc(file.path)}</span> · ${esc(bytes(file.bytes))}</summary>` +
+        `<p>${Object.entries(owners).map(([key,label]) => `${label}: ${num(file.ownership[key].lines)} lines`).join(" · ")}</p>` +
+        file.units.map(unit => `<p>${esc(owners[unit.ownership])} · lines ${num(unit.start_line)}–${num(unit.end_line)}` +
+          (unit.learning_ids || (unit.learning_id && unit.ownership !== "unknown" ? [unit.learning_id] : [])).map(id => ` · <a href="#/rules/${encodeURIComponent(id)}">Inspect rule</a>`).join("") +
+          (unit.cause ? ` · ${esc(unit.cause.replaceAll("_", " "))}` : "") + `</p>`).join("") +
+        runDisclosure("inventory-file-record:" + record.working_copy_id + ":" + file.real_path, "Aliases, imports, scopes, hashes and delivery references", file) + `</details>`;
+    }
+    if (record.issues.length) html += `<h4>Incomplete coverage</h4>` + record.issues.map(issue => `<p>${esc(issue.cause.replaceAll("_", " "))}${issue.path ? ` · <span class="mono">${esc(issue.path)}</span>` : ""}</p>`).join("");
+    html += runDisclosure("inventory-record:" + record.id, "Complete retained inventory and collection limits", record) + `</details></article>`;
+  }
+  html += `<button id="inventory-load" type="button" class="btn" data-inventory-refresh="true" aria-disabled="${Boolean(entry.loading)}">Refresh recorded inventories</button>`;
+  if (entry.next_cursor) html += ` <button id="inventory-older" type="button" class="btn" data-inventory-older="true" aria-disabled="${Boolean(entry.loading)}">Load more inventories</button>`;
+  return html;
+}
+
+export function renderProjectAvailability(entry) {
+  const labels = {available: "Exact delivered content observed", changed: "Marked content has changed", absent: "Delivered content not found", unknown: "Availability unknown"};
+  let html = `<h3>Recorded rule availability</h3><p class="footnote">These checks inspect actual working-copy files. They do not prove that an agent loaded a rule or that an already-running session received it.</p>`;
+  if (entry.error) html += `<p class="error-state" role="alert">${esc(entry.error)}</p>`;
+  if (entry.loading) html += `<p role="status">Reading recorded availability…</p>`;
+  if (entry.reason === "schema_unavailable") html += `<p>This database predates availability observations. An explicit database upgrade is required.</p>`;
+  if (entry.loaded && !entry.records?.length && entry.reason !== "schema_unavailable") html += `<p>No availability observations are retained for this project. This is unknown history.</p>`;
+  html += `<p id="availability-status" tabindex="-1" class="caption" aria-live="polite">${entry.loaded ? `${num(entry.records.length)}${entry.count == null ? "" : ` of ${num(entry.count)}`} rule/copy checks shown` : "No recorded checks loaded yet"}</p>`;
+  (entry.records || []).forEach(record => {
+    const revision = record.revision;
+    const copyPath = record.observations[0].working_copy.normalized_path;
+    const copyName = copyPath.split("/").filter(Boolean).slice(-1)[0] || copyPath;
+    html += `<article class="run-record"><details ${reviewDisclosure("availability:" + revision.id + ":" + record.working_copy_id)}><summary>${esc(copyName)} · ${esc(labels[record.status] || "Unknown status")} · rule ${esc(revision.learning_id.slice(0, 8))}</summary>` +
+      `<p><a href="#/rules/${encodeURIComponent(revision.learning_id)}">Inspect rule</a> · observed ${esc(record.observed_at)}</p>`;
+    if (record.conflicting_observations) html += `<p class="error-state">Conflicting checks share this timestamp; availability is unknown.</p>`;
+    for (const check of record.observations) {
+      html += field("Working copy", `<span class="mono">${esc(check.working_copy.normalized_path)}</span>`) +
+        (check.cause ? field("Reason", esc(check.cause.replaceAll("_", " "))) : "") +
+        field("Delivered revision", `<span class="mono">${esc(check.rule_revision_id)}</span>`);
+      for (const match of check.matches) {
+        html += field("Observed file", `<span class="mono">${esc(match.path)}</span>`);
+        for (const path of match.loading_paths) html += field("Source scope", `${esc(path.provider)} · ${esc(path.scope.kind.replaceAll("_", " "))}${path.scope.paths.length ? ` · ${esc(path.scope.paths.join(", "))}` : ""}`);
+      }
+      html += runDisclosure("availability-check:" + check.id, "Complete retained check and file evidence", check);
+    }
+    html += runDisclosure("availability-revision:" + revision.id, "Delivered content and snapshot provenance", revision) + `</details></article>`;
+  });
+  if (entry.last_collection) {
+    html += `<p class="footnote">Latest collection across known projects: ${esc(entry.last_collection.observed_at)} · ${esc(entry.last_collection.status)}.</p>` +
+      runDisclosure("availability-collection", "Collection coverage and failures", entry.last_collection);
+  }
+  html += `<button id="availability-load" type="button" class="btn" data-availability-refresh="true" aria-disabled="${Boolean(entry.loading)}">Refresh recorded checks</button>`;
+  if (entry.next_cursor) html += ` <button id="availability-older" type="button" class="btn" data-availability-older="true" aria-disabled="${Boolean(entry.loading)}">Load more checks</button>`;
+  return html;
+}
+
+export function renderProjectInspector(row, tab, exposureEntry = {}, {includeTabs = true} = {}) {
   if (!row) return emptyState("No repository selected", "Pick a row from the table.", "");
   const active = PROJECT_TABS.some((t) => t.id === tab) ? tab : "context";
   const weight = row.context_weight || {};
   let body = "";
 
-  if (active === "exposure") {
+  if (active === "inventory") {
+    body = renderProjectInventory(state.projectInventory[row.project_key] || {});
+  } else if (active === "availability") {
+    body = renderProjectAvailability(state.projectAvailability[row.project_key] || {});
+  } else if (active === "exposure") {
     body = renderProjectExposure(exposureEntry.data || row.exposure, exposureEntry);
   } else if (active === "context") {
-    if (weight.computable !== true) {
-      body = section(
-        "Context weight",
-        emptyState(
-          "Not measured",
-          weight.reason || "no reason was given",
-          "PRD section 8a: only the in-force files count. Total markdown would rank repos by transcript size.",
-          { inline: true }
-        )
-      );
-    } else if (!weight.has_instruction_files) {
-      body = section(
-        "Context weight",
-        emptyState(
-          "No instruction files at all",
-          "An agent working here carries nothing from this repo.",
-          "A lesson routed here creates the first file. This is an empty state, not a zero.",
-          { inline: true }
-        )
-      );
-    } else {
-      const files = (weight.files || [])
-        .map(
-          (file) =>
-            `<tr><td class="mono">${esc(file.path)}</td>` +
-            `<td>${badge(file.kind, { state: "" , title: `origin: ${file.origin}`})}</td>` +
-            `<td>${file.always_loaded ? badge("every session", { state: "partial", title: "loaded into every session in this repo" }) : badge("on demand", { state: "info", title: "read only when the agent asks for it" })}</td>` +
-            `<td class="num">${esc(bytes(file.bytes))}</td></tr>`
-        )
-        .join("");
-      body =
-        section(
-          "In force here",
-          field("Always loaded", `<span class="strong">${esc(bytes(weight.always_loaded_bytes))}</span> <span class="caption muted">approx ${num(weight.always_loaded_approx_tokens)} tokens, every session</span>`) +
-            field("Read on demand", `${esc(bytes(weight.on_demand_bytes))}`) +
-            field("In force total", `${esc(bytes(weight.total_bytes))} over ${num(weight.file_count)} file(s)`) +
-            field(
-        "Measured in",
-        `<span class="mono">${esc(weight.path || weight.resolved_path || "")}</span>`
-        // Show why this working copy was selected for measurement.
-        + (row.context_path_reason
-            ? `<span class="footnote">${esc(row.context_path_reason)}</span>`
-            : "")
-      )
-        ) +
-        section(
-          "File by file",
-          `<div class="scroll-x"><table class="data"><thead><tr><th scope="col">File</th><th scope="col">Kind</th>` +
-            `<th scope="col">When</th><th scope="col" class="num">Bytes</th></tr></thead><tbody>${files}</tbody></table></div>`
-        ) +
-        section(
-          "Markdown that is NOT in force",
-          weight.other_md && weight.other_md.scanned
-            ? field(
-                "Other markdown",
-                `${num(weight.other_md.file_count)} file(s), ${esc(bytes(weight.other_md.bytes))}` +
-                  ` <span class="caption muted">${esc(weight.other_md.note)}</span>`
-              )
-            : `<p class="footnote">${esc((weight.other_md || {}).note || "not scanned")}</p>`
-        ) +
-        renderWeightCaveats(weight);
-    }
+    body = renderRecordedContext(row.project_key);
   } else if (active === "topology") {
-    const topology = weight.topology || {};
-    body = section(
-      "Instruction-file topology",
-      topology.label && topology.label !== "unknown"
-        ? field("Shape", badge(topology.label, { state: "info", title: "this decides where a proposal may be written" })) +
-            field("AGENTS.md", topology.agents_md_exists ? "present" : "absent") +
-            field("CLAUDE.md", topology.claude_md_exists ? (topology.claude_md_is_symlink ? "present, a symlink" : topology.claude_md_is_stub ? "present, a thin stub" : "present") : "absent") +
-            field("Symlink to AGENTS.md", String(Boolean(topology.claude_md_symlink_to_agents))) +
-            field("General write target", `<span class="mono">${esc(topology.write_target_general || EM_DASH)}</span>`) +
-            field("Claude-specific target", `<span class="mono">${esc(topology.write_target_claude_specific || EM_DASH)}</span>`)
-        : emptyState(
-            "Topology unknown",
-            topology.error || "no working copy of this repo could be inspected",
-            "The topology comes from routing.detect_topology, the same detector the writer uses.",
-            { inline: true }
-          )
-    );
+    body = renderRecordedTopology(row.project_key);
   } else if (active === "copies") {
     const paths = row.clone_paths || [];
     body =
       section(
         "Working copies",
-        `<p class="field__value">${num(row.clones)} working copies of one repository, ${num(row.clones_on_disk)} still on disk. ` +
+        `<p class="field__value">${num(row.clones)} working copies of one repository. Current filesystem presence is not checked by this reader. ` +
           `They are one row because they are one repository. Counting copies separately would inflate ` +
           `the repository breadth used in routing.</p>` +
           `<div class="kv">${paths.map((path) => `<span class="mono">${esc(path)}</span><span></span>`).join("")}</div>`
@@ -1716,7 +1713,7 @@ export function renderProjectInspector(row, tab, exposureEntry = {}) {
       );
   }
 
-  return renderTabs(PROJECT_TABS, active) + body;
+  return (includeTabs ? renderTabs(PROJECT_TABS, active) : "") + body;
 }
 
 export function renderWeightCaveats(weight) {
@@ -1759,6 +1756,16 @@ export const state = {
   miningHistories: {},
   scanHistories: {},
   projectExposures: {},
+  projectAvailability: {},
+  projectInventory: {},
+  projectInventorySelection: {},
+  projectDetails: {},
+  trends: null,
+  evaluationHistory: null,
+  evaluationHealth: null,
+  evaluationDetail: null,
+  evaluationQuery: "",
+  projectRecords: {},
   projectExposureParams: "",
   projectExposureFocus: "",
   runDetail: null,
@@ -2840,10 +2847,10 @@ function preserveOperationView(id, html) {
   // Render after reading disclosure state so polling does not close inspected evidence.
   const rendered = typeof html === "function" ? html() : html;
   if (body.innerHTML !== rendered) body.innerHTML = rendered;
-    if (activeId && (activeId.startsWith("operation-") || activeId.startsWith("rollback-") || activeId.startsWith("eval-job-") || activeId.startsWith("mining-history-") || activeId.startsWith("scan-history-") || activeId.startsWith("run-"))) {
+    if (activeId && (activeId.startsWith("operation-") || activeId.startsWith("rollback-") || activeId.startsWith("eval-job-") || activeId.startsWith("evaluation-") || activeId.startsWith("mining-history-") || activeId.startsWith("scan-history-") || activeId.startsWith("availability-") || activeId.startsWith("inventory-") || activeId.startsWith("run-") || activeId.startsWith("project-"))) {
     const candidate = doc().getElementById(activeId);
-    const runStatus = /^run-(older|load)-/.test(activeId) ? doc().getElementById(activeId.replace(/^run-(older|load)-/, "run-status-")) : null;
-    const restored = candidate && !candidate.disabled ? candidate : runStatus || card && doc().getElementById(card.id);
+    const runStatus = /^(run|project)-(older|load)-/.test(activeId) ? doc().getElementById(activeId.replace(/^(run|project)-(older|load)-/, "$1-status-")) : null;
+    const restored = candidate && !candidate.disabled ? candidate : runStatus || (activeId.startsWith("availability-") ? doc().getElementById("availability-status") : activeId.startsWith("inventory-") ? doc().getElementById("inventory-status") : null) || card && doc().getElementById(card.id);
     if (restored && restored.focus) restored.focus({ preventScroll: true });
   }
 }
@@ -3194,7 +3201,8 @@ export function parseRoute(hash) {
   const raw = String(hash === null || hash === undefined ? "" : hash).replace(/^#/, "");
   const projectQuery = raw.startsWith("/projects/") && raw.includes("?") ? raw.slice(raw.indexOf("?") + 1) : "";
   const ruleQuery = raw.startsWith("/rules/") && raw.includes("?") ? raw.slice(raw.indexOf("?") + 1) : "";
-  const path = projectQuery || ruleQuery ? raw.slice(0, raw.indexOf("?")) : raw;
+  const trendQuery = raw.startsWith("/evals") && raw.includes("?") ? raw.slice(raw.indexOf("?") + 1) : "";
+  const path = raw.includes("?") ? raw.slice(0, raw.indexOf("?")) : raw;
   const parts = path.split("/").filter(Boolean);
   const view = parts.length ? parts[0] : "overview";
   if (VIEWS.indexOf(view) === -1) return { view: "overview", id: "", unknown: view };
@@ -3207,17 +3215,19 @@ export function parseRoute(hash) {
       id = rest;
     }
   }
-  return { view, id, unknown: "", ...(projectQuery ? {projectQuery} : {}), ...(ruleQuery ? {ruleQuery} : {}) };
+  return { view, id, unknown: "", ...(projectQuery ? {projectQuery} : {}), ...(ruleQuery ? {ruleQuery} : {}), ...(trendQuery ? {trendQuery} : {}) };
 }
 
 export function showRoute(route) {
   state.route = route.view;
   const runRoute = route.view === "overview" && /^(run|night)\//.test(route.id);
+  const projectRoute = route.view === "projects" && Boolean(route.id);
+  setVisible(byId("project-detail"), projectRoute);
   setVisible(byId("run-detail"), runRoute);
   if (runRoute) openRunRoute(route.id);
   else state.runDetail = null;
   VIEWS.forEach((view) => {
-    setVisible(byId(`view-${view}`), view === route.view && !runRoute);
+    setVisible(byId(`view-${view}`), view === route.view && !runRoute && !projectRoute);
   });
   // Derived from VIEWS, not a second list. A hand-written pair list is how a
   // fourth view ends up visible in the router and dead in the nav.
@@ -3236,11 +3246,26 @@ export function showRoute(route) {
     if (incident && state.inspectorTab === "evidence" && Array.from(doc().querySelectorAll('[data-scan-history-root]')).some(root => root.getAttribute('data-scan-history-root') === incident)) loadIncidentScanHistory(incident);
   } else if (route.view === "projects" && route.id) {
     const params = new URLSearchParams(route.projectQuery || "");
-    const tab = params.get("tab") || "context"; params.delete("tab");
+    const tab = params.get("tab") || "summary"; params.delete("tab");
     openProject(route.id, tab, params.toString());
   } else {
     closeInspector();
   }
+  const evaluationRoute = route.view === "evals" && Boolean(route.id);
+  setVisible(byId("evaluation-detail"), evaluationRoute);
+  setVisible(byId("view-evals"), route.view === "evals" && !evaluationRoute);
+  if (route.view === "evals") {
+    state.evaluationQuery = route.trendQuery || "";
+    if (evaluationRoute) {
+      const split = route.id.indexOf("/");
+      openEvaluationDetail(route.id.slice(0, split), route.id.slice(split + 1), state.evaluationQuery);
+    } else {
+      state.evaluationDetail = null;
+      loadTrends(evalQueryParts(state.evaluationQuery).trends.toString());
+      loadEvaluationHistory(state.evaluationQuery);
+      loadEvaluationHealth();
+    }
+  } else state.evaluationDetail = null;
   if (route.view === "review") {
     state.reviewFocusProposal = route.id.startsWith("proposal/") ? route.id.slice("proposal/".length) : "";
     paintReview();
@@ -3295,6 +3320,10 @@ export function renderRunRecords(kind, entry) {
       html += `<p class="footnote">Snapshot before: <span class="mono">${esc(record.result.snapshot_commit_before)}</span><br>Snapshot after: <span class="mono">${esc(record.result.snapshot_commit_after)}</span></p>`;
     }
     html += runDisclosure("run:" + entry.id + ":" + kind + ":" + record.id, label, record);
+    if (kind === "evaluations") {
+      const attempt = (record.links || []).find(link => link.attempt_id);
+      html += `<p><a href="${esc(evaluationHref(attempt ? "attempt" : "unlinked", attempt?.attempt_id || record.id))}">Inspect complete evaluation</a></p>`;
+    }
     if (kind === "proposals") html += `<a href="#/review/proposal/${encodeURIComponent(record.id)}">Inspect proposal in Review</a>`;
     if (kind === "deliveries" && record.proposal_id) html += `<a href="#/review/rollback/${encodeURIComponent(record.proposal_id)}">Inspect rollback eligibility</a>`;
     html += `</article>`;
@@ -3338,6 +3367,18 @@ export function renderRunDetail(entry) {
   });
   html += `</tbody></table></div></section>`;
   html += renderScanSummary(data.scan_summary);
+  const availability = data.availability_summary;
+  html += `<section class="run-notice"><h2 class="section__title">Working-copy rule availability</h2>`;
+  if (!availability || !availability.recorded) html += `<p>${esc(availability?.reason || "No availability collection was retained.")}</p>`;
+  else {
+    html += `<p>Collection: ${esc(availability.status)} · ${esc(availability.observed_at)}</p>`;
+    availability.metrics.forEach(metric => { html += `<p>${esc(metric.label)}: ${num(metric.count)}</p>`; });
+    html += `<p>Outcomes: ${esc(Object.entries(availability.outcomes).map(([key, value]) => `${key}: ${num(value)}`).join(" · ") || "No checks recorded")}</p>`;
+    html += `<h3>Availability coverage and failures by cause</h3><p>${esc(Object.entries(availability.causes).map(([key, value]) => `${key}: ${num(value)}`).join(" · ") || "No coverage failures or unavailable matches recorded")}</p>`;
+    html += runDisclosure("run:" + run.id + ":availability", "Complete availability collection", data.stats.availability);
+    html += `<p>${esc(availability.meaning)}</p>`;
+  }
+  html += `</section>`;
   const llm = data.stats.llm || {}, limits = data.budget_limits;
   html += `<section class="run-notice"><h2 class="section__title">Call budgets and caps</h2>`;
   if (limits === null) html += `<p>Budget limits were not recorded for this run.</p>`;
@@ -3487,8 +3528,7 @@ export async function loadProjectExposure(projectKey, params, {retry = false} = 
   entry = {loading: true}; state.projectExposures[url] = entry;
   const paint = () => {
     if (state.inspectorKind === "project" && state.selectedProject === projectKey && state.inspectorTab === "exposure" && state.projectExposureParams === params) {
-      const row = state.projects?.rows.find(row => row.project_key === projectKey);
-      if (row) preserveOperationView("inspector-body", () => renderProjectInspector(row, "exposure", entry));
+      paintProjectDetail();
     }
   };
   paint();
@@ -3520,26 +3560,262 @@ export function submitProjectExposure(event) {
   openProject(key, "exposure", query);
 }
 
+export async function loadProjectAvailability(projectKey, {refresh = false, older = false} = {}) {
+  let entry = state.projectAvailability[projectKey];
+  if (entry?.loading || (entry?.loaded && !refresh && !older) || (older && !entry?.next_cursor)) return;
+  entry = entry || {records: [], loaded: false};
+  entry.loading = true; entry.error = ""; state.projectAvailability[projectKey] = entry;
+  const paint = () => {
+    if (state.inspectorKind === "project" && state.selectedProject === projectKey && state.inspectorTab === "availability") {
+      paintProjectDetail();
+    }
+  };
+  paint();
+  try {
+    const url = "/api/project-availability?project_key=" + encodeURIComponent(projectKey) + "&limit=20" + (older ? "&cursor=" + encodeURIComponent(entry.next_cursor) : "");
+    const result = await getJSON(url);
+    if (result.project_key !== projectKey) throw new Error("Availability response belongs to a different project");
+    const records = older ? [...entry.records, ...result.records] : result.records;
+    Object.assign(entry, result, {loaded: true, records});
+  } catch (error) {entry.error = String(error.message || error);}
+  finally {entry.loading = false; paint();}
+}
+
+export async function loadProjectInventory(projectKey, {refresh = false, older = false} = {}) {
+  let entry = state.projectInventory[projectKey];
+  if (entry?.loading || (entry?.loaded && !refresh && !older) || (older && !entry?.next_cursor)) return;
+  entry = entry || {records: [], loaded: false};
+  entry.loading = true; entry.error = ""; state.projectInventory[projectKey] = entry;
+  const paint = () => {
+    if (state.inspectorKind === "project" && state.selectedProject === projectKey && ["inventory", "summary", "context", "topology"].includes(state.inspectorTab)) {
+      paintProjectDetail();
+    }
+  };
+  paint();
+  try {
+    const url = "/api/project-inventory?project_key=" + encodeURIComponent(projectKey) + "&limit=20" + (older ? "&cursor=" + encodeURIComponent(entry.next_cursor) : "");
+    const result = await getJSON(url);
+    if (result.project_key !== projectKey) throw new Error("Inventory response belongs to a different project");
+    const records = older ? [...entry.records, ...result.records] : result.records;
+    Object.assign(entry, result, {loaded: true, records});
+  } catch (error) {entry.error = String(error.message || error);}
+  finally {entry.loading = false; paint();}
+}
+
 export function openProject(projectKey, tab, exposureParams = "") {
-  const rows = (state.projects && state.projects.rows) || [];
-  const row = rows.find((r) => r.project_key === projectKey);
+  const changed = state.selectedProject !== projectKey;
+  closeInspector();
   state.inspectorKind = "project";
-  state.inspectorTab = tab || "context";
+  state.inspectorTab = tab || "summary";
   state.selectedProject = projectKey;
   state.projectExposureParams = exposureParams;
-  if (!row) {
-    openInspector(
-      state.projects ? "Repository not found" : "Loading",
-      state.projects
-        ? emptyState("No such repository", `No repo has key ${projectKey}.`, "The link may be older than the current sessions table.")
-        : `<div class="loading"><span class="loading__bar"></span><span class="loading__bar"></span></div>`
-    );
-    return;
-  }
-  const entry = state.projectExposures[projectExposureUrl(projectKey, exposureParams)] || {};
-  openInspector(row.label || row.project_key, renderProjectInspector(row, state.inspectorTab, entry));
+  setVisible(byId("view-projects"), false);
+  setVisible(byId("project-detail"), true);
+  paintProjectDetail();
+  if (changed) doc()?.getElementById("project-title")?.focus({preventScroll: true});
+  loadProjectDetail(projectKey, {refresh: changed});
   if (state.inspectorTab === "exposure") loadProjectExposure(projectKey, exposureParams);
+  if (state.inspectorTab === "availability") loadProjectAvailability(projectKey);
+  if (["summary", "inventory", "context", "topology"].includes(state.inspectorTab)) loadProjectInventory(projectKey);
+  if (state.inspectorTab === "summary") ["contributed", "proposals", "deliveries"].forEach(kind => loadProjectRecords(kind, {refresh: changed}));
   paintProjectRows();
+}
+
+function projectPageId(kind, learningId = "") { return kind + (learningId ? ":" + learningId : ""); }
+
+export async function loadProjectDetail(projectKey, {refresh = false} = {}) {
+  let entry = state.projectDetails[projectKey];
+  if (entry?.loading || (entry?.data && !refresh)) return;
+  entry = {loading: true}; state.projectDetails[projectKey] = entry;
+  paintProjectDetail();
+  try {
+    const data = await getJSON("/api/project-detail?project_key=" + encodeURIComponent(projectKey));
+    if (data.project_key !== projectKey) throw new Error("Project summary belongs to a different project");
+    entry.data = data;
+  } catch (error) { entry.error = String(error.message || error); }
+  finally { entry.loading = false; if (state.selectedProject === projectKey) paintProjectDetail(); }
+}
+
+export async function loadProjectRecords(kind, {older = false, refresh = false, learningId = ""} = {}) {
+  const key = state.selectedProject, pageId = projectPageId(kind, learningId);
+  const pages = state.projectRecords[key] ||= {};
+  let entry = pages[pageId];
+  if (entry?.loading || (entry?.loaded && !older && !refresh) || (older && !entry?.next_cursor)) return;
+  entry = entry || {records: []}; pages[pageId] = entry;
+  entry.loading = true; entry.error = ""; paintProjectDetail();
+  try {
+    const params = new URLSearchParams({project_key: key, kind, limit: "20"});
+    if (learningId) params.set("learning_id", learningId);
+    if (older) params.set("cursor", entry.next_cursor);
+    const data = await getJSON("/api/project-records?" + params);
+    if (data.project_key !== key || data.kind !== kind || (data.learning_id || "") !== learningId) throw new Error("Project records belong to a different selection");
+    const records = older ? [...new Map([...entry.records, ...data.records].map(r => [r.id, r])).values()] : data.records;
+    Object.assign(entry, data, {records, loaded: true});
+  } catch (error) {entry.error = String(error.message || error);}
+  finally {entry.loading = false; if (state.selectedProject === key) paintProjectDetail();}
+}
+
+function projectPanel(title, body, meta = "") {
+  return `<section class="panel"><header class="panel__head"><h2 class="panel__title">${esc(title)}</h2>${meta}</header><div class="panel__body">${body}</div></section>`;
+}
+
+function projectRecordList(key, kind, learningId = "") {
+  const pageId = projectPageId(kind, learningId), entry = state.projectRecords[key]?.[pageId] || {};
+  const target = `data-project-records="${kind}" data-project-learning="${esc(learningId)}"`;
+  let body = entry.error ? `<p class="error-state" role="alert">${esc(entry.error)}</p>` : "";
+  if (entry.loading) body += `<p role="status">Reading ${esc(kind)}…</p>`;
+  if (entry.loaded && !entry.records.length) body += `<p class="muted">${kind === "deliveries" ? "No delivery revisions are retained for this project. Earlier delivery history may be unavailable." : kind === "proposals" ? "No undecided proposal has a verified destination in this project." : "No linked records are retained for this selection."}</p>`;
+  if (entry.reason === "schema_unavailable") body += `<p>The database predates retained delivery revisions. Upgrade it explicitly; missing history cannot be inferred.</p>`;
+  for (const row of entry.records || []) {
+    if (kind === "contributed") {
+      body += `<article class="project-record"><h3><a href="#/rules/${encodeURIComponent(row.id)}">${esc(row.title || row.id)}</a></h3><p>${esc(row.rule_text)}</p><p class="caption">${num(row.project_incidents)} linked incidents in this project · ${esc(row.scope)} · ${esc(row.status)}</p>` +
+        `<details ${reviewDisclosure("project-evidence:" + key + ":" + row.id)}><summary>Evidence from this project</summary>` + projectRecordList(key, "evidence", row.id) + `</details></article>`;
+    } else if (kind === "proposals") {
+      body += `<article class="project-record"><h3><a href="#/review/proposal/${encodeURIComponent(row.id)}">${esc(row.learning?.title || row.learning_id)}</a></h3><p class="mono">${esc(row.target_path)}</p><p>${esc(row.status)} · ${esc(row.next_step.replaceAll("_", " "))}</p>` +
+        `<p class="caption">${esc(row.execution?.detail || row.execution?.reason || "")}</p>` + runDisclosure("project-proposal:" + row.id, "Complete proposed edit and canonical destination", row) + `</article>`;
+    } else if (kind === "deliveries") {
+      body += `<article class="project-record"><h3><a href="#/rules/${encodeURIComponent(row.learning_id)}">Rule ${esc(row.learning_id.slice(0, 8))}</a></h3><p>${esc(row.applied_at)} · <span class="mono">${esc(row.destination.target_path)}</span></p>` +
+        `<details ${reviewDisclosure("project-delivery:" + row.id)}><summary>Delivered content and provenance</summary><pre class="review-card__diff">${esc(row.content)}</pre>` + runDisclosure("project-delivery-record:" + row.id, "Complete application revision", row) + `</details></article>`;
+    } else {
+      body += `<article class="project-record"><p>${esc(row.signal_type)} · ${esc(row.ts || "Time unknown")}</p><p>${esc(row.matched_text)}</p><p class="caption mono">Session ${esc(row.session_id || "ID unknown")}</p>` +
+        renderScanHistory(row.id, "project-" + key) +
+        runDisclosure("project-incident:" + row.id, "Complete retained incident and archived window", row) + `</article>`;
+    }
+  }
+  if (entry.unresolved_proposals?.length) body += runDisclosure("project-unresolved:" + key, `${num(entry.unresolved_proposals.length)} proposals could not be assigned to any project`, entry.unresolved_proposals);
+  body += `<p id="project-status-${esc(pageId)}" tabindex="-1" class="caption" aria-live="polite">${num(entry.records?.length || 0)} shown · ${entry.count == null ? (entry.loaded ? "total unknown" : "total not read") : `${num(entry.count)} retained`}</p>`;
+  body += `<button id="project-load-${esc(pageId)}" class="btn" type="button" ${target} data-project-refresh="true" aria-disabled="${Boolean(entry.loading)}">${entry.loaded ? "Refresh" : "Read"} ${esc(kind)}</button>`;
+  if (entry.next_cursor) body += ` <button id="project-older-${esc(pageId)}" class="btn" type="button" ${target} data-project-older="true" aria-disabled="${Boolean(entry.loading)}">Load more ${esc(kind)}</button>`;
+  return body;
+}
+
+function projectCopyControl(key) {
+  const entry = state.projectInventory[key] || {}, records = entry.records || [];
+  if (!records.length) return `<p class="muted">${esc(entry.error || (entry.loading ? "Reading recorded instruction files…" : "No instruction inventory is retained. Context and ownership are unknown."))}</p>`;
+  const selected = selectedProjectInventory(key);
+  let body = `<label class="caption" for="project-copy">Working copy</label> <select id="project-copy">` + records.map(record => `<option value="${esc(record.working_copy_id)}" ${selected.working_copy_id === record.working_copy_id ? "selected" : ""}>${esc(record.working_copy.normalized_path)}</option>`).join("") + `</select>`;
+  body += `<p id="inventory-status" tabindex="-1" class="caption" aria-live="polite">${num(records.length)} of ${num(entry.count)} copy inventories loaded</p>`;
+  if (entry.next_cursor) body += `<button id="inventory-older" class="btn" type="button" data-inventory-older="true" aria-disabled="${Boolean(entry.loading)}">Load more copies</button>`;
+  if (entry.error) body += `<p class="error-state" role="alert">${esc(entry.error)}</p>`;
+  if (selected.status === "conflicting") return body + `<p class="error-state">The latest inventory has conflicting observations. Inspect Instruction ownership.</p>`;
+  body += `<p class="caption">Observed ${esc(selected.observed_at)} · ${esc(selected.status)}. Other copies can differ.</p>`;
+  return body;
+}
+
+function projectInventoryOverview(key) {
+  let body = projectCopyControl(key);
+  const selected = selectedProjectInventory(key);
+  if (!selected?.files) return body;
+  if (!selected.files.length) body += `<p>${selected.status === "recorded" ? "No supported instruction files were found." : "No complete file inventory is available. Inspect coverage issues."}</p>`;
+  for (const file of selected.files.slice(0, 8)) {
+    const total = file.bytes;
+    const name = projectFileName(file.path, selected.working_copy.normalized_path);
+    body += `<div class="project-file"><div><span class="mono" title="${esc(file.path)}">${esc(name)}</span><span>${esc(bytes(total))}</span></div>` +
+      `<div class="project-ownership-bar" aria-label="${esc(Object.entries(file.ownership).map(([owner, value]) => `${owner.replaceAll("_", " ")}: ${value.lines} lines`).join(", "))}">` +
+      Object.entries(file.ownership).map(([owner, value]) => `<span data-owner="${esc(owner)}" style="width:${total ? value.bytes / total * 100 : 0}%"></span>`).join("") + `</div></div>`;
+  }
+  if (selected.files.length > 8) body += `<p class="caption">8 of ${num(selected.files.length)} files shown. The complete inventory is linked below.</p>`;
+  body += `<p class="caption">Human-managed · exact machine text · edited · unknown. Unmarked text does not prove authorship.</p><p class="caption">${num(selected.totals.files)} physical files · ${esc(bytes(selected.totals.bytes))} observed. Imports and symlink aliases count once. Observed bytes do not prove session loading.</p>`;
+  body += `<a href="#/projects/${encodeURIComponent(key)}?tab=inventory">Inspect every file, ownership, scope and working copy</a>`;
+  return body;
+}
+
+function selectedProjectInventory(key) {
+  const records = state.projectInventory[key]?.records || [];
+  return records.find(r => r.working_copy_id === state.projectInventorySelection[key]) || records[0];
+}
+
+function projectFileName(path, copy) {
+  return path.startsWith(copy + "/") ? path.slice(copy.length + 1) : path;
+}
+
+function projectCoverage(record) {
+  if (!record?.files) return "";
+  return `<p class="caption">Source profile: ${esc(record.profile)}. Runtime loading remains unverified.</p>` +
+    (record.issues.length ? `<h3>Incomplete coverage</h3>` + record.issues.map(issue => `<p>${esc(issue.cause.replaceAll("_", " "))} · <span class="mono">${esc(issue.path || "")}</span></p>`).join("") : "") +
+    `<p class="caption">Unmeasured: ${(record.unobserved_sources || ["runtime_loading"]).map(value => esc(value.replaceAll("_", " "))).join(", ")}.</p>`;
+}
+
+export function renderRecordedContext(key) {
+  const record = selectedProjectInventory(key);
+  let body = projectCopyControl(key);
+  if (!record?.files) return body;
+  if (!record.context) return body + `<p>This older inventory does not record global origins and source eligibility. Collect a new observation with the current collector. Historical observations remain unchanged.</p>` + projectCoverage(record);
+  body += `<p>${esc(record.context.meaning)}</p>`;
+  if (!record.context.groups.length) body += `<p>${record.status === "partial" ? "No complete instruction inventory is available. Inspect the coverage issues below." : "No supported instruction bytes were observed. Runtime sources outside this profile remain unmeasured."}</p>`;
+  for (const group of record.context.groups.filter(group => group.origin === "all")) {
+    body += `<section class="project-record"><h3>${group.provider === "codex" ? "Codex" : "Claude Code"}</h3><p>${num(group.files)} physical files · ${esc(bytes(group.observed_bytes))} observed</p>` +
+      [["Startup candidates", group.startup_bytes], ["Conditional rules", group.conditional_bytes], ["On-demand skill bodies", group.on_demand_bytes], ["Ineligible or unresolved", group.unresolved_bytes]].map(([label, value]) => field(label, esc(bytes(value)))).join("") +
+      `<p class="caption">Each byte is assigned once per provider, to its broadest eligible loading path. Skills can contribute catalog metadata at startup; that metadata budget is not measured here.</p>`;
+    for (const origin of record.context.groups.filter(item => item.provider === group.provider && item.origin !== "all")) {
+      body += `<p>${origin.origin === "global" ? "Global sources" : "Project sources"}: ${esc(bytes(origin.observed_bytes))} observed · ${esc(bytes(origin.startup_bytes))} startup candidates · ${esc(bytes(origin.conditional_bytes))} conditional · ${esc(bytes(origin.on_demand_bytes))} on demand · ${esc(bytes(origin.unresolved_bytes))} ineligible or unresolved.</p>`;
+    }
+    body += `<p class="caption">Global and project paths can reach the same physical file. Their rows can overlap; the provider total removes that overlap.</p></section>`;
+  }
+  return body + projectCoverage(record);
+}
+
+function projectWiring(record, {limit = null} = {}) {
+  if (!record?.files) return `<p class="muted">No unambiguous wiring observation is loaded.</p>`;
+  let body = "";
+  for (const file of limit ? record.files.slice(0, limit) : record.files) {
+    body += `<details ${reviewDisclosure("project-wiring:" + record.working_copy_id + ":" + file.real_path)}><summary class="mono">${esc(projectFileName(file.path, record.working_copy.normalized_path))}</summary>`;
+    for (const path of file.loading_paths) {
+      body += `<p>${esc(path.provider)} · ${esc(path.origin || "origin unknown")} · ${esc(path.scope.kind.replaceAll("_", " "))}</p>` +
+        `<p class="caption">${esc(bytes(path.eligible_prefix_bytes))} eligible of ${esc(bytes(file.bytes))} observed${path.eligibility_reason ? ` · ${esc(path.eligibility_reason.replaceAll("_", " "))}` : ""}.</p>`;
+      if (path.conditions.length) body += `<p>Conditions: ${path.conditions.map(condition => condition.paths.map(esc).join(", ")).join("; ")}</p>`;
+      if (path.import_chain.length) body += `<p class="mono">${path.import_chain.map(p => esc(projectFileName(p, record.working_copy.normalized_path))).join(" → ")} → ${esc(projectFileName(path.path, record.working_copy.normalized_path))}</p>`;
+    }
+    body += `<p class="caption mono">Physical file: ${esc(file.real_path)}</p>` +
+      (file.aliases.length > 1 ? `<p class="caption mono">Aliases: ${file.aliases.map(esc).join(" · ")}</p>` : "") +
+      runDisclosure("project-wiring-record:" + record.working_copy_id + ":" + file.real_path, "Complete recorded loading paths", file.loading_paths) + `</details>`;
+  }
+  if (!record.files.length) body += `<p>No supported files were recorded. Inspect coverage before interpreting this as empty.</p>`;
+  if (limit && record.files.length > limit) body += `<p class="caption">${num(limit)} of ${num(record.files.length)} files shown.</p>`;
+  return body;
+}
+
+export function renderRecordedTopology(key) {
+  const record = selectedProjectInventory(key);
+  return projectCopyControl(key) + `<p>These paths were observed during collection. Imports and aliases share physical file counts. Instruction delivery revalidates its destination separately.</p>` + projectWiring(record) + projectCoverage(record);
+}
+
+export function renderProjectPage(key) {
+  const entry = state.projectDetails[key] || {}, data = entry.data;
+  const legacy = state.projects?.rows.find(row => row.project_key === key);
+  const title = data?.label || legacy?.label || key;
+  let body = `<nav class="run-breadcrumb" aria-label="Breadcrumb"><a href="#/projects">Projects</a> / ${esc(title)}</nav><header class="run-heading"><div><h1 id="project-title" tabindex="-1" class="view__title">${esc(title)}</h1><p class="mono caption">${esc(key)}</p>` +
+    (data?.displays.length > 1 ? `<p class="caption">Recorded names: ${data.displays.map(esc).join(" · ")}</p>` : "") + `</div><button id="project-refresh" class="btn" type="button" data-project-summary-refresh="true">Refresh project</button></header>`;
+  body += renderTabs(PROJECT_TABS, state.inspectorTab);
+  if (state.inspectorTab !== "summary") {
+    if (["inventory", "availability", "exposure"].includes(state.inspectorTab)) {
+      const content = state.inspectorTab === "inventory" ? renderProjectInventory(state.projectInventory[key] || {}) : state.inspectorTab === "availability" ? renderProjectAvailability(state.projectAvailability[key] || {}) : renderProjectExposure(state.projectExposures[projectExposureUrl(key, state.projectExposureParams)]?.data, state.projectExposures[projectExposureUrl(key, state.projectExposureParams)] || {});
+      return body + projectPanel(PROJECT_TABS.find(t => t.id === state.inspectorTab).label, content);
+    }
+    if (state.inspectorTab === "context") return body + projectPanel("Instruction context", renderRecordedContext(key));
+    if (state.inspectorTab === "topology") return body + projectPanel("Observed instruction wiring", renderRecordedTopology(key));
+    return body + projectPanel("Indexed project context", `<p class="footnote">This summary uses retained index records. Current filesystem presence and session access are not inferred.</p>` + (legacy ? renderProjectInspector(legacy, state.inspectorTab, {}, {includeTabs: false}) : `<p>No legacy index row is retained. Use the observed inventory above.</p>`));
+  }
+  if (entry.error) return body + `<div class="error-state" role="alert">${esc(entry.error)}</div>`;
+  if (!data) return body + `<p role="status">Reading project detail…</p>`;
+  const first = selectedProjectInventory(key);
+  body += `<div class="tiles project-tiles">` + [["Known indexed sessions", num(data.indexed.known_session_ids), `${num(data.indexed.transcripts)} files · ${num(data.indexed.unknown_session_ids)} without IDs`], ["Retained incidents", num(data.incidents), "Queue evidence; inspect Exposure for rates"], ["Lessons contributed", num(data.contributed_learnings), "Lessons with evidence from this project"], ["Observed instruction size", first?.totals && !(first.status === "partial" && !first.files?.length) ? bytes(first.totals.bytes) : EM_DASH, first ? `${first.working_copy.normalized_path.split("/").pop()} · ${first.status}` : "No copy inventory loaded"]].map(([label, value, note]) => `<div class="tile"><div class="tile__label">${label}</div><div class="tile__value">${esc(value)}</div><div class="tile__sub">${esc(note)}</div></div>`).join("") + `</div>`;
+  const copyRows = data.indexed_paths.map(path => `<tr><td><details ${reviewDisclosure("project-path:" + key + ":" + path.path)}><summary class="mono">${esc(path.path.split("/").pop() || "Path unknown")}</summary><p class="mono">${esc(path.path)}</p></details></td><td class="num">${num(path.transcripts)}</td><td class="num">${num(path.known_session_ids)}</td></tr>`).join("");
+  const wiring = projectWiring(first, {limit: 8});
+  body += `<div class="project-columns"><div class="project-primary">` +
+    projectPanel("Where the instructions live", projectInventoryOverview(key)) +
+    projectPanel("Proposed edits", `<p class="caption">Undecided proposals use current canonical destinations and the shared execution policy.</p>` + projectRecordList(key, "proposals")) +
+    projectPanel("Lessons contributed", projectRecordList(key, "contributed")) +
+    projectPanel("Recorded deliveries", `<p class="caption">${esc(data.delivery_note)} Historical revisions; availability is separate.</p>` + projectRecordList(key, "deliveries")) +
+    `</div><aside class="project-secondary">` + projectPanel("How instructions are wired", wiring + `<p><a href="#/projects/${encodeURIComponent(key)}?tab=topology">All loading paths and coverage</a></p>`) +
+    projectPanel("Working copies and indexed paths", `<p class="caption">Raw index paths can include aliases. They are not counted as separate canonical projects.</p><div class="scroll-x"><table class="data"><thead><tr><th>Indexed path</th><th class="num">Files</th><th class="num">Known IDs</th></tr></thead><tbody>${copyRows}</tbody></table></div><p class="caption">${esc(data.session_note)}</p>` + runDisclosure("project-sessions:" + key, "Session coverage and observed copy identities", {indexed:data.indexed, observed:data.observed, working_copies:data.observed_working_copies})) +
+    projectPanel("Exposure and availability", `<p>Compare timestamped signals with physical lines and inspect the exact delivered text observed in each working copy.</p><p><a href="#/projects/${encodeURIComponent(key)}?tab=exposure">Inspect exposure and detector versions</a></p><p><a href="#/projects/${encodeURIComponent(key)}?tab=availability">Inspect recorded rule availability</a></p><p class="caption">Session eligibility and recurrence benefit are not yet measured.</p>`) + `</aside></div>`;
+  return body;
+}
+
+export function paintProjectDetail() {
+  if (state.inspectorKind !== "project" || !state.selectedProject) return;
+  preserveOperationView("project-detail-body", () => renderProjectPage(state.selectedProject));
 }
 
 /* ------------------------------ painting --------------------------------- */
@@ -3581,6 +3857,8 @@ export function paintOverview() {
   // not put its pre-decision count back into the shared navigation.
   paintInboxCount(state.review || inbox);
   setText("nav-freshness", (data.freshness || {}).banner || "");
+  const trendGate = doc().getElementById("trend-gate");
+  if (trendGate) trendGate.innerHTML = renderEvaluationHealth(state.evaluationHealth || {});
 }
 
 export function paintRules() {
@@ -3642,6 +3920,290 @@ export function paintProjectRows() {
   if (!data) return;
   setHTML("projects-tbody", renderProjectRows(data.rows, state.selectedProject));
 }
+
+/* Evaluation reads are independent of trend filters and never enqueue model work. */
+const EVAL_SELECTORS = ["learning_id", "proposal_id", "run_id", "command_id"];
+export function evalQueryParts(query = "") {
+  const all = new URLSearchParams(query), trends = new URLSearchParams(), history = new URLSearchParams();
+  for (const [key, value] of all) (key.startsWith("eval_") ? history : trends).set(key, value);
+  return {all, trends, history};
+}
+export function evaluationHref(kind, id, query = "") {
+  return `#/evals/${kind}/${encodeURIComponent(id)}` + (query ? "?" + query : "");
+}
+export function ruleEvaluationHref(id) {
+  return "#/evals?eval_learning_id=" + encodeURIComponent(id);
+}
+function evaluationNotice(outcome) {
+  return `<div class="eval-notice" data-state="${esc(outcome.tone)}"><strong>${esc(outcome.label)}</strong><p>${esc(outcome.reason)}</p></div>`;
+}
+export function renderEvaluationHistory(entry = {}) {
+  const params = new URLSearchParams(entry.params || ""), kind = params.get("eval_kind") || "attempt";
+  const selector = EVAL_SELECTORS.find(key => params.has("eval_" + key)) || "learning_id";
+  let html = `<form id="evaluation-filter" class="eval-filter exposure-form"><label>History<select id="evaluation-kind" name="eval_kind"><option value="attempt"${kind === "attempt" ? " selected" : ""}>Recorded attempts</option><option value="unlinked"${kind === "unlinked" ? " selected" : ""}>Unlinked historical results</option></select></label>` +
+    `<details ${reviewDisclosure("evaluation-filter")}><summary>Filter attempts by exact source ID</summary><label>Source<select name="selector" id="evaluation-selector">${EVAL_SELECTORS.map(key => `<option value="${key}"${key === selector ? " selected" : ""}>${esc(key.replace("_id", "").replaceAll("_", " "))}</option>`).join("")}</select></label><label>Exact ID<input id="evaluation-value" name="value" value="${esc(params.get("eval_" + selector) || "")}" placeholder="All recorded attempts"></label><p class="caption">Source filters apply to recorded attempts. Historical results have no inferred source revision.</p></details>` +
+    `<button id="evaluation-submit" class="btn" type="submit">Show history</button></form>`;
+  if (entry.loading) return html + `<p role="status">Reading evaluation history…</p>`;
+  if (entry.error) return html + `<p role="alert" class="error-state">${esc(entry.error)}</p><button class="btn" id="evaluation-retry" data-evaluation-refresh="true">Retry history</button>`;
+  const data = entry.data;
+  if (!data) return html + `<p>Evaluation history has not been loaded.</p>`;
+  html += `<p id="evaluation-page-status" tabindex="-1" aria-live="polite">${num(data.records.length)} shown · ${data.count == null ? "history count unknown" : `${num(data.count)} ${kind === "unlinked" ? "unlinked results" : "recorded attempts"}`}</p><p class="caption">${esc(data.reason)}</p>`;
+  if (!data.records.length) html += `<p>${data.computable ? "No records match this selection." : "Complete attempt history is unavailable for this database."}</p>`;
+  html += `<div class="eval-cards" tabindex="0" role="region" aria-label="Evaluation history records">`;
+  html += data.records.map(row => `<article class="eval-card"><p class="caption"><time>${esc(row.created_at || "Time not recorded")}</time> · ${esc(row.state)}</p><h3>${esc(row.rule_text || "Historical evaluation · " + row.subject_id)}</h3>` +
+    `<p><strong>${esc(row.outcome.label)}</strong></p>` +
+    (row.kind === "attempt" ? `<p class="caption">${num(row.completed_scenarios)} of ${num(row.scenarios)} scenario results · ${num(row.paired_scenarios)} comparable pairs<br>${num(row.calls_recorded)} results / ${num(row.calls_started)} logical call starts</p>` : `<p class="caption">Exact source revision and model calls unknown.</p>`) +
+    (row.observed_arms ? `<dl class="eval-card-arms">${["with", "without"].map(arm => { const a = row.observed_arms[arm]; return `<div><dt>${arm === "with" ? "With" : "Without"} the rule</dt><dd>${a.completed ? `${num(a.observed_passes)} / ${num(a.completed)} passed` : "No completed trials"}</dd></div>`; }).join("")}</dl>` : "") +
+    `<p class="caption">Recorded verdict: ${esc(row.verdict || "none")}</p><a id="evaluation-link-${esc(row.id)}" data-evaluation-open="${esc(row.id)}" data-evaluation-kind="${esc(row.kind)}" href="${esc(evaluationHref(row.kind, row.id, state.evaluationQuery || ""))}">Inspect complete evaluation<span class="visually-hidden"> ${esc(row.id)}</span> →</a></article>`).join("") + `</div>`;
+  html += `<div class="eval-pagination">` + (params.has("eval_cursor") ? `<button id="evaluation-first" class="btn" data-evaluation-page="first">Newest records</button>` : "") +
+    (data.next_cursor ? `<button id="evaluation-older" class="btn" data-evaluation-page="older">Older records</button>` : "") +
+    `<button id="evaluation-refresh" class="btn btn--quiet" data-evaluation-refresh="true">Refresh history</button></div>`;
+  return html;
+}
+export function paintEvaluationHistory() {
+  if (state.route === "evals" && !state.evaluationDetail && doc().getElementById("evaluation-history-body"))
+    preserveOperationView("evaluation-history-body", () => renderEvaluationHistory(state.evaluationHistory || {}));
+}
+export async function loadEvaluationHistory(query = "", {refresh = false} = {}) {
+  const {history} = evalQueryParts(query), params = history.toString(), old = state.evaluationHistory;
+  if (!refresh && old?.params === params && (old.loading || old.data)) {paintEvaluationHistory(); return;}
+  const focus = doc().activeElement?.id || "";
+  const entry = {params, data:null, loading:true, error:""}; state.evaluationHistory = entry; paintEvaluationHistory();
+  try {
+    const kind = history.get("eval_kind") || "attempt", request = new URLSearchParams({limit:"20"});
+    if (!["attempt", "unlinked"].includes(kind)) throw new Error("Unknown evaluation history kind.");
+    if (history.get("eval_cursor")) request.set("cursor", history.get("eval_cursor"));
+    if (kind === "attempt") {
+      request.set("summary", "true");
+      for (const key of EVAL_SELECTORS) if (history.has("eval_" + key)) request.set(key, history.get("eval_" + key));
+    }
+    entry.data = await getJSON((kind === "attempt" ? API.evalAttempts : API.evalResults) + "?" + request);
+  } catch(error) {entry.error = String(error.message || error);}
+  finally {
+    entry.loading = false;
+    if (state.evaluationHistory === entry) {
+      paintEvaluationHistory();
+      if (state.route === "evals" && !state.evaluationDetail && focus.startsWith("evaluation-")) {
+        const target = doc().getElementById(["evaluation-older", "evaluation-first"].includes(focus) ? "evaluation-page-status" : focus);
+        target?.focus?.({preventScroll:true});
+      }
+    }
+  }
+}
+export function submitEvaluationFilter(event) {
+  if (event.target.id !== "evaluation-filter") return;
+  event.preventDefault();
+  const fields = new FormData(event.target), params = evalQueryParts(state.evaluationQuery).trends;
+  const kind = fields.get("eval_kind"), selector = fields.get("selector"), value = String(fields.get("value") || "").trim();
+  if (kind === "unlinked") params.set("eval_kind", kind);
+  else if (value && EVAL_SELECTORS.includes(selector)) params.set("eval_" + selector, value);
+  const query = params.toString(), hash = "#/evals" + (query ? "?" + query : "");
+  if (currentHash() === hash) loadEvaluationHistory(query, {refresh:true}); else setHash(hash);
+}
+function renderEvaluationArms(scenario) {
+  let html = `<div class="scroll-x" tabindex="0" role="region" aria-label="Scenario ${scenario.scenario + 1} trial arms"><table class="data eval-arm-table"><thead><tr><th scope="col">Arm</th><th scope="col">Observed passes</th><th scope="col">Graded failures</th><th scope="col">Completed / planned</th><th scope="col">Valid / planned</th></tr></thead><tbody>`;
+  for (const arm of ["without", "with"]) {
+    const value = scenario.arms[arm];
+    html += `<tr><th scope="row">${arm === "with" ? "With the rule" : "Without the rule"}</th><td>${num(value.observed_passes)}</td><td>${num(value.graded_failures)}</td><td>${num(value.completed)} / ${num(value.requested_trials)}</td><td>${num(value.valid_trials)} / ${num(value.requested_trials)}</td></tr>`;
+  }
+  html += `</tbody></table></div>`;
+  for (const arm of ["without", "with"]) {
+    const value = scenario.arms[arm];
+    html += `<p><strong>${arm === "with" ? "With" : "Without"} the rule:</strong> ${value.skipped ? `skipped · ${esc(value.skipped.reason)}` : `${num(value.attempted)} trials started`}. ` +
+      (value.served_models.map(model => `${esc(model.provider)} / ${esc(model.model)}`).join("; ") || "Served model unknown") + `.</p>`;
+    if (Object.keys(value.exclusions).length) html += `<p class="footnote">Excluded from comparison: ${esc(Object.entries(value.exclusions).map(([cause, count]) => `${cause}: ${count}`).join(" · "))}</p>`;
+  }
+  if (scenario.comparison.computable) {
+    const withRule = scenario.arms.with, withoutRule = scenario.arms.without;
+    html += `<p class="eval-comparison">Comparable paired results: with rule <strong>${num(withRule.valid_passes)} / ${num(withRule.valid_trials)}</strong> passed; without rule <strong>${num(withoutRule.valid_passes)} / ${num(withoutRule.valid_trials)}</strong> passed. ` +
+      (Math.min(withRule.valid_trials, withoutRule.valid_trials) < 20 ? "Fewer than 20 valid trials per arm; no percentage delta shown." : `Paired change: ${scenario.comparison.pass_rate_delta > 0 ? "+" : ""}${Math.round(scenario.comparison.pass_rate_delta * 100)} percentage points.`) + ` Counts describe this scenario only.</p>`;
+  } else html += `<p class="eval-comparison">Paired change unavailable · ${esc(scenario.comparison.reason)}. Missing results are not zero.</p>`;
+  return html;
+}
+function renderEvaluationCalls(events, prefix) {
+  const starts = events.filter(e => e.kind === "call_started"), results = events.filter(e => e.kind === "call_result");
+  if (!starts.length) return `<p>No logical call start was retained for this selection.</p>`;
+  return starts.map(event => {
+    const source = event.data, result = results.find(e => e.data.call.id === source.call_id)?.data;
+    const call = result?.call;
+    return `<article class="eval-call"><h4>${esc(source.stage)} · ${event.arm ? `${esc(event.arm)} rule · trial ${event.trial_index + 1}` : "scenario generation"}</h4><p class="mono">${esc(source.call_id)}</p>` +
+      `<p>Requested: ${esc(source.model_class)}${call?.model_requested ? " / " + esc(call.model_requested) : ""}<br>Served: ${call?.model_reported ? `${esc(call.provider)} / ${esc(call.model_reported)}` : "unknown"}</p>` +
+      `<p>Outcome: ${esc(call?.outcome || "No completed result retained")}. Provider invocations: ${result?.provider_attempts == null ? "unknown" : num(result.provider_attempts)}.</p>` +
+      (call?.error ? `<p class="delivery-error">${esc(call.error)}</p>` : "") +
+      runDisclosure(prefix + ":call:" + source.call_id, "Complete call record and execution inputs", {start:event, result:result || null}) + `</article>`;
+  }).join("");
+}
+export function renderEvaluationDetail(entry) {
+  const back = "#/evals" + (entry.query ? "?" + entry.query : "");
+  let html = `<nav class="run-breadcrumb" aria-label="Breadcrumb"><a href="${esc(back)}">Evals &amp; trends</a> / Evaluation detail</nav>`;
+  if (entry.loading) return html + `<p role="status">Reading retained evaluation evidence…</p>`;
+  if (entry.error) return html + `<p class="error-state" role="alert">${esc(entry.error)}</p><button id="evaluation-detail-retry" class="btn" data-evaluation-detail-refresh="true">Retry evaluation</button>`;
+  const data = entry.data, summary = data.summary;
+  html += `<header class="view__head"><div><h1 id="evaluation-title" class="view__title" tabindex="-1">${entry.kind === "unlinked" ? "Historical evaluation" : "Evaluation attempt"}</h1><p class="mono">${esc(summary.id)}</p><p>${esc(summary.created_at || "Time not recorded")} · ${esc(summary.state)} · recorded verdict: ${esc(summary.verdict || "none")}</p></div><button id="evaluation-detail-refresh" class="btn" data-evaluation-detail-refresh="true">Refresh evidence</button></header>` + evaluationNotice(summary.outcome);
+  if (entry.kind === "unlinked") {
+    if (data.attempt_links?.length) html += projectPanel("Exact attempt records are available", data.attempt_links.map(link => `<p><a href="${esc(evaluationHref("attempt", link.attempt_id, entry.query))}">Inspect scenario ${link.scenario + 1} in its retained attempt</a></p>`).join(""));
+    html += projectPanel("Retained historical result", `<p>Subject ID: <span class="mono">${esc(summary.subject_id)}</span>. This does not identify an exact rule revision.</p><p>Reported trial outcomes: ${num(summary.story.succeeded)} passed / ${num(summary.story.attempted)} attempted; ${num(summary.story.failed)} failed. Infrastructure failures may be included in those historical counts.</p><p>Comparison validity, exact source and producing model calls are unknown. No paired change is calculated.</p>` + runDisclosure("legacy-eval:" + summary.id, "Complete historical arms, metrics and failure taxonomy", data.record));
+    return html;
+  }
+  const source = data.source;
+  html += projectPanel("Rule and source at evaluation time", `<p class="eval-rule">${esc(source.learning.rule_text)}</p><p>Proposal state when frozen: <strong>${esc(source.proposal.status)}</strong>. Later decisions and delivered files are separate.</p><p class="eval-links"><a href="#/rules/${encodeURIComponent(source.learning_id)}?tab=why">Inspect rule</a><a href="#/review/proposal/${encodeURIComponent(source.proposal_id)}">Current proposal in Review</a><a href="#/review/eval/${encodeURIComponent(source.proposal_id)}">Preview regeneration cost…</a>` +
+    (source.run_id ? `<a href="${esc(runHref("run", source.run_id))}">Producing run</a>` : "") + `</p><p class="caption">${num(summary.completed_scenarios)} of ${num(summary.scenarios)} scenario results; ${num(summary.calls_recorded)} results / ${num(summary.calls_started)} logical call starts.</p>` +
+    runDisclosure("evaluation-source:" + source.id, "Complete frozen source, settings and revision identities", source));
+  data.scenarios.forEach(scenario => {
+    const index = scenario.scenario, events = data.events.filter(e => e.scenario_index === index);
+    const key = source.id + ":" + index;
+    let body = `<p>Recorded scenario verdict: <strong>${esc(scenario.evaluation?.verdict || "No result")}</strong>.</p>`;
+    if (!scenario.specification) body += `<p>No complete specification was retained. Generation starts and failures remain below.</p>`;
+    body += renderEvaluationArms(scenario);
+    if (scenario.specification) body += runDisclosure("evaluation-spec:" + key, "Complete specification and content hash", scenario.specification);
+    const generation = events.filter(e => ["generation_started", "generation_prompt", "generation_failed"].includes(e.kind));
+    body += runDisclosure("evaluation-generation:" + key, "Generation prompt, input evidence and failures", generation);
+    body += `<details ${reviewDisclosure("evaluation-trials:" + key)}><summary>Every trial outcome and interruption</summary>` + events.filter(e => ["trial_started", "trial_result", "trial_failed"].includes(e.kind)).map(e => `<article class="eval-call"><h4>${esc(e.arm)} rule · trial ${e.trial_index + 1} · ${esc(e.kind.replace("trial_", ""))}</h4>${fullRecord(e)}</article>`).join("") + `</details>`;
+    body += `<details ${reviewDisclosure("evaluation-calls:" + key)}><summary>Model calls for this scenario (${events.filter(e => e.kind === "call_started").length})</summary>${renderEvaluationCalls(events, key)}</details>`;
+    html += projectPanel(`Scenario ${index + 1}${scenario.specification ? " · " + scenario.specification.spec.title : ""}`, body);
+  });
+  html += projectPanel("Attempt outcome and retained stops", runDisclosure("evaluation-result:" + source.id, "Complete gate tally and stop history", {result:data.result, stops:data.events.filter(e => e.kind === "attempt_stopped")}));
+  return html + projectPanel("Complete chronological evidence", `<p>Events can share timestamps. Their scenario, arm, trial and call IDs establish their relationships.</p>` + runDisclosure("evaluation-events:" + source.id, "All retained events without truncation", data.events));
+}
+export function paintEvaluationDetail() {
+  if (state.route === "evals" && state.evaluationDetail) preserveOperationView("evaluation-detail", () => renderEvaluationDetail(state.evaluationDetail));
+}
+export async function openEvaluationDetail(kind, id, query = "", {refresh = false} = {}) {
+  if (!refresh && state.evaluationDetail?.id === id && state.evaluationDetail.kind === kind && state.evaluationDetail.query === query) {paintEvaluationDetail(); return;}
+  const entry = {kind, id, query, loading:true, data:null, error:""}; state.evaluationDetail = entry; paintEvaluationDetail();
+  try {
+    if (!["attempt", "unlinked"].includes(kind) || !id) throw new Error("Unknown evaluation detail address.");
+    entry.data = await getJSON((kind === "attempt" ? API.evalAttempts : API.evalResults) + "/" + encodeURIComponent(id));
+    if (entry.data.summary.id !== id) throw new Error("The response identifies a different evaluation.");
+  } catch(error) {entry.error = String(error.message || error);}
+  finally {
+    entry.loading = false;
+    if (state.evaluationDetail === entry) {
+      paintEvaluationDetail();
+      if (state.route === "evals") doc().getElementById(refresh ? "evaluation-detail-refresh" : "evaluation-title")?.focus?.({preventScroll:refresh});
+    }
+  }
+}
+
+/* Monthly observations are fetched on demand. The URL retains the exact filters. */
+function trendNumber(value) {
+  return value == null ? EM_DASH : value > 0 && value < 0.01 ? "<0.01" : Number(value.toFixed(2)).toLocaleString("en-US", {maximumFractionDigits: 2});
+}
+
+export function renderTrendMatrix(data) {
+  const points = data.series || [];
+  if (!points.length) return emptyState("Trend unavailable", data.reason_text, "");
+  let html = `<p class="caption">Signal occurrences per 100,000 physical lines. Each signal row is scaled to its own peak. Focus a cell for its exact numerator and denominator.</p>`;
+  html += `<div class="scroll-x" tabindex="0" role="region" aria-label="Monthly signal measurements"><table class="matrix trend-matrix"><thead><tr><th scope="col">Signal / workload</th>` +
+    points.map(p => `<th scope="col">${esc(p.month)}${p.partial ? `<br><span class="caption">Partial month</span>` : ""}</th>`).join("") + `</tr></thead><tbody>`;
+  for (const signal of data.signal_types) {
+    const peak = Math.max(0, ...points.map(p => p.signals[signal].rate_per_100k || 0));
+    html += `<tr><th scope="row" class="matrix__row-label">${esc(signal.replaceAll("_", " "))}</th>`;
+    html += points.map(p => {
+      const value = p.signals[signal], rate = value.rate_per_100k;
+      const explanation = `${p.month}: ${signal.replaceAll("_", " ")} · ${value.count} occurrences / ${p.eligible_lines} eligible physical lines · ${p.sessions} known sessions. ${rate == null ? (p.reason === "unknown_version" ? "Unknown detector version; no rate." : "No eligible exposure; no rate.") : `${trendNumber(rate)} per 100,000 lines.`}${p.small_sample ? ` Fewer than ${data.min_sessions} sessions; small sample.` : ""}${p.partial ? " Partial month." : ""}`;
+      return `<td tabindex="0" title="${esc(explanation)}" aria-label="${esc(explanation)}" data-partial="${p.partial}" data-small="${p.small_sample}"><span class="trend-value">${esc(trendNumber(rate))}</span>` +
+        (rate == null ? `<span class="spark trend-gap" aria-hidden="true">—</span>` : `<span class="spark" aria-hidden="true"><span class="spark__bar" style="--v:${peak ? 100 * rate / peak : 0}"></span></span>`) + `</td>`;
+    }).join("") + `</tr>`;
+  }
+  for (const [label, field] of [["Eligible lines", p => p.eligible_lines], ["Known sessions", p => p.sessions], ["Median lines / session", p => p.session_size.median], ["Delivered revisions", p => p.deliveries]]) {
+    html += `<tr class="trend-workload"><th scope="row">${label}</th>` + points.map(p => `<td>${esc(trendNumber(field(p)))}</td>`).join("") + `</tr>`;
+  }
+  return html + `</tbody></table></div><p class="footnote">Shaded cells have fewer than ${num(data.min_sessions)} known sessions. Their observed rates remain visible. Dashed columns mark an incomplete month. No month is dropped for a small sample.</p>`;
+}
+
+export function renderEvaluationHealth(entry = {}) {
+  if (entry.error) return `<p role="alert">${esc(entry.error)}</p><button class="btn" data-evaluation-health-refresh="true">Retry gate evidence</button>`;
+  if (!entry.data) return `<p role="status">Reading retained gate evidence…</p>`;
+  const data = entry.data;
+  return `<p>${data.attempts == null ? "Recorded attempt count unknown" : `${num(data.attempts)} recorded evaluation attempts`}.</p>` +
+    data.by_outcome.map(row => field(row.label, num(row.count))).join("") +
+    `<p>${num(data.unlinked_results)} historical result rows without an attempt link; comparison validity unknown.</p><p class="caption">${esc(data.reason)}</p>`;
+}
+export async function loadEvaluationHealth({refresh = false} = {}) {
+  if (!refresh && state.evaluationHealth && (state.evaluationHealth.loading || state.evaluationHealth.data)) return;
+  const entry = {loading:true, data:null, error:""}; state.evaluationHealth = entry;
+  const paint = () => {if (state.route === "evals" && !state.evaluationDetail && doc().getElementById("trend-gate")) preserveOperationView("trend-gate", () => renderEvaluationHealth(state.evaluationHealth));};
+  paint();
+  try {entry.data = await getJSON(API.evalHealth);} catch(error) {entry.error = String(error.message || error);}
+  finally {entry.loading = false; if (state.evaluationHealth === entry) paint();}
+}
+
+export function renderTrends(entry) {
+  const historyPanel = projectPanel("Every eval so far", `<div id="evaluation-history-body">${renderEvaluationHistory(state.evaluationHistory || {})}</div>`);
+  if (entry.loading) return `<p role="status">Reading monthly observations…</p>` + historyPanel;
+  if (entry.error) return `<p class="error-state" role="alert">${esc(entry.error)}</p><button class="btn" data-trend-refresh="true">Retry monthly observations</button><p><a href="#/evals">Reset trend filters</a></p>` + historyPanel;
+  const data = entry.data;
+  if (!data) return `<p>Monthly observations have not been loaded.</p>`;
+  const requested = data.requested;
+  const select = (name, label, first, values, selected) => `<label>${label}<select name="${name}" id="trend-${name}"><option value="">${first}</option>` + values.map(([value, title]) => `<option value="${esc(value)}"${value === selected ? " selected" : ""}>${esc(title)}</option>`).join("") + `</select></label>`;
+  const projects = data.project_options.map(key => [key, key]);
+  if (requested.project_key && !projects.some(([key]) => key === requested.project_key)) projects.push([requested.project_key, requested.project_key]);
+  const versions = data.version_groups.map(v => [v.compatibility_key, `${v.identifiable ? "Known" : "Unknown"} · ${v.compatibility_key.slice(0, 20)}`]);
+  if (requested.compatibility_key && !versions.some(([key]) => key === requested.compatibility_key)) versions.push([requested.compatibility_key, "Uncovered · " + requested.compatibility_key]);
+  let html = `<form id="trends-filter" class="exposure-form trend-form">` +
+    select("project_key", "Project", "All observed projects", projects, requested.project_key) +
+    select("compatibility_key", "Detector / parser configuration", "Select automatically only if unique", versions, requested.compatibility_key) +
+    `<label>Last month (UTC)<input type="month" name="end_month" id="trend-end_month" required max="${esc(data.partial_month)}" value="${esc(requested.end_month)}"></label>` +
+    `<button id="trend-submit" class="btn" type="submit">Show seven months</button></form>`;
+  html += `<div class="banner" data-state="partial"><div><strong>Observed trends do not establish improvement</strong><p class="caption">${esc(data.denominator_note)} ${esc(data.retention_note)}</p></div></div>`;
+  let chart = (data.reason_text ? `<p class="footnote">${esc(data.reason_text)}</p>` : "") +
+    ((data.coverage_by_project || []).some(p => p.coverage?.coverage_complete === false) ? `<p class="footnote">Incomplete scan coverage in ${num(data.coverage_by_project.filter(p => p.coverage?.coverage_complete === false).length)} project scope(s). Inspect exclusions before comparing these observed subsets.</p>` : "") +
+    `<p class="caption">${num(data.version_groups.length)} recorded detector configurations · ${data.compatibility_key ? `Selected: <span class="mono">${esc(data.compatibility_key.slice(0, 16))}</span>` : "No comparable version selected"}</p>` + renderTrendMatrix(data);
+  chart += `<details><summary>Detector coverage by month (${data.version_groups.length} versions)</summary><p class="caption">A version marks observed coverage, not its release date. The same transcript can have observations under several versions. Selecting one never joins their lines or rates.</p>`;
+  chart += data.version_groups.map(v => `<div class="trend-version"><p class="mono">${esc(v.compatibility_key)}${v.compatibility_key === data.compatibility_key ? " · selected" : ""}</p><p>${v.months.map(m => `${esc(m.month)}: ${num(m.eligible_lines)} lines`).join(" · ") || "No eligible lines in these months"}</p>` + runDisclosure("trend-version:" + v.compatibility_key, "Recorded detector, parser and settings", v.manifests) + `</div>`).join("") + `</details>`;
+  chart += runDisclosure("trend-coverage", "Coverage exclusions and workload details", {coverage_by_project: data.coverage_by_project, unassigned_lines: data.unassigned_lines, months: data.series.map(p => ({month:p.month, observed_lines:p.observed_lines, excluded_lines:p.excluded_lines, unknown_session_lines:p.unknown_session_lines, projects:p.projects, transcripts:p.transcripts, workload:p.workload, session_size:p.session_size}))});
+  html += `<div class="project-columns"><div class="project-primary">` + projectPanel("Signals over time, by kind", chart) + `</div><aside class="project-secondary">` +
+    historyPanel +
+    projectPanel("Gate health", `<div id="trend-gate">${renderEvaluationHealth(state.evaluationHealth || {})}</div>`) +
+    projectPanel("What the counts can show", `<p>These are deterministic signal occurrences. Several signals can refer to one mistake.</p><p>Workload rows describe only the part of each session observed within that month. Compare detector versions, sources and session sizes before interpreting a change.</p><p>Delivery markers show historical revisions. They do not prove when a working copy loaded the instruction.</p>`) + `</aside></div>`;
+  const deliveries = data.deliveries;
+  let deliveryBody = `<p>${esc(deliveries.note)}</p><p id="trend-delivery-status" tabindex="-1" aria-live="polite">${num(deliveries.records.length)} shown · ${deliveries.count == null ? "history unavailable" : `${num(deliveries.count)} retained revisions in this interval`}</p>`;
+  deliveryBody += deliveries.records.map(r => `<article class="project-record"><p><time>${esc(r.applied_at)}</time> · ${esc(r.project_key || "Global instruction")}</p><p><a href="#/rules/${encodeURIComponent(r.learning_id)}?tab=why">Inspect rule ${esc(r.learning_id)}</a></p>` + runDisclosure("trend-delivery:" + r.id, "Exact application and revision identity", r) + `</article>`).join("");
+  if (entry.params?.includes("delivery_cursor=")) deliveryBody += `<button id="trend-deliveries-first" class="btn" data-trend-deliveries-first="true">Newest deliveries</button> `;
+  if (deliveries.next_cursor) deliveryBody += `<button id="trend-deliveries-next" class="btn" data-trend-deliveries-next="true">Older deliveries</button>`;
+  return html + projectPanel("Recorded delivery dates", deliveryBody);
+}
+
+export function paintTrends() {
+  if (state.route === "evals" && !state.evaluationDetail) preserveOperationView("trends-body", () => renderTrends(state.trends || {}));
+}
+
+export async function loadTrends(params = "", {refresh = false} = {}) {
+  const previous = state.trends;
+  if (!refresh && previous?.params === params && (previous.loading || previous.data)) {paintTrends(); return;}
+  const activeId = doc()?.activeElement?.id || "";
+  const entry = {params, loading: true, data: null, error: "", focus: activeId.startsWith("trend-") ? activeId : ""};
+  state.trends = entry; paintTrends();
+  try {
+    entry.data = await getJSON("/api/incident-rate" + (params ? "?" + params : ""));
+  } catch (error) {entry.error = String(error.message || error);}
+  finally {
+    entry.loading = false;
+    if (state.trends === entry) {
+      paintTrends();
+      if (state.route === "evals" && entry.focus) {
+        const focus = doc().getElementById(entry.focus.startsWith("trend-deliveries-") ? "trend-delivery-status" : entry.focus);
+        if (focus?.focus) {
+          focus.focus({preventScroll:true});
+          if (entry.focus.startsWith("trend-deliveries-") && focus.scrollIntoView) focus.scrollIntoView({block:"nearest"});
+        }
+      }
+    }
+  }
+}
+
+export function submitTrends(event) {
+  if (event.target.id !== "trends-filter") return;
+  event.preventDefault();
+  const params = evalQueryParts(state.evaluationQuery).history;
+  for (const [key, value] of new FormData(event.target)) if (value) params.set(key, String(value));
+  const query = params.toString();
+  const hash = "#/evals" + (query ? "?" + query : "");
+  if (currentHash() === hash) loadTrends(query, {refresh:true});
+  else setHash(hash);
+}
+
 
 /* ------------------------------ loading ---------------------------------- */
 
@@ -3834,6 +4396,40 @@ function findAttr(target, attribute) {
 }
 
 export function handleMainClick(event) {
+  if (findAttr(event.target, "data-evaluation-refresh")) {loadEvaluationHistory(state.evaluationQuery, {refresh:true}); loadEvaluationHealth({refresh:true}); return;}
+  if (findAttr(event.target, "data-evaluation-health-refresh")) {loadEvaluationHealth({refresh:true}); return;}
+  if (findAttr(event.target, "data-evaluation-detail-refresh") && state.evaluationDetail) {
+    const entry = state.evaluationDetail; openEvaluationDetail(entry.kind, entry.id, entry.query, {refresh:true}); return;
+  }
+  const evaluationOpen = findAttr(event.target, "data-evaluation-open");
+  if (evaluationOpen) {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || (event.button != null && event.button !== 0)) return;
+    event.preventDefault();
+    const route = parseRoute(currentHash());
+    setHash(evaluationHref(findAttr(event.target, "data-evaluation-kind"), evaluationOpen, route.trendQuery || "")); return;
+  }
+  const evaluationPage = findAttr(event.target, "data-evaluation-page");
+  if (evaluationPage) {
+    const params = new URLSearchParams(state.evaluationQuery);
+    if (evaluationPage === "older" && state.evaluationHistory?.data?.next_cursor) params.set("eval_cursor", state.evaluationHistory.data.next_cursor);
+    else params.delete("eval_cursor");
+    setHash("#/evals" + (params.toString() ? "?" + params : "")); return;
+  }
+  if (findAttr(event.target, "data-trend-refresh")) {loadTrends(state.trends?.params || "", {refresh:true}); return;}
+  if (findAttr(event.target, "data-trend-deliveries-next") || findAttr(event.target, "data-trend-deliveries-first")) {
+    const params = new URLSearchParams(state.evaluationQuery);
+    if (findAttr(event.target, "data-trend-deliveries-next")) params.set("delivery_cursor", state.trends.data.deliveries.next_cursor);
+    else params.delete("delivery_cursor");
+    setHash("#/evals?" + params.toString()); return;
+  }
+  const projectKind = findAttr(event.target, "data-project-records");
+  if (projectKind) {loadProjectRecords(projectKind, {older: Boolean(findAttr(event.target, "data-project-older")), refresh: Boolean(findAttr(event.target, "data-project-refresh")), learningId: findAttr(event.target, "data-project-learning") || ""}); return;}
+  if (findAttr(event.target, "data-project-summary-refresh")) {
+    const key = state.selectedProject;
+    loadProjectDetail(key, {refresh: true}); loadProjectInventory(key, {refresh: true});
+    if (state.inspectorTab === "summary") ["contributed", "proposals", "deliveries"].forEach(kind => loadProjectRecords(kind, {refresh: true}));
+    return;
+  }
   const scanId = findAttr(event.target, "data-scan-history");
   if (scanId) {loadIncidentScanHistory(scanId, {older: Boolean(findAttr(event.target, "data-scan-history-older"))}); return;}
   const runKind = findAttr(event.target, "data-run-records");
@@ -3907,8 +4503,8 @@ export function handleMainClick(event) {
   const projectKey = findAttr(target, "data-project-key");
   if (projectKey) {
     const focus = findAttr(target, "data-focus");
-    setHash(`#/projects/${encodeURIComponent(projectKey)}`);
-    openProject(projectKey, focus || "context");
+    setHash(`#/projects/${encodeURIComponent(projectKey)}${focus ? "?tab=" + encodeURIComponent(focus) : ""}`);
+    openProject(projectKey, focus || "summary");
     return;
   }
   if (ruleId) {
@@ -3937,6 +4533,11 @@ export function handleMainKeydown(event) {
 }
 
 export function handleInspectorClick(event) {
+  if (findAttr(event.target, "data-inventory-refresh")) {loadProjectInventory(state.selectedProject, {refresh: true}); return;}
+  if (findAttr(event.target, "data-inventory-older")) {loadProjectInventory(state.selectedProject, {older: true}); return;}
+  if (findAttr(event.target, "data-availability-refresh")) {loadProjectAvailability(state.selectedProject, {refresh: true}); return;}
+  if (findAttr(event.target, "data-availability-older")) {loadProjectAvailability(state.selectedProject, {older: true}); return;}
+
   const scanId = findAttr(event.target, "data-scan-history");
   if (scanId) {
     if (state.inspectorKind === "rule" && !findAttr(event.target, "data-scan-history-older")) setHash(`#/rules/${encodeURIComponent(state.selectedRule)}?tab=evidence&scan=${encodeURIComponent(scanId)}`);
@@ -3990,9 +4591,17 @@ export function wire() {
   byId("inspector-close").addEventListener("click", () => closeInspector());
   byId("inspector-body").addEventListener("click", handleInspectorClick);
   byId("inspector-body").addEventListener("submit", submitProjectExposure);
+  byId("project-detail-body").addEventListener("click", handleInspectorClick);
+  byId("project-detail-body").addEventListener("submit", submitProjectExposure);
   byId("main").addEventListener("click", handleMainClick);
+  byId("main").addEventListener("submit", submitTrends);
+  byId("main").addEventListener("submit", submitEvaluationFilter);
   byId("main").addEventListener("keydown", handleMainKeydown);
   byId("main").addEventListener("change", (event) => {
+    if (event.target.id === "project-copy" && state.selectedProject) {
+      state.projectInventorySelection[state.selectedProject] = event.target.value;
+      paintProjectDetail();
+    }
     if (event.target.id === "run-selector" && state.runDetail) {
       location.hash = runHref("run", event.target.value, state.runDetail.stage);
     }
