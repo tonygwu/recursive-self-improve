@@ -65,12 +65,32 @@ def make_env(tmp_path: Path, **overrides) -> Env:
     claude.mkdir()
     codex.mkdir()
     repo = make_repo(tmp_path / "work" / "alpha")
+    # Without these, Config falls back to the developer's real provider paths,
+    # so a pipeline test would pass or fail according to what happens to be
+    # installed on the machine. Same synthetic executables as e2e_corpus: they
+    # answer the startup version probe and refuse every model invocation.
+    providers = tmp_path / "providers"
+    providers.mkdir()
+    for name in ("claude", "codex"):
+        executable = providers / name
+        executable.write_text(
+            '#!/bin/sh\n'
+            'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+            '  printf "synthetic provider 1.0\\n"\n'
+            'else\n'
+            '  printf "fixture permits only a version probe\\n" >&2\n'
+            '  exit 64\n'
+            'fi\n'
+        )
+        executable.chmod(0o700)
     settings = {
         "claude_projects_dir": str(claude),
         "codex_sessions_dir": str(codex),
         "codex_archived_dir": str(tmp_path / "codex-archived"),
         "state_dir": str(tmp_path / "state"),
         "project_identity_use_gh": False,
+        "claude_path": str(providers / "claude"),
+        "codex_path": str(providers / "codex"),
         # pytest's tmp_path sits under /var/folders on macOS, which the default
         # denylist excludes. Denial is tested explicitly with its own marker.
         "denylist_substrings": ("denied-tree",),

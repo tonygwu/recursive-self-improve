@@ -241,14 +241,15 @@ def test_managed_discovery_disappearance_is_failed(cfg, tmp_path, monkeypatch):
     repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
     write(repo/'.claude/commands/check.md', 'Local command.\n')
     root = Path(cfg.claude_managed_dir)/'.claude/skills'; root.mkdir(parents=True)
-    original = os.lstat; seen = 0
+    # The race: the root is present when discovery checks it, then becomes
+    # unreadable while the walk enumerates it. Inject at scandir, which the walk
+    # performs on every platform. Counting lstat calls instead would depend on
+    # how many Path.resolve happens to make, which differs by platform.
+    original = os.scandir
     def disappears(path, *a, **kw):
-        nonlocal seen
-        if Path(path) == root:
-            seen += 1
-            if seen > 1: raise PermissionError('invented discovery race')
+        if Path(path) == root: raise PermissionError('invented discovery race')
         return original(path, *a, **kw)
-    monkeypatch.setattr(os, 'lstat', disappears)
+    monkeypatch.setattr(os, 'scandir', disappears)
     record = capture(cfg, repo); validate(record)
     assert record['managed_discovery']['skills_status'] == 'failed'
     assert record['files'][0]['loading_paths'][0]['eligible_prefix_bytes'] == 0
