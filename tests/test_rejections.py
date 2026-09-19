@@ -20,9 +20,13 @@ def proposal(store, target, *, lesson=None, status='pending', diff=None):
 
 
 def decision(store, cfg, action, proposals, key=None):
-    return {'action': action, 'request_key': key or new_id(), 'members': [
+    body = {'action': action, 'request_key': key or new_id(), 'members': [
         {k: review_snapshot(store, p['id'], cfg)[k] for k in ('proposal_id', 'revision')}
         for p in proposals]}
+    if action == 'approve':
+        from self_improve.review import preview_selection
+        body['preview_revision'] = preview_selection(store, cfg, [p['id'] for p in proposals])['revision']
+    return body
 
 
 def waiting(store, cfg):

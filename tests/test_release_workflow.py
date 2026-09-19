@@ -60,6 +60,13 @@ def test_invented_history_through_review_delivery_recovery_and_rollback(tmp_path
             assert rule['provenance']['incidents'] and rule['evidence_linked'] > 0
             assert 'Keep full raw output' in rule['rule_text']
             body = approval_request(client, [rejected['id']], 'release-reject-target')
+            # A rejection binds only its member revisions. The combined-edit
+            # authorization belongs to approval, and the route refuses it here.
+            combined = body.pop('preview_revision')
+            refused = client.post('/api/commands',
+                                  json={**body, 'preview_revision': combined,
+                                        'action': 'reject_target'})
+            assert refused.status_code == 400 and refused.json()['error'] == 'InvalidCommand'
             response = client.post('/api/commands', json={**body, 'action': 'reject_target'})
             assert response.status_code == 202, response.text
             assert response.json()['members'][0]['decision_scope'] == 'target'

@@ -16,6 +16,8 @@ def rendered(tmp_path_factory):
     source = Path(__file__).resolve().parents[1] / "src/self_improve/dashboard/static/app.js"
     module = root / "app.mjs"
     module.write_bytes(source.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(root)
     probe = root / "probe.mjs"
     probe.write_text('''
 import * as app from "./app.mjs";
@@ -62,7 +64,7 @@ def test_missing_measurements_do_not_invent_a_project_history(rendered):
 def test_missing_rule_and_eval_links_report_the_recorded_scope(rendered):
     text = rendered["rule"]
     assert "invented-eval" in text
-    assert "No violated rule was recorded" in text
+    assert "No violation report was retained" in text
     assert "no existing rule covered this" not in text
     assert "not linked to this proposal" in text
     assert "broken LINK" not in text

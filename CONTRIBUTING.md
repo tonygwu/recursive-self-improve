@@ -42,28 +42,37 @@ The demo uses invented records in a temporary database. The regular pipeline's
 `run --dry-run` command writes operational state and is unsuitable as a test
 rehearsal. Do not point tests or demo decisions at a live database.
 
-## Evaluation dashboard browser check
+## Browser checks
 
-The optional browser journey uses invented data and substituted model providers.
-It requires the Playwright Python package and an installed Chromium browser.
-It makes no paid model calls. Port 8876 must be available.
+`tests/browser/` holds disposable fixture servers and their verifiers. A fixture
+named `*_demo.py` serves invented records from a temporary database. A verifier
+named `verify_*.py` drives one contract against it and prints an upper-case
+success marker. They use invented data and substituted model providers, require
+the Playwright Python package and an installed Chromium browser, and make no
+paid model calls. Port 8876 must be available.
 
-Start the fixture in one terminal:
+Start the fixture for the contract you changed in one terminal:
 
 ```sh
 uv run --extra dashboard python tests/browser/eval_dashboard_demo.py
 ```
 
-Run the journey in another terminal:
+Run its verifier in another terminal:
 
 ```sh
 uv run --offline --with playwright python tests/browser/verify_eval_dashboard.py
 ```
 
-Stop the fixture with Ctrl-C after the journey. The server removes its temporary
-database on shutdown. Screenshots and logs remain under ignored `reports/`.
-The success marker is `EVAL_BROWSER_OK`. It covers pagination, source links,
-keyboard focus, both themes, and GET-only browsing without database changes.
+Stop the fixture with Ctrl-C afterwards. The server removes its temporary database
+on shutdown. Screenshots and logs remain under ignored `reports/`. This journey's
+marker is `EVAL_BROWSER_OK`, covering pagination, source links, keyboard focus,
+both themes, and GET-only browsing without database changes. Other verifiers
+follow the same shape for Review, Rules, Projects, Run, trends, navigation,
+rollback, accessibility and visual contrast. Each states its own coverage and
+asserts that its temporary Store and instruction targets are unchanged.
+
+A verifier requires the fixture it names. Read the verifier's final success line
+to see what it actually proved; a clean exit alone is not full acceptance.
 
 ## Prepare a change
 

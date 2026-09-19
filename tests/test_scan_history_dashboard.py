@@ -212,6 +212,8 @@ def test_scan_history_final_page_preserves_focus_and_rule_link(tmp_path):
     from self_improve.dashboard import app
     module = tmp_path / 'app.mjs'
     module.write_bytes((Path(app.__file__).parent/'static'/'app.js').read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     runner = tmp_path / 'history.mjs'
     runner.write_text('''import assert from 'node:assert/strict';
 import * as ui from './app.mjs';

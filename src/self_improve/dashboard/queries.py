@@ -39,9 +39,9 @@ it affects rather than buried here:
    while context weight is what an agent actually *carried*.
 4. ``top_signal`` ties break on the alphabetically first ``signal_type`` and the
    tie is reported in ``tied_with``.
-5. A failure class is ``fixed`` only if the registry names a verified fix
-   timestamp AND no run started after it recorded the class; a later occurrence
-   is reported as ``regressed``, never silently re-hidden.
+5. Historical fix metadata matches only an exact verified constraint key.
+   A later run with that key stays visible; source commit time alone does not
+   establish the deployed revision or prove the identical defect recurred.
 """
 
 from __future__ import annotations
@@ -54,6 +54,8 @@ from datetime import date, datetime, timedelta, timezone
 
 # Constants only — never the Store class. `test_queries_never_constructs_a_store`
 # enforces that distinction, because constructing one runs migrations.
+from .. import project_measurements
+
 from .scan_data import project_exposure
 from ..execution_policy import waiting_proposals, proposal_dispositions, policy_snapshot, MANDATORY_REVIEW_ACTIONS
 from ..store import (
@@ -86,6 +88,9 @@ __all__ = [
 ]
 
 
+from .. import stage_accounting
+
+
 class DashboardDataError(Exception):
     """A row the dashboard cannot read. Never recovered from with a default."""
 
@@ -114,6 +119,7 @@ KNOWN_STATUSES = frozenset(
 #: outrank a real outcome.
 CELL_STATES_WORST_FIRST = (
     "unreadable",
+    "unaccounted",
     "unknown_status",
     "failed",
     "error",
@@ -127,6 +133,7 @@ CELL_STATES_WORST_FIRST = (
     "interrupted",
     "abandoned",
     "partial",
+    "limited",
     "budget_exhausted",
     "refused",
     "running",
@@ -156,247 +163,15 @@ RUN_STATUSES = (
 #: Re-exported, not redefined — see store.LLM_SUCCESS_OUTCOMES.
 from ..store import LLM_SUCCESS_OUTCOMES  # noqa: E402  (kept beside its users)
 
-#: Taxonomy keys that are NOT failures. `budget_exhausted` counts incidents the
-#: nightly cap never reached; those incidents were not attempted.
-NOT_FAILURE_TAXONOMY = {
-    "propose_TargetRejected": "a prior target rejection suppressed proposal generation at that target; no eval was attempted",
-    "propose_LessonRejected": "a prior lesson-wide rejection suppressed proposal generation everywhere; no eval was attempted",
-    "budget_exhausted": "incidents the run's cap never reached — not attempted, not failed",
-    "budget_refused_this_incident": "one incident refused because the cap was reached mid-run",
-    "gate_budget_exhausted": "a proposal held because the gate's budget was gone before it was asked",
-    "wall_deadline_reached": (
-        "incidents left unmined because the run hit its wall-clock deadline — "
-        "not attempted, not failed. The run stopped on purpose so it would "
-        "release the nightly lock before the next 02:30"
-    ),
-}
-
-def failure_copy(cls: str) -> dict | None:
-    """Resolve the plain-language copy for a failure class.
-
-    Some classes carry a detail after a colon — `call_failed:spawn_error`
-    names both the family and the outcome that caused it. An exact-match
-    lookup drops the whole family into "unknown" with a blank explanation,
-    which is how the operator ends up reading a count with no words next to
-    it. Fall back to the family.
-    """
-    exact = FAILURE_COPY.get(cls)
-    if exact is not None:
-        return exact
-    family, sep, _detail = cls.partition(":")
-    if sep:
-        return FAILURE_COPY.get(family)
-    # Keys built from an exception class at runtime (`gate_ValueError`) cannot
-    # be enumerated. They resolve by prefix, and only AFTER the exact lookup —
-    # `gate_budget_exhausted` is not a failure and must never be claimed here.
-    if cls in NOT_FAILURE_TAXONOMY:
-        return None
-    for prefix, copy in FAILURE_PREFIX_COPY:
-        if cls.startswith(prefix):
-            return copy
-    return None
-
-
-#: Prefix families for taxonomy keys built from an exception class at runtime.
-#: They deliberately name the STAGE and nothing else: the suffix is an
-#: arbitrary class name, and inventing a cause for it is the failure this whole
-#: file has been corrected for. Consulted only after the exact lookup, so a key
-#: with its own entry — or one in NOT_FAILURE_TAXONOMY — always wins.
-FAILURE_PREFIX_COPY = (
-    (
-        "gate_",
-        {
-            "name": "The gate stage raised",
-            "explanation": (
-                "The gate raised while evaluating a proposal. The suffix is "
-                "the exception class. The proposal stays pending — no verdict "
-                "was recorded about the rule."
-            ),
-        },
-    ),
-    (
-        "propose_",
-        {
-            "name": "The propose stage raised",
-            "explanation": (
-                "Turning a learning into a proposal raised. The suffix is the "
-                "exception class. The learning stays where it was."
-            ),
-        },
-    ),
-    (
-        "prune_",
-        {
-            "name": "The prune stage raised",
-            "explanation": (
-                "The A/B prune raised while re-checking an applied rule. The "
-                "suffix is the exception class. Nothing was removed."
-            ),
-        },
-    ),
-    (
-        "not_appliable_",
-        {
-            "name": "Not in a state the apply stage can act on",
-            "explanation": (
-                "The apply stage reached a proposal whose status it does not "
-                "act on. The suffix is that status. Nothing was written."
-            ),
-        },
-    ),
+# Compatibility exports; report generation uses the same dependency-free copy.
+from ..failure_presentation import (  # noqa: E402
+    FAILURE_COPY, FAILURE_PREFIX_COPY, NOT_FAILURE_TAXONOMY, failure_copy, taxonomy_rows,
 )
-
-#: Plain-language copy per D3. `technical` is the progressive-disclosure name.
-FAILURE_COPY = {
-    "MineParseFailure": {
-        "name": "No answer we could read",
-        "explanation": (
-            # Describe only the observed parse failure. A call with no answer uses the
-            # separate call_failed:<outcome> taxonomy.
-            "The mining agent answered, and the answer was not the JSON we "
-            "asked for. Nothing was lost — the incident stays queued and is "
-            "retried."
-        ),
-    },
-    "call_failed": {
-        "name": "The call never produced an answer",
-        "explanation": (
-            "The provider CLI was reached but returned nothing usable, so no "
-            "answer was ever parsed. The suffix names the outcome class — "
-            "`spawn_error` means the process could not start at all. Nothing "
-            "was lost; the incident stays queued."
-        ),
-    },
-    "gate_sandbox_unverified": {
-        "name": "The sandbox could not be proven to contain an escape",
-        "explanation": (
-            # Name a failed containment check explicitly so a bare count cannot hide it.
-            "The trial was NOT run and no verdict was recorded. A rule that "
-            "hits this stays pending — recording a verdict about a rule the "
-            "sandbox never safely tested is the mistake the probe exists to "
-            "prevent."
-        ),
-    },
-    "provider_unavailable": {
-        "name": "No provider could be started",
-        "explanation": (
-            "The run's preflight found no usable provider CLI, so the whole "
-            "queue was refused rather than attempted. Nothing was tried and "
-            "nothing was lost; the count is what the refusal cut."
-        ),
-    },
-    "MineContractViolation": {
-        "name": "Answer was missing required fields",
-        "explanation": (
-            "Valid JSON, but a required key was absent or out of range. "
-            "Rejected whole rather than half-accepted."
-        ),
-    },
-    "IntegrityError": {
-        "name": "A database constraint rejected a write",
-        "explanation": (
-            # IntegrityError covers multiple constraints. The suffix identifies the
-            # specific constraint; the base class alone cannot identify its cause.
-            "sqlite raised on a constraint. The write was rolled back and the "
-            "incident stays queued. From 2026-08-23 the key carries a suffix "
-            "naming which constraint — `unique:<table>`, "
-            "`not_null:<table.column>`, `foreign_key`, or `unparsed` when the "
-            "message is one we have not seen. A row with NO suffix is older "
-            "than that split and cannot say which constraint it was."
-        ),
-    },
-    "parse_error": {
-        "name": "No answer we could read",
-        "explanation": (
-            "Output arrived and did not carry the answer in the contract we "
-            "asked for. A call that produced NO output is `empty_output`, not "
-            "this."
-        ),
-    },
-    "empty_output": {
-        "name": "The call produced no output",
-        "explanation": (
-            # An empty stdout stream is distinct from a reply that could not be parsed.
-            "The provider exited cleanly and wrote nothing to stdout, so "
-            "there was never an answer to read. Nothing was lost; the "
-            "incident stays queued."
-        ),
-    },
-    "timeout": {
-        "name": "The model never answered",
-        "explanation": "The call passed its deadline and was abandoned.",
-    },
-    "max_turns": {
-        "name": "The agent ran out of turns",
-        "explanation": "The agentic miner hit its turn limit before answering.",
-    },
-    "model_mismatch": {
-        "name": "A different model answered",
-        "explanation": (
-            "The response envelope named a model other than the one requested, "
-            "so the answer was refused."
-        ),
-    },
-    "quota_exhausted": {
-        "name": "Out of quota",
-        "explanation": "The account's usage window was spent.",
-    },
-    "spawn_error": {
-        "name": "The CLI would not start",
-        "explanation": "The agent process failed to launch.",
-    },
-    "auth_failed": {
-        "name": "The account's login is dead",
-        "explanation": (
-            "The provider refused the account's credentials. Retrying cannot "
-            "clear this and no reset time applies \u2014 that account needs an "
-            "interactive login before it can serve another call. Distinct from "
-            "the transient credential race, which is retried once and "
-            "usually succeeds."
-        ),
-    },
-    "sandbox_denied": {
-        "name": "The sandbox refused the agent",
-        "explanation": (
-            "The operating system refused an operation the provider needed "
-            "before it could answer, so nothing ran. In the gate stage this "
-            "means no trial was executed. Until 2026-09-05 that was recorded "
-            "as `ungated`, which is auto-applied; it is now recorded as "
-            "`error`, which never votes, so the rule is held for a person. "
-            "See docs/FINDING-eval-gate-never-ran.md."
-        ),
-    },
-    "sandbox_incapable_fleet": {
-        "name": "No account could run a sandboxed trial",
-        "explanation": (
-            "Nothing was spent. Every account the router offered belongs to a "
-            "provider that cannot start inside the sandbox, so the call was "
-            "refused rather than burnt. Distinct from `The sandbox refused "
-            "the agent`, which is a call that WAS made and then blocked. Fix "
-            "it by giving the fleet capacity on a provider that works, or by "
-            "clearing `sandbox_incompatible_providers` if the incompatibility "
-            "has been resolved."
-        ),
-    },
-    "other": {
-        "name": "Something else went wrong",
-        "explanation": "An error with no more specific class.",
-    },
-}
 
 # Code-fix metadata uses commit author time converted to UTC. Match exact
 # failure keys, not broad families: fixing one constraint does not fix every
 # future IntegrityError.
 FIXED_FAILURES = {
-    # Compatibility key for historical rows that omitted the constraint suffix.
-    "IntegrityError": {
-        "fixed_at": "2026-08-16T10:56:04Z",
-        "fix_commit": "cfd6410b5469b2e2c718c16c1c042e2f1c3f123a",
-        "fix": (
-            "incident_learnings linking is idempotent (ON CONFLICT DO NOTHING) "
-            "and each incident commits independently."
-        ),
-    },
     "IntegrityError:unique:incident_learnings": {
         "fixed_at": "2026-08-16T10:56:04Z",
         "fix_commit": "cfd6410b5469b2e2c718c16c1c042e2f1c3f123a",
@@ -607,118 +382,15 @@ def data_freshness(store, *, now_utc) -> dict:
 
 
 def _stage_numbers(stage: str, payload: dict) -> dict | None:
-    """attempted/succeeded/failed for one stage, or None if the shape is new.
-
-    Each stage records a different shape and the shapes have changed over time,
-    so this is an explicit table rather than a guess. Returning ``None`` makes
-    the cell ``unreadable`` and lists it in ``grid['unreadable']``; it never
-    reads as ok.
-    """
-    if not isinstance(payload, dict):
-        return None
-    extras: dict = {}
-    if stage == "scan":
-        if not {"files_attempted", "files_succeeded", "files_failed"} <= set(payload):
-            return None
-        attempted = int(payload["files_attempted"])
-        succeeded = int(payload["files_succeeded"])
-        failed = int(payload["files_failed"])
-        # Count scan passes, not distinct sessions. Several runs can read the same
-        # session file on one data day, so the label must preserve that distinction.
-        number, label = succeeded, "files scanned (summed over the night's runs)"
-        extras["files_skipped_unchanged"] = payload.get("files_skipped_unchanged")
-    elif stage == "mine":
-        if not {"attempted", "succeeded", "failed"} <= set(payload):
-            return None
-        attempted = int(payload["attempted"])
-        succeeded = int(payload["succeeded"])
-        failed = int(payload["failed"])
-        number, label = succeeded, "incidents mined"
-        extras["mode"] = payload.get("mode")
-    elif stage == "cluster":
-        merged_nothing = int(payload.get("merge_attempted", 0) or 0) == 0
-        if "merge_attempted" in payload and not (merged_nothing and payload.get("candidates")):
-            attempted = int(payload["merge_attempted"])
-            succeeded = int(payload.get("merge_succeeded", 0))
-            failed = int(payload.get("merge_failed", 0))
-        elif "candidates" in payload:
-            # agentic passthrough: the miner already deduped, so there is no
-            # attempt/fail concept — candidates passed straight through.
-            attempted = succeeded = int(payload["candidates"])
-            failed = 0
-            extras["passthrough"] = True
-        else:
-            return None
-        number, label = int(payload.get("candidates", succeeded)), "candidate rules"
-        extras["mode"] = payload.get("mode")
-    elif stage == "gate":
-        if "attempted" not in payload:
-            return None
-        attempted = int(payload["attempted"])
-        verdicts = {
-            key: int(payload.get(key, 0))
-            for key in ("gated_pass", "gated_fail", "ungated", "inconclusive")
-        }
-        succeeded = sum(verdicts.values())
-        failed = int(payload.get("failed", 0))
-        number, label = succeeded, "verdicts"
-        extras["verdicts"] = verdicts
-        extras["refused"] = int(payload.get("refused", 0))
-    elif stage == "apply":
-        if not {"attempted", "applied"} <= set(payload):
-            return None
-        applied = int(payload["applied"])
-        held = int(payload.get("held", 0))
-        failed = int(payload.get("failed", 0))
-        recorded = int(payload["attempted"])
-        attempted = max(recorded, applied + held + failed)
-        # A held proposal is the CORRECT outcome under --review-only, so it is
-        # a success of the apply stage, not a failure.
-        succeeded = applied + held
-        if attempted != recorded:
-            extras["attempted_adjusted"] = {
-                "recorded": recorded,
-                "used": attempted,
-                "reason": "applied+held+failed exceeded the recorded attempted count",
-            }
-        number, label = applied, "edits applied"
-        extras["applied"] = applied
-        extras["held"] = held
-    else:
-        raise DashboardDataError(f"unknown stage {stage!r}; known stages are {STAGES}")
-    taxonomy = payload.get("taxonomy")
-    if isinstance(taxonomy, dict):
-        extras["taxonomy"] = dict(taxonomy)
-    unaccounted = attempted - succeeded - failed - extras.get("refused", 0)
-    return {
-        "attempted": attempted,
-        "succeeded": succeeded,
-        "failed": failed,
-        "unaccounted": unaccounted,
-        "number": number,
-        "number_label": label,
-        **extras,
-    }
+    """Compatibility adapter over the pure native-accounting reader."""
+    try:
+        return stage_accounting.numbers(stage, payload)
+    except (ValueError, KeyError) as exc:
+        raise DashboardDataError(str(exc)) from exc
 
 
 def _state_from_numbers(nums: dict) -> str:
-    attempted = nums["attempted"]
-    succeeded = nums["succeeded"]
-    failed = nums["failed"]
-    if attempted <= 0:
-        return "ok"  # ran, had nothing to do; `idle` is set by the caller
-    if failed == 0 and succeeded == attempted:
-        return "ok"
-    if failed == 0 and nums.get("refused", 0) > 0 and succeeded + nums["refused"] == attempted:
-        return "budget_exhausted" if succeeded else "refused"
-    if succeeded == 0 and failed == 0:
-        # Attempted work, no failures reported, nothing produced: refused
-        # (budget), never `failed`. AGENTS.md: do not read a run with no eval
-        # verdicts as a gate that failed.
-        return "refused"
-    if succeeded == 0:
-        return "failed"
-    return "partial"
+    return stage_accounting.state_from_numbers(nums)
 
 
 def _stage_cell(run: dict, stage: str, stats: dict) -> dict:
@@ -731,7 +403,7 @@ def _stage_cell(run: dict, stage: str, stats: dict) -> dict:
     """
     status = run["status"]
     payload = stats.get(stage)
-    if payload is None:
+    if stage not in stats:
         if status == "ok":
             state = "skipped"
         elif status in RUN_STATUSES:
@@ -745,7 +417,10 @@ def _stage_cell(run: dict, stage: str, stats: dict) -> dict:
             "number": None,
             "number_label": "",
         }
-    nums = _stage_numbers(stage, payload)
+    try:
+        nums = _stage_numbers(stage, payload)
+    except DashboardDataError as exc:
+        raise DashboardDataError(f"run {run['id']}.{exc}") from exc
     if nums is None:
         return {
             "state": "unreadable",
@@ -754,10 +429,13 @@ def _stage_cell(run: dict, stage: str, stats: dict) -> dict:
             "number": None,
             "number_label": "",
             "unreadable_keys": sorted(payload) if isinstance(payload, dict) else [],
+            "missing_fields": stage_accounting.missing_fields(stage, payload) if isinstance(payload, dict) else [],
+            "meaning": stage_accounting.MEANINGS[stage],
+            "reason": "Required native outcome counters are missing." if isinstance(payload, dict) else "The retained stage is not an object.",
         }
     state = _state_from_numbers(nums)
     cell = {"state": state, "recorded": True, "run_status": status, **nums}
-    if nums["attempted"] <= 0:
+    if state == "ok" and nums["attempted"] == 0:
         cell["idle"] = True
     return cell
 
@@ -844,6 +522,9 @@ def run_stage_grid(store, *, now_utc, window_days: int | None = None) -> dict:
                 "states": state_counts,
                 "runs_without_record": sum(1 for c in per_run if not c["recorded"]),
                 "runs": len(per_run),
+                "accounted_runs": len(recorded),
+                "unreadable_runs": sum(c["recorded"] and "attempted" not in c for c in per_run),
+                "unit": stage_accounting.UNITS[stage],
                 "attempted": sum(c["attempted"] for c in recorded) if recorded else None,
                 "succeeded": sum(c["succeeded"] for c in recorded) if recorded else None,
                 "failed": sum(c["failed"] for c in recorded) if recorded else None,
@@ -1034,6 +715,11 @@ WHY_QUEUED = {
 #: rows). Keyed by ``proposals.action``; every member of
 #: ``cfg.review_queue_actions`` must appear here or the lookup raises.
 WHY_CARVE_OUT = {
+    "add": "your configuration requires manual review for instruction additions.",
+    "edit": "your configuration requires manual review for instruction edits.",
+    "delete": "your configuration requires manual review for instruction deletions.",
+    "new_skill": "your configuration requires manual review for new skills.",
+    "new_rule_file": "your configuration requires manual review for new rule files.",
     "recover_rule": "this is a generated recovery proposal. Inspect its exact patch, selected source, and destination before approving.",
     "resolve_rollback": "this resolves a rollback conflict. Inspect the exact changes and retained application before approving.",
     "reapply": "this reapplies a rolled-back change. Inspect the new patch and original rollback before approving.",
@@ -1253,12 +939,13 @@ def _provenance(store, learning_ids: list[str]) -> dict:
     """
     if not learning_ids:
         return {}
+    from . import evidence_identity as identity
+    identities=identity.metadata_index(store)
     slots = ",".join("?" * len(learning_ids))
     rows = store.query(
         "SELECT il.learning_id AS lid, "
         "       MIN(i.ts) AS first_seen, MAX(i.ts) AS last_seen, "
         "       COUNT(*) AS incident_count, "
-        "       COUNT(DISTINCT i.session_id) AS session_count, "
         "       COUNT(DISTINCT i.project_path) AS path_count "
         "  FROM incident_learnings il "
         "  JOIN incidents i ON i.id = il.incident_id "
@@ -1271,7 +958,7 @@ def _provenance(store, learning_ids: list[str]) -> dict:
             "first_seen": r["first_seen"],
             "last_seen": r["last_seen"],
             "incident_count": int(r["incident_count"]),
-            "session_count": int(r["session_count"]),
+            "session_count": 0,
             "path_count": int(r["path_count"]),
             "sources": [],
             "examples": [],
@@ -1280,24 +967,23 @@ def _provenance(store, learning_ids: list[str]) -> dict:
         for r in rows
     }
 
-    # Which agent produced the evidence. `sessions.source` is the only place
-    # that fact lives; the incident itself does not carry it.
-    for r in store.query(
-        "SELECT DISTINCT il.learning_id AS lid, s.source AS source "
-        "  FROM incident_learnings il "
-        "  JOIN incidents i ON i.id = il.incident_id "
-        "  JOIN sessions s ON s.file_path = i.session_file "
-        f" WHERE il.learning_id IN ({slots}) AND s.source <> ''",
-        tuple(learning_ids),
-    ):
-        if r["lid"] in out and r["source"] not in out[r["lid"]]["sources"]:
-            out[r["lid"]]["sources"].append(r["source"])
+    linked=store.query(
+        'SELECT il.learning_id AS lid,i.* FROM incident_learnings il '
+        'JOIN incidents i ON i.id=il.incident_id '+f'WHERE il.learning_id IN ({slots}) ORDER BY i.id',
+        tuple(learning_ids))
+    for lid,bucket in out.items():
+        evidence=[r for r in linked if r['lid']==lid]
+        summary=identity.session_summary(identities,[r for r in evidence if r['ts']])
+        bucket.update(session_count=summary['known_session_count'],
+                      unknown_session_records=summary['unknown_session_records'],
+                      unknown_source_incidents=sum(not identity.session_ref(identities,r)['provider'] for r in evidence))
+        bucket['sources']=sorted({identity.session_ref(identities,r)['provider'] for r in evidence}-{''})
 
     # Example incidents, newest first. Report each family's cap alongside the
     # sample so readers can distinguish displayed incidents from total evidence.
     for r in store.query(
-        "SELECT il.learning_id AS lid, i.id, i.ts, i.project_path, "
-        "       i.signal_type, i.matched_text "
+        "SELECT il.learning_id AS lid, i.id, i.ts, i.project_path, i.project_key, i.session_id, i.session_file, "
+        "       i.signal_type, i.matched_text, i.window_json "
         "  FROM incident_learnings il "
         "  JOIN incidents i ON i.id = il.incident_id "
         f" WHERE il.learning_id IN ({slots}) AND i.ts <> '' "
@@ -1317,6 +1003,7 @@ def _provenance(store, learning_ids: list[str]) -> dict:
                 "project_path": r["project_path"],
                 "signal_type": r["signal_type"],
                 "matched_text": r["matched_text"] or "",
+                "presentation": normalize_incident({**r, 'identity':identity.identity(identities,r)}),
             }
         )
     return out
@@ -1370,7 +1057,7 @@ def review_queue(store, cfg) -> dict:
     and rejection scope. Independent membership rules could make the views disagree.
     """
     carve_outs = tuple(sorted(set(_cfg_attr(cfg, "review_queue_actions")) | MANDATORY_REVIEW_ACTIONS))
-    from ..commands import review_snapshot
+    from ..commands import review_content, review_content_revision
     waiting = {row["id"]: row for row in waiting_proposals(store, cfg)}
     rows = store.query(
         "SELECT p.id, p.learning_id, p.status, p.target_path, p.target_kind, "
@@ -1384,9 +1071,13 @@ def review_queue(store, cfg) -> dict:
 
     families: dict[str, dict] = {}
     for row in rows:
-        code, copy, carve = why_needs_you(
-            row["status"], action=row["action"], cfg=cfg
-        )
+        execution = waiting[row['id']]['execution']
+        if execution['reason'] == 'fresh_approval_required':
+            code, copy, carve = execution['reason'], execution['detail'], True
+        else:
+            code, copy, carve = why_needs_you(
+                row["status"], action=row["action"], cfg=cfg
+            )
         if row["status"] == "gated_pass" and not carve:
             copy = waiting[row["id"]]["execution"]["detail"]
         fam = families.setdefault(
@@ -1408,7 +1099,7 @@ def review_queue(store, cfg) -> dict:
         fam["proposals"].append(
             {
                 "id": row["id"],
-                "revision": review_snapshot(store, row["id"], cfg)["revision"],
+                "content_revision": review_content_revision(review_content(store, row["id"])),
                 "status": row["status"],
                 "target_path": row["target_path"],
                 "target_kind": row["target_kind"],
@@ -1540,6 +1231,7 @@ def review_queue(store, cfg) -> dict:
     note = note.strip()
 
     return {
+        "profile": "review-content/1",
         "families": out_families,
         "family_count": len(out_families),
         "count": sum(f["size"] for f in out_families),
@@ -1628,11 +1320,12 @@ def backlog(store, cfg, *, window_days: int = 14) -> dict:
         window_start = window_end = None
 
     capacity = int(_cfg_attr(cfg, "max_cheap_calls_per_run"))
-    net = None if arrivals_per_day is None else arrivals_per_day - capacity
     return {
         "queued": queued,
         "incidents_by_status": by_status,
         "mine_capacity_per_run": capacity,
+        "capacity_unit": "model_calls_per_run",
+        "capacity_note": "Configured mining-model call slots per run, not successful incidents. Calls can fail, retry or serve other mining-pool stages.",
         "mine_order": _cfg_attr(cfg, "mine_order"),
         "arrivals": {
             "per_day": arrivals_per_day,
@@ -1652,10 +1345,10 @@ def backlog(store, cfg, *, window_days: int = 14) -> dict:
                 "together, so arrival rates use the source event timestamps"
             ),
         },
-        "net_per_day": net,
+        "net_per_day": None,
         "race": (
-            "arrivals versus capacity, not a countdown: the queue grows, so any "
-            "number of nights to empty it would be fiction"
+            "Transcript-time arrivals and execution-time mining use different windows. "
+            "Model-call slots are not incident throughput; no net daily rate is inferred."
         ),
     }
 
@@ -1704,11 +1397,14 @@ def failure_panel(store) -> dict:
         for stage, payload in stats.items():
             if not isinstance(payload, dict):
                 continue
-            taxonomy = payload.get("taxonomy")
-            if not isinstance(taxonomy, dict):
+            if 'taxonomy' not in payload:
                 continue
-            for cls, count in taxonomy.items():
-                count = int(count)
+            try:
+                descriptions = taxonomy_rows(payload['taxonomy'], owner=f"run {run['id']}.{stage}.taxonomy")
+            except ValueError as exc:
+                raise DashboardDataError(str(exc)) from exc
+            for description in descriptions:
+                cls, count = description['class'], description['count']
                 if cls in NOT_FAILURE_TAXONOMY:
                     not_failures[cls] = not_failures.get(cls, 0) + count
                     continue
@@ -1724,8 +1420,10 @@ def failure_panel(store) -> dict:
                     )
 
     llm_rows = store.query(
-        "SELECT stage, outcome, COUNT(*) AS n FROM llm_calls GROUP BY stage, outcome"
+        "SELECT run_id, stage, outcome, COUNT(*) AS n FROM llm_calls GROUP BY run_id, stage, outcome"
     )
+    run_by_id = {run['id']: run for run in runs}
+    unlinked_failed_calls = 0
     llm_by_stage: dict[str, dict] = {}
     for row in llm_rows:
         bucket = llm_by_stage.setdefault(
@@ -1733,13 +1431,26 @@ def failure_panel(store) -> dict:
         )
         n = int(row["n"])
         bucket["attempted"] += n
-        bucket["by_outcome"][row["outcome"]] = n
+        bucket["by_outcome"][row["outcome"]] = bucket["by_outcome"].get(row["outcome"], 0) + n
         if row["outcome"] in LLM_SUCCESS_OUTCOMES:
             bucket["succeeded"] += n
         else:
             bucket["failed"] += n
             totals[row["outcome"]] = totals.get(row["outcome"], 0) + n
             stages_seen.setdefault(row["outcome"], set()).add(row["stage"])
+            owner = run_by_id.get(row['run_id'])
+            if owner is None:
+                unlinked_failed_calls += n
+                continue
+            cls = row['outcome']
+            if recent_from and _day(owner['started']) >= recent_from:
+                recent[cls] = recent.get(cls, 0) + n
+            prior = last_seen.get(cls)
+            if prior is None or (owner['started'], owner['id']) >= (prior['started'], prior['run_id']):
+                last_seen[cls] = {'run_id': owner['id'], 'started': owner['started'], 'count': n}
+            fixed = FIXED_FAILURES.get(cls)
+            if fixed and owner['started'] > fixed['fixed_at']:
+                after_fix.setdefault(cls, []).append({'run_id': owner['id'], 'started': owner['started'], 'count': n})
 
     open_rows, fixed_rows, quiet_rows, regressed_rows, unknown = [], [], [], [], []
     for cls in sorted(totals):
@@ -1748,8 +1459,8 @@ def failure_panel(store) -> dict:
             unknown.append({"class": cls, "count": totals[cls]})
         entry = {
             "class": cls,
-            "name": copy["name"] if copy else cls,
-            "explanation": copy["explanation"] if copy else "",
+            "name": copy["name"] if copy else "Unclassified outcome",
+            "explanation": copy["explanation"] if copy else "No explanation is registered for this recorded identifier.",
             "has_copy": copy is not None,
             "stages": sorted(stages_seen.get(cls, ())),
             "total": totals[cls],
@@ -1785,9 +1496,14 @@ def failure_panel(store) -> dict:
         "llm_by_stage": llm_by_stage,
         "success_outcomes": list(LLM_SUCCESS_OUTCOMES),
         "latest_run_day": latest_day,
+        "retained_runs": len(runs),
+        "retained_calls": sum(row['n'] for row in llm_rows),
+        "unlinked_failed_calls": unlinked_failed_calls,
+        "recent_window_from": recent_from,
         "note": (
-            "Nothing was lost — every failed incident stays queued and is retried. "
-            "Fixed classes are excluded from current health."
+            "Counts combine stage taxonomy entries and call outcomes; they are not deduplicated incidents. "
+            "Recent means the seven calendar days ending on the latest retained run day, using explicit run ownership. "
+            "Unlinked calls have unknown run coverage. Retained records do not prove complete execution history."
         ),
     }
 
@@ -1956,71 +1672,18 @@ def normalize_incident(row: dict) -> dict:
     incident_id = _require(row, "id", what)
     signal_type = _require(row, "signal_type", what)
     matched_text = _require(row, "matched_text", what)
-    window = _json_arr(_require(row, "window_json", what), f"{what}.window_json")
+    from ..incident_evidence import present, IncidentEvidenceError
+    try:
+        evidence = present({**row, 'matched_text': matched_text,
+                            'window_json': _require(row, 'window_json', what)},
+                           owner=what, max_chars=DISPLAY_TEXT_MAX)
+    except IncidentEvidenceError as exc:
+        raise DashboardDataError(str(exc)) from exc
+    return {'id': incident_id, 'signal_type': signal_type,
+            'ts': row.get('ts', ''), 'status': row.get('status', ''),
+            'score': row.get('score'), 'session_id': row.get('session_id', ''),
+            'project_key': row.get('project_key', ''), **({'identity':row['identity']} if 'identity' in row else {}), **evidence}
 
-    first = window[0] if window and isinstance(window[0], dict) else None
-    if first is None:
-        kind = "empty" if not window else "unknown"
-    elif "count_in_session" in first or "session_file" in first:
-        kind = "occurrence"
-    elif "role" in first:
-        kind = "turn"
-    else:
-        kind = "unknown"
-
-    is_hash = bool(_SHA1_RE.match(matched_text))
-    text = ""
-    if not is_hash:
-        text = matched_text
-    if not text:
-        for entry in window:
-            if isinstance(entry, dict) and entry.get("text"):
-                text = str(entry["text"])
-                break
-    if not text:
-        text = (
-            f"(no readable text retained; error fingerprint {matched_text[:8]}…)"
-            if is_hash
-            else "(no readable text retained)"
-        )
-
-    truncated = None
-    if len(text) > DISPLAY_TEXT_MAX:
-        truncated = {"cut_chars": len(text) - DISPLAY_TEXT_MAX, "original_chars": len(text)}
-        text = text[:DISPLAY_TEXT_MAX]
-
-    occurrences = None
-    if kind == "occurrence":
-        stamps = [e.get("ts", "") for e in window if isinstance(e, dict) and e.get("ts")]
-        paths = sorted(
-            {e.get("project_path", "") for e in window if isinstance(e, dict)} - {""}
-        )
-        occurrences = {
-            "sessions": len(window),
-            "total_count": sum(
-                int(e.get("count_in_session", 0)) for e in window if isinstance(e, dict)
-            ),
-            "first_ts": min(stamps) if stamps else "",
-            "last_ts": max(stamps) if stamps else "",
-            "project_paths": paths,
-        }
-
-    return {
-        "id": incident_id,
-        "signal_type": signal_type,
-        "ts": row.get("ts", ""),
-        "status": row.get("status", ""),
-        "score": row.get("score"),
-        "session_id": row.get("session_id", ""),
-        "project_key": row.get("project_key", ""),
-        "window_kind": kind,
-        "window_len": len(window),
-        "display_text": text,
-        "display_text_truncated": truncated,
-        "fingerprint": matched_text if is_hash else "",
-        "matched_text_is_fingerprint": is_hash,
-        "occurrences": occurrences,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -2086,45 +1749,55 @@ def rule_families(store) -> dict:
     }
 
 
-def rules(store, *, evidence_sample: int = 5) -> dict:
+def rules(store, *, evidence_sample: int = 5, learning_ids: list[str] | None = None) -> dict:
     """Every learning with state, target, evidence, provenance and verdict.
 
     Miner generation comes from immutable content history. Historical or
     subsequently changed content stays unknown; scan time is not mining time.
     """
-    from ..mining_history import summaries as mining_summaries
+    from ..mining_history import summaries as mining_summaries, summary as mining_summary
+    if learning_ids is not None and (not isinstance(learning_ids,list) or not 1 <= len(learning_ids) <= 50 or not all(isinstance(lid,str) and lid for lid in learning_ids)):
+        raise DashboardDataError('Selected rule IDs must be a nonempty list of at most 50 IDs')
+    params = tuple(learning_ids or ())
+    slots = ','.join('?' for _ in params)
+    def selected(column):
+        return f" WHERE {column} IN ({slots})" if learning_ids is not None else ''
+
     learnings = store.query(
         "SELECT id, title, rule_text, why, category, scope, evidence_count, "
         "project_count, projects_json, first_seen, last_seen, confidence, status, "
         "duplicate_of, created_at, incident_summary, source, violated_existing_rule, "
-        "path_globs_json, primary_project_path FROM learnings ORDER BY created_at, id"
+        "path_globs_json, primary_project_path FROM learnings" + selected("id") + " ORDER BY created_at, id", params
     )
-    mining=mining_summaries(store,learnings)
+    mining={row["id"]:mining_summary(store,row) for row in learnings} if learning_ids is not None else mining_summaries(store,learnings)
     proposals = store.query(
         "SELECT id, learning_id, run_id, target_path, target_kind, action, status, "
         # Include the stored diff for the V2 proposal inspector.
         "eval_result_id, applied_at, created_at, diff_unified "
-        "FROM proposals ORDER BY created_at, id"
+        "FROM proposals" + selected("learning_id") + " ORDER BY created_at, id", params
     )
     evals = {
         row["id"]: row
         for row in store.query(
             "SELECT id, kind, subject_id, attempted, succeeded, failed, "
-            "error_taxonomy_json, metrics_json, verdict, started FROM eval_results"
+            "error_taxonomy_json, metrics_json, verdict, started FROM eval_results" +
+            (f" WHERE subject_id IN ({slots}) OR id IN (SELECT eval_result_id FROM proposals WHERE learning_id IN ({slots}))" if learning_ids is not None else ''), params+params
         )
     }
+    from . import evidence_identity as identity
+    identities=identity.metadata_index(store)
     evidence = store.query(
         "SELECT il.learning_id AS learning_id, i.id AS incident_id, i.signal_type AS signal_type, "
-        "i.ts AS ts, i.project_key AS project_key, i.session_id AS session_id, "
+        "i.ts AS ts, i.project_key AS project_key, i.session_id AS session_id, i.session_file AS session_file, "
         "i.matched_text AS matched_text, i.window_json AS window_json, i.status AS status, "
-        "i.score AS score, s.project_display AS project_display, s.source AS session_source "
+        "i.score AS score "
         "FROM incident_learnings il "
         "JOIN incidents i ON i.id = il.incident_id "
-        "LEFT JOIN sessions s ON s.file_path = i.session_file "
-        "ORDER BY il.learning_id, i.ts"
+        + selected("il.learning_id") + " ORDER BY il.learning_id, i.ts, i.id", params
     )
     by_learning: dict[str, list[dict]] = {}
     for row in evidence:
+        row['identity']=identity.identity(identities,row)
         by_learning.setdefault(row["learning_id"], []).append(row)
 
     props_by_learning: dict[str, list[dict]] = {}
@@ -2135,19 +1808,16 @@ def rules(store, *, evidence_sample: int = 5) -> dict:
     for eid, row in evals.items():
         subject_evals.setdefault(row["subject_id"], []).append(eid)
 
-    families = rule_families(store)
+    families = rule_families(store) if learning_ids is None else None
     out = []
     for learning in learnings:
         lid = learning["id"]
         evidence_rows = by_learning.get(lid, [])
-        repos = sorted(
-            {
-                (r["project_display"] or r["project_key"] or "(unknown repo)")
-                for r in evidence_rows
-            }
-        )
-        agents = sorted({r["session_source"] for r in evidence_rows if r["session_source"]})
-        sessions_seen = sorted({r["session_id"] for r in evidence_rows if r["session_id"]})
+        projects=[identity.project_ref(identities,key) for key in sorted({r['project_key'] for r in evidence_rows}-{''})]
+        repos=[p['label'] for p in projects]
+        sessions=identity.session_summary(identities,evidence_rows)
+        agents=sorted({r['identity']['session']['provider'] for r in evidence_rows}-{''})
+        sessions_seen=[r['native_session_id'] for r in sessions['sessions'] if r['identity_kind']=='native_session']
         sample = [normalize_incident(r | {"id": r["incident_id"]}) for r in evidence_rows[:evidence_sample]]
         sample_cut = max(0, len(evidence_rows) - len(sample))
 
@@ -2212,7 +1882,8 @@ def rules(store, *, evidence_sample: int = 5) -> dict:
                 "confidence": learning["confidence"],
                 "evidence_count": learning["evidence_count"],
                 "evidence_linked": len(evidence_rows),
-                "project_count": learning["project_count"],
+                "project_count": len({r["project_key"] for r in evidence_rows if r["project_key"]}) if learning_ids is not None else learning["project_count"],
+                **({"recorded_project_count":learning["project_count"], "unknown_project_incidents":sum(not r["project_key"] for r in evidence_rows)} if learning_ids is not None else {}),
                 "projects": _json_arr(learning["projects_json"], f"learnings.{lid}.projects_json"),
                 "path_globs": _json_arr(
                     learning["path_globs_json"], f"learnings.{lid}.path_globs_json"
@@ -2230,7 +1901,12 @@ def rules(store, *, evidence_sample: int = 5) -> dict:
                 "unlinked_subject_evals": unlinked,
                 "miner_generation": mining[lid],
                 "provenance": {
-                    "repos": repos,
+                    "repos": repos, "projects":projects,
+                    **{k:v for k,v in sessions.items() if k!='sessions'},
+                    "sessions":sessions['sessions'][:evidence_sample],
+                    "session_records_total":len(sessions['sessions']),
+                    "session_records_cut":max(0,len(sessions['sessions'])-evidence_sample),
+                    "learning_source":identity.source_product(learning['source']),
                     "agent_product": learning["source"],
                     "agents_in_evidence": agents,
                     "session_ids": sessions_seen[:evidence_sample],
@@ -2249,9 +1925,9 @@ def rules(store, *, evidence_sample: int = 5) -> dict:
                     "violated_existing_rule": violated,
                     "flagged": bool(violated),
                     "label": (
-                        "Written but ignored — a rule already covered this"
+                        "The miner reported an existing rule. Agent receipt and violation are unverified."
                         if violated
-                        else "No prior rule violation was recorded"
+                        else "No violation report was retained. Prior rule receipt and violation are unknown."
                     ),
                 },
             }
@@ -2352,7 +2028,7 @@ def projects(
         "FROM incident_learnings il JOIN incidents i ON i.id = il.incident_id"
     )
     proposal_rows = store.query(
-        "SELECT id, target_path, target_kind, status FROM proposals"
+        "SELECT id, learning_id, target_path, target_kind, status FROM proposals"
     )
 
     repos: dict[str, dict] = {}
@@ -2400,6 +2076,7 @@ def projects(
                 path_owner.append((path.rstrip(os.sep), key))
     path_owner.sort(key=lambda pair: -len(pair[0]))
     received: dict[str, list[dict]] = {}
+    applied_lessons: dict[str, set[str]] = {}
     unattributed: list[dict] = []
     for prop in proposal_rows:
         target = prop["target_path"]
@@ -2416,6 +2093,8 @@ def projects(
         }
         if owner:
             received.setdefault(owner, []).append(entry)
+            if prop["status"] == "applied":
+                applied_lessons.setdefault(owner, set()).add(prop["learning_id"])
         else:
             unattributed.append(entry)
 
@@ -2489,6 +2168,7 @@ def projects(
                 "top_signal": top_signal,
                 "signals": signals,
                 "rules_written_here": len(rules_by_key.get(key, ())),
+                "rules_applied_here": len(applied_lessons.get(key, ())),
                 "rules_received": len(received.get(key, ())),
                 "rules_received_detail": received.get(key, []),
                 "context_weight": weight,
@@ -2500,10 +2180,7 @@ def projects(
                     "deliberately not routing.canonical_working_copy(), which answers "
                     "where automation WRITES, not what an agent carried"
                 ),
-                "benefit": not_computable(
-                    "project_stats has no writer for incident recurrence, so benefit "
-                    "is not computable from applied proposal counts alone"
-                ),
+                "benefit": project_measurements.project_benefit(store, project_key=key),
             }
         )
 
@@ -2581,7 +2258,7 @@ def _weigh(weigher, path: str, key: str, errors: list[dict]) -> dict:
 def incident_rate(store, *, now_utc, min_sessions=MIN_SESSIONS_FOR_MONTH,
                   project_key=None, compatibility_key=None, months=7,
                   end_month=None, delivery_cursor=None) -> dict:
-    """Version-2 monthly physical-line observations; no legacy session estimate."""
+    """Version-3 monthly physical-line observations; no legacy session estimate."""
     _utc_day(now_utc)
     from .trend_data import monthly_exposure
     return monthly_exposure(store, now_utc=now_utc, min_sessions=min_sessions,
@@ -2596,7 +2273,9 @@ def incident_rate(store, *, now_utc, min_sessions=MIN_SESSIONS_FOR_MONTH,
 
 def overview(store, cfg, *, now_utc, window_days: int | None = 14) -> dict:
     """Everything V1 renders, from one read-only Store."""
+    from .overview_data import snapshot
     return {
+        "audit": snapshot(store, cfg, now_utc=now_utc),
         "freshness": data_freshness(store, now_utc=now_utc),
         "status_line": status_line(store, cfg, now_utc=now_utc),
         "grid": run_stage_grid(store, now_utc=now_utc, window_days=window_days),

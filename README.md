@@ -13,9 +13,11 @@ No general improvement rate is claimed.
 *Overview — Figma v2 design with invented data. The pipeline, stage history, and
 review queue show how the pieces fit together.*
 
-The images below are **design previews** with invented examples. Their counts,
-trends, and trial outcomes are illustrative. See [preview scope](docs/RESEARCH_PREVIEW.md)
-for implemented behavior, and try the disposable demo for the current UI.
+The images below are **Figma design exports** with invented examples. Their counts,
+trends, and trial outcomes are illustrative. The dashboard now implements this v2
+design, so the disposable demo shows the same screens. Complete visual parity is
+not claimed, and the demo does not match these exports pixel for pixel. See
+[preview scope](docs/RESEARCH_PREVIEW.md) for implemented behavior.
 
 ## Try it without personal history
 
@@ -43,11 +45,19 @@ See [installation and package checks](docs/DISTRIBUTION.md).
 
 ## Supported workflow
 
-The latest preview adds a dedicated Project page, recorded instruction inventories,
-per-copy rule availability, monthly signal trends, and complete evaluation history.
-Evaluation details retain the frozen rule, scenarios, trial outcomes, and served
-models. These records support inspection without claiming real-world improvement.
-Existing installations need the [database upgrade](docs/UPGRADING.md).
+The latest preview rebuilds every screen on the v2 design and adds a full Review
+detail view, a command palette, grouped project navigation, and Run backlog and
+delivery context. It records observational recurrence measurements, human quality
+judgments, display-only rule families, retained instruction text, and native
+session and loading reports for both Claude Code and Codex. Instruction
+inventories now also cover legacy commands, managed files, embedded policy, and
+plugin instructions. Evaluation details retain the frozen rule, scenarios, trial
+outcomes, and served models.
+
+These records support inspection. A retained report does not establish that an
+agent loaded or followed a rule, and a recurrence measurement is an association,
+not a cause. No improvement rate is claimed. Existing installations need the
+[database upgrade](docs/UPGRADING.md).
 
 Inspect runs, rules and evidence; review the exact proposed revision; approve it;
 run the instruction worker explicitly; inspect its result; and request a
@@ -122,9 +132,9 @@ send redacted content to a provider. A bounded model request does not itself
 disable provider tools; prompts are not an enforced permission boundary.
 
 The selected workflow is verified with invented histories and stubbed provider
-responses. That scope does not establish real-provider effectiveness. Full
-diagnosis, session receipt, benefit metrics, quality assessments, policy controls,
-and full Figma parity remain [backlog](docs/RESEARCH_PREVIEW.md).
+responses. That scope does not establish real-provider effectiveness. Per-session
+instruction receipt and continuity, validated benefit statistics, and complete
+Figma parity remain [backlog](docs/RESEARCH_PREVIEW.md).
 
 ## Develop and inspect
 

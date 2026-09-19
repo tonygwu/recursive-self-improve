@@ -225,3 +225,23 @@ def test_a_session_with_no_path_is_treated_as_orphaned(tmp_path):
     )
     exported = json.loads((tmp_path / "backup/preserved.json").read_text())
     assert any(i["id"] == nopath_inc for i in exported["incidents"])
+
+
+def test_queue_archive_is_exported_without_pinning_rebuildable_incidents(env):
+    from self_improve import queue_history as q
+    from tests.test_queue_history import SETTINGS
+    store,tmp_path,gone,gone_inc,_=env
+    live=store.query_one('SELECT * FROM incidents WHERE id!=?',(gone_inc,))
+    q.set_processed_status(store,live['id'],'dismissed',outcome='negative')
+    store.insert('runs',{'id':'queue-run','started':utc_now_iso()})
+    snapshot=q.capture(store,'queue-run',phase='finish',settings=SETTINGS);store.commit()
+    before={t:store.query('SELECT * FROM '+t) for t in q.TABLES}
+    stats=rebuild_state(store,export_path=tmp_path/'queue-backup')
+    exported=json.loads((tmp_path/'queue-backup'/'preserved.json').read_text())['queue_history']
+    assert exported==before and stats['deleted']['incidents']==1
+    assert store.query_one('SELECT * FROM incidents WHERE id=?',(live['id'],)) is None
+    assert store.query_one('SELECT * FROM queue_snapshots')==snapshot
+    removals=store.query("SELECT * FROM queue_events WHERE operation='delete'")
+    assert len(removals)==1 and removals[0]['old_status']=='dismissed' and removals[0]['queue_delta']==0
+    assert store.query('SELECT * FROM queue_processing')==before['queue_processing']
+    assert q.read_run(store,'queue-run')['queue_count']==1

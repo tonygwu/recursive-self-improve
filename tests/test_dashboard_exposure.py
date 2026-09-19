@@ -168,6 +168,8 @@ def test_exposure_renderer_keeps_missing_zero_and_version_states_distinct(tmp_pa
     js = Path(app.__file__).parent / 'static' / 'app.js'
     module = tmp_path / 'app.mjs'
     module.write_bytes(js.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     runner = tmp_path / 'check.mjs'
     runner.write_text('''import assert from 'node:assert/strict';
 import {renderProjectExposure, renderExposureRate, parseRoute} from './app.mjs';

@@ -88,6 +88,8 @@ class PhysicalLine:
     headless: bool | None = None
     is_subagent: bool | None = None
     denylisted: bool = False
+    # Native, content-free creation/turn metadata; never a model-loading receipt.
+    session_context: dict | None = None
 
 
 class SessionSource(Protocol):

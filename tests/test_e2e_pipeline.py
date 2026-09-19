@@ -1532,16 +1532,25 @@ def test_regating_records_new_eval_history_without_undoing_a_decision(corpus, mo
 def test_an_eval_finishing_after_review_or_edit_does_not_overwrite_it(corpus, monkeypatch, change):
     from self_improve import pipeline
     from self_improve.commands import review_snapshot, submit_command
+    from self_improve.review import preview_selection
+    from self_improve.propose import make_unified_diff
 
     _capture_gate_wiring(monkeypatch)
     pid, _ = _existing_proposal(corpus.store)
+    target = corpus.root / 'reviewed-during-eval.md'
+    target.write_text('invented existing rule\n')
+    corpus.store.update('proposals', 'id', pid, {'target_path': str(target),
+        'diff_unified': make_unified_diff('invented existing rule\n', 'invented existing rule\nnew rule\n', str(target))})
+    corpus.store.commit()
     original = pipeline.gate_one_proposal
     captured = {}
     def interleaved(store, cfg, *args, **kwargs):
         if change == "approve":
             reviewed = review_snapshot(store, pid, cfg)
+            shown = preview_selection(store, cfg, [pid])
             captured["command"] = submit_command(store, cfg, {
                 "request_key": "decision-during-eval", "action": "approve",
+                "preview_revision": shown['revision'],
                 "members": [{"proposal_id": pid, "revision": reviewed["revision"]}],
             })
         else:
@@ -1555,3 +1564,50 @@ def test_an_eval_finishing_after_review_or_edit_does_not_overwrite_it(corpus, mo
     assert corpus.store.query_one("SELECT * FROM proposals WHERE id=?", (pid,)) == captured["proposal"]
     assert stats["gate_proposal"]["status_update"] == ("preserved_decision" if change == "approve" else "preserved_changed_revision")
     assert len(corpus.store.query("SELECT * FROM proposal_eval_history WHERE proposal_id=?", (pid,))) == 1
+
+
+def test_queue_snapshots_bind_effective_arguments_even_on_scan_failure(corpus,monkeypatch):
+    from self_improve import queue_history
+    def fail(*args,**kwargs):raise RuntimeError('invented scanner failure')
+    monkeypatch.setattr('self_improve.scan.scan_all',fail)
+    with pytest.raises(RuntimeError,match='invented scanner'):
+        run_pipeline(corpus.cfg,corpus.store,dry_run=True,max_cheap_calls=3,max_strong_calls=2,project_filter='invented-filter')
+    snapshots=corpus.store.query('SELECT * FROM queue_snapshots ORDER BY phase')
+    assert {s['phase'] for s in snapshots}=={'start','finish'}
+    assert len({s['settings_json'] for s in snapshots})==1
+    settings=json.loads(snapshots[0]['settings_json'])
+    assert settings['cheap_call_cap']==3 and settings['strong_call_cap']==2
+    assert settings['gate_call_cap']==corpus.cfg.max_gate_calls_per_run
+    assert settings['project_filter']=='invented-filter' and settings['dry_run']
+    assert queue_history.read_run(corpus.store,snapshots[0]['run_id'])['snapshot']['phase']=='finish'
+
+
+def test_report_failure_keeps_first_terminal_queue_snapshot(corpus,monkeypatch):
+    from self_improve import queue_history
+    observed=[]
+    def fail(store,cfg,run_id,path):
+        snapshot=store.query_one("SELECT * FROM queue_snapshots WHERE run_id=? AND phase='finish'",(run_id,))
+        assert snapshot;observed.append(snapshot)
+        session=store.query_one('SELECT file_path FROM sessions LIMIT 1')
+        store.insert_incident({'id':'arrived-after-terminal','session_file':session['file_path'],'signal_type':'correction'})
+        store.commit()
+        raise RuntimeError('invented report failure')
+    monkeypatch.setattr('self_improve.report.generate',fail)
+    with pytest.raises(RuntimeError,match='invented report'):
+        run_pipeline(corpus.cfg,corpus.store,dry_run=True)
+    assert len(observed)==1
+    snap=observed[0];got=queue_history.read_run(corpus.store,snap['run_id'])
+    assert got['snapshot']['id']==snap['id'] and got['queue_count']==snap['queue_count']
+    assert corpus.store.query_one('SELECT status FROM runs WHERE id=?',(snap['run_id'],))['status']=='error'
+    assert corpus.store.query_one("SELECT COUNT(*) n FROM incidents WHERE status='new'")['n']==snap['queue_count']+1
+
+
+def test_queue_capture_failure_does_not_publish_a_phantom_running_run(corpus):
+    from self_improve.queue_history import QueueHistoryError
+    corpus.store.conn.execute('DROP TRIGGER queue_snapshots_no_update')
+    with pytest.raises(QueueHistoryError,match='trigger'):
+        run_pipeline(corpus.cfg,corpus.store,dry_run=True)
+    assert not corpus.store.conn.in_transaction
+    assert corpus.store.query('SELECT * FROM runs')==[]
+    corpus.store.commit()
+    assert corpus.store.query('SELECT * FROM queue_snapshots')==[]

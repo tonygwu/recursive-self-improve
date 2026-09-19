@@ -254,7 +254,7 @@ def build_corpus(tmp_path: Path) -> Corpus:
         codex_sessions_dir=str(tmp_path / "codex" / "sessions"),
         codex_archived_dir=str(codex_archived),
         state_dir=str(tmp_path / "state"),
-        global_claude_md=str(tmp_path / "global" / "CLAUDE.md"),
+        claude_managed_dir=str(tmp_path/'managed'), global_claude_md=str(tmp_path / "global" / "CLAUDE.md"),
         codex_global_agents_md=str(tmp_path / "codex" / "AGENTS.md"),
         skills_dir=str(tmp_path / "skills"),
         # pytest's tmp_path lives under /var/folders, which the production

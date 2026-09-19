@@ -30,6 +30,7 @@ with sync_playwright() as p:
         page.get_by_role('button',name='Newest records',exact=True).click()
         page.get_by_text('20 shown · 23 recorded attempts',exact=True).wait_for()
         # Existing trend filters and history selection retain independent state.
+        page.locator('#trend-options-toggle').focus();page.keyboard.press('Enter')
         page.get_by_label('Last month (UTC)').fill('2025-09');page.get_by_role('button',name='Show seven months').click()
         page.wait_for_url('**/*end_month=2025-09*');page.wait_for_load_state('networkidle')
         page.get_by_text('20 shown · 23 recorded attempts',exact=True).wait_for()
@@ -59,7 +60,7 @@ with sync_playwright() as p:
                 page.locator('#main').evaluate('(e)=>e.scrollTop=0')
                 assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                 assert detail.evaluate('(e)=>e.scrollWidth<=e.clientWidth+1')
-                assert page.locator('.eval-notice').evaluate('(e)=>getComputedStyle(e).backgroundColor')!='rgba(0, 0, 0, 0)'
+                assert detail.locator('.eval-notice').evaluate('(e)=>getComputedStyle(e).backgroundColor')!='rgba(0, 0, 0, 0)'
                 page.screenshot(path=str(out/f'eval-detail-{theme}-{width}.png'))
         page.reload();page.wait_for_load_state('networkidle');title.wait_for()
         assert info['attempt'] in page.url and 'end_month=2025-09' in page.url

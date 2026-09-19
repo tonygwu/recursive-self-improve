@@ -468,7 +468,7 @@ def test_rebuild_backup_verifier_enforces_its_format(tmp_path, capsys, change):
     assert expected in capsys.readouterr().err
 
 
-def test_rebuild_rolls_back_when_the_transaction_commit_fails(rebuild_store, tmp_path):
+def test_rebuild_refuses_unknown_retention_and_store_rolls_back_commit_failure(rebuild_store, tmp_path):
     import sqlite3
     from self_improve.rebuild import rebuild_state
     store = rebuild_store
@@ -479,8 +479,16 @@ def test_rebuild_rolls_back_when_the_transaction_commit_fails(rebuild_store, tmp
     store.commit()
     before = list(store.conn.iterdump())
     try:
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with pytest.raises(ValueError, match="retained_reference"):
             rebuild_state(store, export_path=tmp_path / "retained-backup")
+        assert not (tmp_path / "retained-backup").exists()
+        assert list(store.conn.iterdump()) == before
+        # The earlier preflight now protects rebuild. Exercise the Store's
+        # deferred commit failure independently so its rollback remains proved.
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            with store.transaction(write=True):
+                store.conn.execute("DELETE FROM incidents WHERE session_file=?", (source["file_path"],))
+                store.conn.execute("DELETE FROM sessions WHERE file_path=?", (source["file_path"],))
         assert list(store.conn.iterdump()) == before
         assert not store.conn.in_transaction
     finally:

@@ -20,7 +20,7 @@ caps and report omissions. Project context weight covers the selected top-N
 repositories; a repo-wide Markdown walk requires an explicit request.
 
 Serialize through JSONResponse so unexpected objects fail instead of being
-coerced. The browser filters the already-loaded rule rows; there is no server
+coerced. Rules and complete retained evidence use bounded read APIs; there is no server
 embedding-search endpoint.
 """
 
@@ -117,10 +117,14 @@ def _sidecar_report(db_path: Path) -> str:
     lines = []
     for suffix in ("-wal", "-shm"):
         side = db_path.with_name(db_path.name + suffix)
-        if side.exists():
-            lines.append(f"    {side}: present ({side.stat().st_size} bytes)")
-        else:
+        try:
+            size = side.stat().st_size
+        except FileNotFoundError:
             lines.append(f"    {side}: absent")
+        except OSError as exc:
+            lines.append(f"    {side}: unavailable ({type(exc).__name__})")
+        else:
+            lines.append(f"    {side}: present ({size} bytes)")
     return "\n".join(lines)
 
 
@@ -134,9 +138,11 @@ def open_read_only_store(db_path) -> Store:
     if not path.exists():
         raise DashboardStartupError(
             f"No state database at {path}.\n"
-            "  The dashboard only reads; it never creates or migrates the schema.\n"
-            "  Fix: run the miner once to create it, e.g.\n"
-            "      uv run selfimprove run --dry-run"
+            "  Dashboard startup never creates or migrates the schema.\n"
+            "  Preview explicit initialization of this selected database:\n"
+            f"      {_upgrade_preview(path, initialize=True)}\n"
+            "  Check the selected database in the preview, then rerun without --dry-run.\n"
+            "  Initialization never overwrites existing state or starts the miner."
         )
     try:
         store = Store(path, read_only=True)
@@ -153,33 +159,43 @@ def open_read_only_store(db_path) -> Store:
         if "no such table" in str(exc):
             raise DashboardStartupError(
                 f"The state database at {path} has no schema_migrations table, so it "
-                "has never been migrated.\n"
-                "  The dashboard never migrates a database: that is a write, and a "
-                "read-only view has no business deciding when the schema moves.\n"
-                "  Fix: run the miner once, e.g.\n"
-                "      uv run selfimprove run --dry-run"
+                "has no migration history that can be verified.\n"
+                "  The dashboard never migrates a database. Inspect this selected state:\n"
+                f"      {_upgrade_preview(path)}\n"
+                "  If the plan accepts it, stop services using this database and apply "
+                "the upgrade with --backup to a new private directory.\n"
+                "  Tables with no migration history need diagnosis or a verified restore; "
+                "do not initialize over existing state."
             ) from exc
         raise DashboardStartupError(_open_failure_message(path, exc)) from exc
     store.migrations_applied = int((row or {}).get("n") or 0)
     return store
 
 
+def _upgrade_preview(path: Path, *, initialize=False) -> str:
+    import shlex
+    command = ['uv', 'run', 'selfimprove', 'upgrade-state', '--database', str(path.absolute())]
+    if initialize:
+        command.append('--initialize')
+    return shlex.join([*command, '--dry-run'])
+
+
 def _open_failure_message(path: Path, exc: Exception) -> str:
+    try:
+        size = f'{path.stat().st_size} bytes'
+    except OSError as metadata_error:
+        size = f'size unavailable: {type(metadata_error).__name__}'
     return (
         f"Cannot open the state database read-only: {type(exc).__name__}: {exc}\n"
-        f"    path: {path} ({path.stat().st_size} bytes)\n"
+        f"    path: {path} ({size})\n"
         f"{_sidecar_report(path)}\n"
-        "  The database runs in WAL mode, and a mode=ro open still needs the -shm "
-        "shared-memory file. SQLite creates that file in the database's own "
-        "directory, so the user running this server must own the database and be "
-        "able to write that directory.\n"
-        "  Fixes, in order of preference:\n"
-        f"    1. run the dashboard as the user who owns {path};\n"
-        f"    2. make {path.parent} writable by this user;\n"
-        f"    3. take the database out of WAL as its owner:\n"
-        f"       sqlite3 {path} 'PRAGMA journal_mode=DELETE;'\n"
-        "  This process will NOT retry with a writable handle. Constructing a "
-        "writable Store migrates the live database (docs/RUNBOOK.md)."
+        "  Check file access as the database owner. A WAL database may need its -shm "
+        "shared-memory file and write access to the containing directory even for "
+        "a read-only connection.\n"
+        "  For an isolated copy, use a consistent SQLite backup in a new private "
+        "writable directory. Copying only the main file can omit committed WAL data; "
+        "do not delete the -wal or -shm sidecars to make startup succeed.\n"
+        "  This process will NOT retry with a writable handle or change journal mode."
     )
 
 
@@ -232,9 +248,12 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
         # short-lived writer over the same resolved database, without migration.
         store = open_read_only_store(resolved_db)
         app.state.store = store
+        app.state.evidence_search_cache = evidence_data.EvidenceSearchCache(store)
         try:
             yield
         finally:
+            app.state.evidence_search_cache.clear()
+            app.state.evidence_search_cache = None
             app.state.store = None
             store.close()
 
@@ -244,7 +263,7 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
             "Local views and durable review decisions. The dashboard records "
             "intent; a separate worker delivers instruction edits."
         ),
-        version="0.1.1",
+        version="0.1.2",
         lifespan=lifespan,
     )
     app.state.cfg = cfg
@@ -322,6 +341,28 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
 
     from .. import eval_history
     from . import eval_data
+    from .. import quality
+    from . import quality_data
+
+    @app.get('/api/class-evidence', summary='Separate delivery, availability, human quality, gate and class consent evidence')
+    async def api_class_evidence():
+        with store().transaction():
+            return _json(quality_data.classes(store(),cfg))
+
+    @app.get('/api/quality-preview', summary='Deterministic applied-revision sample preview without recording it')
+    async def api_quality_preview(target_class: str, size: int = 20, seed: str = 'quality-1'):
+        with store().transaction():
+            return _json(quality.preview(store(),cfg,target_class=target_class,size=size,seed=seed))
+
+    @app.get('/api/quality-samples', summary='Retained human assessment samples')
+    async def api_quality_samples(target_class: str | None = None, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(quality.samples(store(),target_class=target_class,limit=limit,cursor=cursor))
+
+    @app.get('/api/quality-samples/{sample_id}', summary='Complete frozen sample and revision history of human judgments')
+    async def api_quality_sample(sample_id: str):
+        with store().transaction():
+            return _json(quality.sample(store(),sample_id))
 
     @app.exception_handler(eval_history.EvalHistoryError)
     async def _eval_history_error(request, exc):
@@ -403,9 +444,10 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
 
     @app.get("/api/overview", summary="V1 Overview: freshness, grid, backlog, failures")
     async def api_overview(window_days: int | None = DEFAULT_WINDOW_DAYS):
-        return _json(
-            queries.overview(store(), cfg, now_utc=now(), window_days=window_days)
-        )
+        with store().transaction():
+            return _json(
+                queries.overview(store(), cfg, now_utc=now(), window_days=window_days)
+            )
 
     from . import run_data
 
@@ -428,6 +470,104 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
     async def api_run_records(run_id: str, kind: str, limit: int = 50, cursor: str | None = None):
         with store().transaction():
             return _json(run_data.records(store(),run_id,kind=kind,limit=limit,cursor=cursor))
+
+    @app.get('/api/runs/{run_id}/related-deliveries', summary='Earlier reviewed targets linked by retained learning identity')
+    async def api_run_related_deliveries(run_id: str, limit: int = 20, cursor: str | None = None):
+        from . import run_context
+        with store().transaction():
+            return _json(run_context.related_deliveries(store(),run_id,limit=limit,cursor=cursor))
+
+    @app.get('/api/runs/{run_id}/backlog', summary='Historical global queue snapshot and comparable observed rates')
+    async def api_run_backlog(run_id: str):
+        from .. import queue_history
+        try:
+            with store().transaction():
+                return _json(queue_history.read_run(store(), run_id))
+        except KeyError as exc:
+            raise run_data.RunNotFound('Run not found: '+run_id) from exc
+        except (queue_history.QueueHistoryError, sqlite3.DatabaseError) as exc:
+            raise run_data.RunDataError(str(exc)) from exc
+
+    from . import run_artifacts
+
+    @app.exception_handler(run_artifacts.ArtifactError)
+    async def _artifact_error(request, exc):
+        return JSONResponse(status_code=exc.status,content={'error':exc.code,'detail':str(exc)})
+
+    @app.get('/api/runs/{run_id}/artifacts', summary='Local retained files linked to this exact run')
+    async def api_run_artifacts(run_id: str, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(run_artifacts.catalog(store(),run_id,limit=limit,cursor=cursor))
+
+    @app.get('/api/runs/{run_id}/artifacts/{key}', summary='Bounded text inspection of one retained artifact')
+    async def api_run_artifact(run_id: str, key: str):
+        with store().transaction():
+            return _json(run_artifacts.read(store(),run_id,key))
+
+    @app.get('/api/runs/{run_id}/artifacts/{key}/download', summary='Exact bytes of the inspected artifact version')
+    async def api_run_artifact_download(run_id: str, key: str, version: str):
+        from starlette.responses import StreamingResponse
+        with store().transaction():
+            chunks,size,close=run_artifacts.download(store(),run_id,key,version)
+        class ArtifactResponse(StreamingResponse):
+            async def __call__(self, scope, receive, send):
+                try:
+                    await super().__call__(scope,receive,send)
+                finally:
+                    close()
+        return ArtifactResponse(chunks,media_type='text/plain',headers={
+            'Content-Length':str(size),'Content-Disposition':'attachment; filename="'+('report.md' if key=='report' else key)+'"',
+            'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'})
+
+    from . import evidence_data
+
+    @app.exception_handler(evidence_data.EvidenceError)
+    async def _evidence_error(request, exc):
+        return JSONResponse(status_code=exc.status, content={'error':exc.code,'detail':str(exc)})
+
+    @app.get('/api/evidence', summary='Search all complete retained evidence sources')
+    async def api_evidence(query: str = '', kinds: str = '', project_key: str | None = None, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(evidence_data.search(store(),cfg,query=query,kinds=kinds.split(',') if kinds else (),project_key=project_key,limit=limit,cursor=cursor,cache=app.state.evidence_search_cache))
+
+    @app.get('/api/evidence/{kind}/{source_id}', summary='Complete selected source, provenance and recovery diagnosis')
+    async def api_evidence_detail(kind: str, source_id: str):
+        with store().transaction():
+            return _json(evidence_data.detail(store(),cfg,kind=kind,source_id=source_id))
+
+    @app.get('/api/learnings/{learning_id}/evidence', summary='Every explicitly linked incident in stable pages')
+    async def api_learning_evidence(learning_id: str, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(evidence_data.learning_evidence(store(),learning_id=learning_id,limit=limit,cursor=cursor))
+
+    from . import rule_data
+
+    @app.exception_handler(rule_data.RuleBrowserError)
+    async def _rule_browser_error(request, exc):
+        return JSONResponse(status_code=exc.status, content={'error':exc.code,'detail':str(exc)})
+
+    @app.exception_handler(rule_data.mining_history.HistoryError)
+    async def rule_mining_history_error(request, exc):
+        return responses.JSONResponse(status_code=500,content={"error":"MiningHistoryError","detail":str(exc)})
+
+    @app.exception_handler(rule_data.rule_families.FamilyError)
+    async def _family_data_error(request, exc):
+        return JSONResponse(status_code=500, content={'error':'FamilyDataError','detail':str(exc)})
+
+    @app.get('/api/rules/browse', summary='Filtered display families or individual rule summaries')
+    async def api_rule_browser(query: str = '', target: str = 'all', sort: str = 'evidence', grouping: bool = True, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(rule_data.browse(store(),cfg,query=query,target=target,sort=sort,grouping=grouping,limit=limit,cursor=cursor))
+
+    @app.get('/api/rule-families/{family_id}/members', summary='Every matching member of a display family in bounded pages')
+    async def api_rule_family_members(family_id: str, query: str = '', target: str = 'all', sort: str = 'evidence', grouping: bool = True, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(rule_data.members(store(),cfg,family_id,query=query,target=target,sort=sort,grouping=grouping,limit=limit,cursor=cursor))
+
+    @app.get('/api/rules/{learning_id}', summary='Complete selected rule inspector; other rule payloads are not loaded')
+    async def api_rule_detail(learning_id: str):
+        with store().transaction():
+            return _json(rule_data.detail(store(),learning_id))
 
     @app.get("/api/rules", summary="V2 Rules: every learning with provenance and verdict")
     async def api_rules(evidence_sample: int = 5):
@@ -456,8 +596,9 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
     @app.get('/api/review-preview', summary='Complete selected members and consolidated edits, without recording a decision')
     async def api_review_preview(proposal_ids: str):
         from ..review import preview_selection
+        from .review_evidence import enrich
         with store().transaction():
-            return _json(preview_selection(store(), cfg, proposal_ids.split(',')))
+            return _json(enrich(store(), preview_selection(store(), cfg, proposal_ids.split(','))))
 
     @app.post("/api/commands", summary="Record a typed command over exact reviewed proposal revisions")
     async def api_command(body: dict):
@@ -764,9 +905,15 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
                             content={'error': 'InventoryError', 'detail': str(exc)})
 
     @app.get('/api/project-inventory', summary='Recorded instruction files, ownership and loading paths per copy')
-    async def api_project_inventory(project_key: str, limit: int = 20, cursor: str | None = None):
+    async def api_project_inventory(project_key: str, limit: int = 20, cursor: str | None = None, working_copy_id: str | None = None):
         with store().transaction():
-            return _json(instruction_inventory.project_inventory(store(), project_key=project_key, limit=limit, cursor=cursor))
+            return _json(instruction_inventory.project_inventory(store(), project_key=project_key, limit=limit, cursor=cursor, working_copy_id=working_copy_id))
+
+    @app.get('/api/project-context-history', summary='Retained context measurements and changes for one working copy')
+    async def api_project_context_history(project_key: str, working_copy_id: str, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(instruction_inventory.context_history(store(), project_key=project_key,
+                working_copy_id=working_copy_id, limit=limit, cursor=cursor))
 
     from . import project_data
 
@@ -779,6 +926,61 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
     async def api_project_detail(project_key: str):
         with store().transaction():
             return _json(project_data.detail(store(), project_key=project_key))
+
+    @app.get('/api/project-summary', summary='Retained rule and exact-copy observation summaries')
+    async def api_project_summary(project_key: str, working_copy_id: str | None = None, limit: int = 3):
+        from . import project_summary
+        with store().transaction():
+            return _json(project_summary.summary(store(), cfg, project_key=project_key,
+                working_copy_id=working_copy_id, limit=limit))
+
+    from .. import project_measurements
+
+    @app.exception_handler(project_measurements.MeasurementError)
+    async def _measurement_error(request, exc):
+        return JSONResponse(status_code=400 if isinstance(exc, project_measurements.MeasurementRequestError) else 409,
+                            content={'error':type(exc).__name__, 'detail':str(exc)})
+
+    @app.get('/api/project-measurements', summary='Retained observational recurrence measurements')
+    async def api_project_measurements(project_key: str | None = None, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(project_measurements.measurement_history(store(), project_key=project_key, limit=limit, cursor=cursor))
+
+    @app.get('/api/project-measurements/{measurement_id}', summary='Complete retained recurrence evidence')
+    async def api_project_measurement(measurement_id: str):
+        with store().transaction():
+            return _json(project_measurements.measurement_detail(store(), measurement_id))
+
+    from .. import native_loads
+
+    @app.exception_handler(native_loads.NativeLoadError)
+    async def _native_load_error(request, exc):
+        return JSONResponse(status_code=400 if isinstance(exc, native_loads.NativeLoadRequestError) else 409,
+                            content={'error':type(exc).__name__, 'detail':str(exc)})
+
+    @app.get('/api/project-native-events', summary='Retained native instruction loading and lifecycle reports')
+    async def api_project_native_events(project_key: str, logical_session_key: str | None = None,
+                                         working_copy_id: str | None = None, limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(native_loads.native_history(store(), project_key=project_key,
+                logical_session_key=logical_session_key, working_copy_id=working_copy_id,
+                limit=limit, cursor=cursor))
+
+    from .. import session_context
+
+    @app.exception_handler(session_context.SessionContextError)
+    async def _session_context_error(request, exc):
+        return JSONResponse(status_code=400 if isinstance(exc, session_context.SessionContextRequestError) else 409,
+                            content={'error':type(exc).__name__, 'detail':str(exc)})
+
+    @app.get('/api/project-sessions', summary='Native session evidence and observed availability candidates')
+    async def api_project_sessions(project_key: str, compatibility_key: str | None = None,
+                                    rule_revision_id: str | None = None, working_copy_id: str | None = None,
+                                    limit: int = 20, cursor: str | None = None):
+        with store().transaction():
+            return _json(session_context.project_sessions(store(), project_key=project_key,
+                compatibility_key=compatibility_key, rule_revision_id=rule_revision_id,
+                working_copy_id=working_copy_id, limit=limit, cursor=cursor))
 
     @app.get('/api/project-records', summary='Complete paginated project contributions, evidence, proposals or deliveries')
     async def api_project_records(project_key: str, kind: str, learning_id: str | None = None,

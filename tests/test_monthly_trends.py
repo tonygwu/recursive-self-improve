@@ -35,11 +35,13 @@ def test_months_use_uncapped_occurrences_and_actual_line_timestamps(tmp_path):
     env.store.conn.execute('DELETE FROM incidents')
     env.store.commit()
     result = queries.incident_rate(env.store, now_utc=NOW, project_key=PROJECT)
-    assert result['contract_version'] == 2
+    assert result['contract_version'] == 3
     points = {p['month']: p for p in result['series']}
     aug, sep = points['2026-08'], points['2026-09']
-    assert (aug['eligible_lines'], aug['occurrences'], aug['rate_per_100k']) == (3, 0, 0)
-    assert (sep['eligible_lines'], sep['occurrences'], sep['rate_per_100k']) == (1, 1, 100000)
+    assert (aug['eligible_lines'], aug['occurrences'], aug['observed_rate_per_100k']) == (3, 0, 0)
+    assert (sep['eligible_lines'], sep['occurrences'], sep['observed_rate_per_100k']) == (1, 1, 100000)
+    assert aug['rate_per_100k'] is sep['rate_per_100k'] is None
+    assert result['reason'] == 'insufficient_sessions'
     assert aug['sessions'] == sep['sessions'] == 1
     assert aug['session_size']['median'] == 3 and sep['session_size']['median'] == 1
     assert not aug['partial'] and sep['partial']
@@ -70,7 +72,9 @@ def test_versions_are_separate_and_unknown_versions_have_no_rate(tmp_path):
         selected = queries.incident_rate(env.store, now_utc=NOW, compatibility_key=group['compatibility_key'])
         sep = selected['series'][-1]
         assert (sep['eligible_lines'], sep['occurrences']) == (1, 1)
-        assert sep['rate_per_100k'] == (100000 if group['identifiable'] else None)
+        assert sep['rate_per_100k'] is None
+        assert sep['observed_rate_per_100k'] == (100000 if group['identifiable'] else None)
+        assert sep['reason'] == ('insufficient_sessions' if group['identifiable'] else 'unknown_version')
         assert group['months'][-1]['month'] == '2026-09'
         assert group['manifests'][0]['config']['values']['correction_max_len'] in {1500, env.cfg.correction_max_len}
     env.store.close()
@@ -158,7 +162,8 @@ def test_skipped_physical_lines_remain_visible(tmp_path):
                       x_tokens('2026-09-01T00:00:01Z')])
     scan(env, 'tokens')
     point = queries.incident_rate(env.store, now_utc=NOW)['series'][-1]
-    assert point['eligible_lines'] == 2 and point['rate_per_100k'] == 0
+    assert point['eligible_lines'] == 2 and point['observed_rate_per_100k'] == 0
+    assert point['rate_per_100k'] is None
     assert point['workload']['by_source'] == {'codex': 2}
     env.store.close()
 

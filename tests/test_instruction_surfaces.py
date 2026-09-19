@@ -24,7 +24,7 @@ def test_untracked_global_skills_rules_and_override_only_are_collected(cfg, stor
     availability.collect_availability(store, cfg, observed_at='2030-01-01T00:00:00Z')
     record = inventory.project_inventory(store, project_key=key)['records'][0]
     assert {f['real_path'] for f in record['files']} == {str(p) for p in (claude, codex, rule, override)}
-    assert record['profile'] == 'instruction-surfaces/2'
+    assert record['profile'] == 'instruction-surfaces/6'
     assert all(p['origin'] == 'global' for f in record['files'] for p in f['loading_paths'])
     assert next(f for f in record['files'] if f['path'] == str(rule))['loading_paths'][0]['scope']['kind'] == 'path_scoped'
     assert record['totals']['ownership']['machine']['bytes'] == 0
@@ -159,11 +159,11 @@ def test_discovery_limit_is_named_and_old_profiles_remain_readable(cfg, store, t
 def test_claude_skill_name_collision_does_not_invent_active_body(cfg, tmp_path):
     repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
     text = '---\nname: same-name\n---\nInvented body.\n'
-    write(Path(cfg.skills_dir)/'global/SKILL.md', text)
-    write(repo/'.claude/skills/local/SKILL.md', text)
+    write(Path(cfg.skills_dir)/'same-command/SKILL.md', text)
+    write(repo/'.claude/skills/same-command/SKILL.md', text)
     result = inspect_surfaces(cfg, repo)
     assert len(result['files']) == 2
-    assert all(p['eligible_prefix_bytes'] == 0 and p['eligibility_reason'] == 'skill_name_precedence_unresolved'
+    assert all(p['eligible_prefix_bytes'] == 0 and p['eligibility_reason'] == 'command_name_precedence_unresolved'
                for file in result['files'] for p in file['loading_paths'])
 
 

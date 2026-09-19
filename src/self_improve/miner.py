@@ -348,12 +348,11 @@ def mine_incident(
     (our own DB invariant, so this is a hard failure, not a counted one).
     """
     incident_id = incident_row["id"]
+    from .incident_evidence import parse_window, IncidentEvidenceError
     try:
-        window = json.loads(incident_row["window_json"])
-    except (ValueError, TypeError) as exc:
-        raise MinerError(
-            f"incident {incident_id}: window_json is not strict JSON: {exc}"
-        ) from exc
+        window = parse_window(incident_row['window_json'], owner=f'incident {incident_id}')
+    except IncidentEvidenceError as exc:
+        raise MinerError(str(exc)) from exc
     prompt, template_sha = render_prompt_revision(
         Path(prompts_dir) / "mine_incident.md",
         {
@@ -447,7 +446,8 @@ def _persist_mine_body(
             f"incident {incident_id}: {'; '.join(errors)}"
         )
     if payload["is_real_learning"] is False:
-        store.update("incidents", "id", incident_id, {"status": "dismissed"})
+        from .queue_history import set_processed_status
+        set_processed_status(store, incident_id, "dismissed", outcome="negative", provenance=provenance)
         if commit:
             store.commit()
         return None
@@ -513,7 +513,8 @@ def _persist_mine_body(
     }
     store.insert("learnings", learning)
     store.link_incident_learning(incident_id, learning["id"])
-    store.update("incidents", "id", incident_id, {"status": "mined"})
+    from .queue_history import set_processed_status
+    set_processed_status(store, incident_id, "mined", outcome="new", provenance=provenance)
     from .mining_history import append
     append(store,learning,before=None,kind='new',incidents=[incident_row],provenance=provenance)
     if commit:
@@ -559,7 +560,8 @@ def _persist_dedup_decision(
     if lesson_rejected(store, target['id']):
         # The user already said no to this lesson; new evidence is recorded
         # for audit but must not resurrect it or grow its counters.
-        store.update("incidents", "id", incident_id, {"status": "dismissed"})
+        from .queue_history import set_processed_status
+        set_processed_status(store, incident_id, "dismissed", outcome="duplicate_of_rejected", provenance=provenance)
         from .mining_history import append
         append(store,target,before=target,kind='duplicate_of_rejected',incidents=[incident_row],provenance=provenance)
         if commit:
@@ -642,7 +644,9 @@ def _persist_dedup_decision(
             )
 
     store.update("learnings", "id", target["id"], updates)
-    store.update("incidents", "id", incident_id, {"status": "mined"})
+    from .queue_history import set_processed_status
+    set_processed_status(store, incident_id, "mined", outcome="amend_applied" if amend_of_applied else decision,
+                         provenance=provenance)
     refreshed = store.query_one("SELECT * FROM learnings WHERE id = ?", (target["id"],))
     from .mining_history import append
     append(store,refreshed,before=target,kind='amend_applied' if amend_of_applied else decision,
@@ -779,9 +783,8 @@ def _build_fallback_sandbox(
     Used only when the full transcript aged out (:class:`TranscriptAgedOut`).
     transcript.md is marked with :data:`AGED_OUT_NOTE` so the agent knows it
     is seeing the redacted incident window only, not the full session.
-    Window entries were written by archive_trajectory.py as ``{role, ts, text}``
-    (already redacted; render re-redacts, which is an idempotent no-op) — any
-    other shape is a broken DB invariant and raises.
+    Turn and occurrence entries share archive validation. Rendering re-redacts
+    retained text and preserves occurrence count, time and source locations.
     """
     events, start_line = _fallback_mine_events(store, incident_row)
     sandbox_dir = Path(sandbox_dir)
@@ -812,12 +815,11 @@ def _fallback_mine_events(store, incident_row):
             f"incident {incident_id}: session row missing for "
             f"{incident_row['session_file']!r} (DB invariant violation)"
         )
+    from .incident_evidence import parse_window, IncidentEvidenceError
     try:
-        window = json.loads(incident_row["window_json"])
-    except (ValueError, TypeError) as exc:
-        raise MinerError(
-            f"incident {incident_id}: window_json is not strict JSON: {exc}"
-        ) from exc
+        window = parse_window(incident_row['window_json'], owner=f'incident {incident_id}')
+    except IncidentEvidenceError as exc:
+        raise MinerError(str(exc)) from exc
     if not isinstance(window, list) or not window:
         raise MinerError(
             f"incident {incident_id}: window_json must be a non-empty list to "
@@ -832,30 +834,21 @@ def _fallback_mine_events(store, incident_row):
                 f"incident {incident_id}: window_json entry {i} is not an "
                 "object (DB invariant violation)"
             )
-        if {"role", "ts", "text"} <= entry.keys():
-            role, text = str(entry["role"]), str(entry["text"])
-        elif {"ts", "text"} <= entry.keys():
-            # The OTHER legitimate shape: a promoted repeated_error stores one
-            # entry per session it recurred in, not a turn window
-            # (scan.py's cross-session promotion). Rendering it as a turn would
-            # throw away the two things that make it evidence — how often it
-            # recurred and where — so the count and the session are folded into
-            # the text. Accept both archive shapes so an occurrence remains usable
-            # after its source transcript is gone.
-            where = str(entry.get("session_file") or "").rsplit("/", 1)[-1]
-            count = entry.get("count_in_session")
-            prefix_bits = []
-            if count is not None:
-                prefix_bits.append(f"{count}x")
-            if where:
-                prefix_bits.append(f"in {where}")
-            prefix = f"[recurred {' '.join(prefix_bits)}]\n" if prefix_bits else ""
-            role, text = "tool_result", prefix + str(entry["text"])
-        else:
+        if not {"ts", "text"} <= entry.keys():
             raise MinerError(
                 f"incident {incident_id}: window_json entry {i} is neither a "
                 "{role, ts, text} turn nor a {ts, text, ...} occurrence "
                 "(DB invariant violation)"
+            )
+        role, text = entry.get('role') or 'tool_result', entry['text']
+        if 'count_in_session' in entry or 'session_file' in entry or not entry.get('role'):
+            # Preserve occurrence metadata even in mixed legacy entries.
+            count = entry.get('count_in_session')
+            text = (
+                f"[recurred {str(count)+'x' if count is not None else 'count unknown'} "
+                f"in {entry.get('session_file') or 'session path unknown'}; "
+                f"project {entry.get('project_path') or 'location unknown'}; "
+                f"time {entry.get('ts') or 'unknown'}]\n" + text
             )
         events.append(
             TurnEvent(
@@ -863,7 +856,7 @@ def _fallback_mine_events(store, incident_row):
                 session_file=incident_row["session_file"],
                 session_id=incident_row.get("session_id", ""),
                 project_path=incident_row.get("project_path", ""),
-                ts_utc=str(entry["ts"]),
+                ts_utc=entry["ts"],
                 role=role,
                 kind="window",
                 text=text,

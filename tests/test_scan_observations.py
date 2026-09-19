@@ -452,7 +452,8 @@ def test_missing_schema_is_a_named_error_not_empty_history(tmp_path):
         exposure(env.store)
     with pytest.raises(so.ScanObservationError, match="scan_observation_occurrences is unreadable"):
         so.scan_history(env.store, session_file=str(path))
-    env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (so.MIGRATION,))
+    for migration in (so.MIGRATION, '0026_scan_incident_links', '0027_scan_run_index', '0030_session_context'):
+        env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (migration,))
     env.store.commit()
     with pytest.raises(so.ScanObservationError, match="require migration 0022_scan_observations"):
         exposure(env.store)
@@ -522,10 +523,12 @@ def test_rebuild_deletes_nothing_when_the_backup_cannot_be_written(tmp_path, mon
 def test_older_schema_dry_run_reads_without_migrating(tmp_path):
     env = make_env(tmp_path)
     _live_and_deleted(env)
-    for table in ("scan_incident_links", "scan_observation_occurrences", "scan_occurrences",
+    for table in ("session_context_records", "session_context_batches",
+                  "scan_incident_links", "scan_observation_occurrences", "scan_occurrences",
                   "scan_lines", "scan_observations", "scan_manifests", "scan_working_copies"):
         env.store.conn.execute(f"DROP TABLE {table}")
-    env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (so.MIGRATION,))
+    for migration in (so.MIGRATION, '0026_scan_incident_links', '0027_scan_run_index', '0030_session_context'):
+        env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (migration,))
     env.store.commit()
     db = Path(env.store.db_path)
     env.store.conn.close()

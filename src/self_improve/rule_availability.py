@@ -176,6 +176,8 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
     require_schema(store)
     from . import instruction_inventory as inventory
     inventory.require_schema(store)
+    from . import instruction_text
+    instruction_text.require_schema(store)
     if store.conn.in_transaction:
         raise AvailabilityError('Collect availability outside a database transaction')
     at = timestamp(observed_at or utc_now_iso(), 'availability collection')
@@ -204,7 +206,7 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
             path = revision['destination']['repo_root']
             copy = working_copy_identity(revision['project_key'], path)
             copies[(revision['project_key'], copy['id'])] = (revision['project_key'], path)
-    observations, inventories = [], []
+    observations, inventories, text_archives = [], [], []
     for (project_key, copy_id), (_, path) in sorted(copies.items()):
         relevant = [r for r in revisions if r['project_key'] in {'', project_key}]
         actual = resolve_project(path, cache)
@@ -214,13 +216,20 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
                        global_targets=[*(p for p in (cfg.global_claude_md, cfg.codex_global_agents_md) if os.path.lexists(p)),
                            *(r['destination']['target_path'] for r in relevant if not r['project_key'])]))
         copy_at = timestamp(observed_at or utc_now_iso(), 'inventory observation')
+        from .instruction_metrics import collect as collect_metrics
+        measurements = collect_metrics(surface, path)
         inventories.append(inventory.build_inventory(surface=surface, project_key=project_key,
-            working_copy_path=path, revisions=relevant, observed_at=copy_at, run_id=run_id))
+            working_copy_path=path, revisions=relevant, observed_at=copy_at, run_id=run_id, measurements=measurements))
+        text_archives.append(instruction_text.build_archive(surface, inventories[-1]))
         batch = inspect_working_copy(cfg, project_key=project_key, working_copy_path=path,
                                      revisions=relevant, observed_at=copy_at, _surface=surface)
         for record in batch:
             revision = next(r for r in relevant if r['id'] == record['rule_revision_id'])
             latest = latest_applications.get(revision['proposal_id'])
+            from .rule_revisions import application_end
+            ending = application_end(store, revision)
+            if ending and (ending['at'] is None or copy_at >= ending['at']):
+                record.update(status='unknown', cause=ending['cause'], matches=[])
             if latest and latest != revision['application_event_id']:
                 record.update(status='unknown', cause='application_superseded', matches=[])
             if actual.key != project_key:
@@ -251,6 +260,7 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
         for revision in revisions: record_revision(store, revision)
         record_availability(store, observations=observations)
         inventory.record_inventories(store, records=inventories)
+        instruction_text.record_archives(store, text_archives)
         previous = store.query_one('SELECT * FROM rule_availability_collections WHERE id=?', (record['id'],))
         if previous:
             if read_record(previous, 'rule_availability_collections') != record:
@@ -297,12 +307,21 @@ def availability_intervals(store, *, rule_revision_id, working_copy_id, start, e
         elif active:
             active['end'] = when; periods.append(active); active = None
     if active: periods.append(active)
+    from .rule_revisions import application_end
+    ending = application_end(store, revision)
+    if ending and ending['at'] is None:
+        periods = []
+    elif ending:
+        periods = [{**p, 'end':min(p['end'] or ending['at'], ending['at']),
+                    'confirmed_through':min(p['confirmed_through'],ending['at'])}
+                   for p in periods if p['start'] < ending['at']]
     gaps = [(datetime.fromisoformat(b['observed_at'])-datetime.fromisoformat(a['observed_at'])).total_seconds()
             for a,b in zip(records,records[1:])]
     visible = [p for p in periods if p['start'] < end and (p['end'] or end) > start]
     return {'rule_revision_id': rule_revision_id, 'working_copy_id': working_copy_id, 'start': start, 'end': end,
             'periods': visible, 'observation_count': len(records), 'computable': bool(records),
-            'reason': '' if records else 'no_availability_observations',
+            'reason': ending['cause'] if ending and not periods else '' if records else 'no_availability_observations',
+            'application_end': ending,
             'first_observed_at': records[0]['observed_at'] if records else None,
             'last_observed_at': records[-1]['observed_at'] if records else None,
             'largest_observation_gap_seconds': max(gaps, default=None),

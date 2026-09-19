@@ -125,6 +125,16 @@ def test_pages_conflicting_times_and_api_keep_copy_ownership(cfg,store,tmp_path)
     second=inventory.project_inventory(store,project_key=key,limit=2,cursor=first['next_cursor'])
     assert first['count']==3 and len(first['records'])==2 and len(second['records'])==1 and second['next_cursor'] is None
     assert len({r['working_copy_id'] for r in first['records']+second['records']})==3
+    selected=second['records'][0]['working_copy_id']
+    exact=inventory.project_inventory(store,project_key=key,working_copy_id=selected,limit=2)
+    assert exact['working_copy_id']==selected and exact['records']==second['records']
+    assert exact['count']==1 and exact['next_cursor'] is None
+    assert inventory.project_inventory(store,project_key=key,working_copy_id='f'*64)['count']==0
+    for value in ['', 'bad', 'A'*64, 3]:
+        with pytest.raises(inventory.InventoryError,match='Invalid inventory'):
+            inventory.project_inventory(store,project_key=key,working_copy_id=value)
+    with pytest.raises(inventory.InventoryError,match='Invalid inventory cursor'):
+        inventory.project_inventory(store,project_key=key,working_copy_id=selected,cursor=first['next_cursor'])
     with pytest.raises(inventory.InventoryError,match='different project'):
         inventory.project_inventory(store,project_key='different',cursor=first['next_cursor'])
     (repo/'AGENTS.md').write_text('# Changed at same timestamp\n')
@@ -136,6 +146,12 @@ def test_pages_conflicting_times_and_api_keep_copy_ownership(cfg,store,tmp_path)
     with TestClient(create_app(cfg,db_path=copy)) as client:
         assert client.get('/api/project-inventory',params={'project_key':key}).json()['count']==3
         assert client.get('/api/project-inventory',params={'project_key':key,'limit':0}).status_code==400
+        response=client.get('/api/project-inventory',params={'project_key':key,'working_copy_id':selected})
+        assert response.status_code==200 and response.json()['working_copy_id']==selected
+        assert [r['working_copy_id'] for r in response.json()['records']]==[selected]
+        absent=client.get('/api/project-inventory',params={'project_key':'different','working_copy_id':selected}).json()
+        assert absent['count']==0 and absent['records']==[]
+        assert client.get('/api/project-inventory',params={'project_key':key,'working_copy_id':'bad'}).status_code==400
     assert copy.read_bytes()==before
     assert store.query_one('SELECT COUNT(*) n FROM llm_calls')['n']==0
 
@@ -211,6 +227,8 @@ def test_inventory_ui_pagination_focus_late_response_and_unknown_counts(tmp_path
     from self_improve.dashboard import app
     node=shutil.which('node');assert node
     (tmp_path/'app.mjs').write_bytes((Path(app.__file__).parent/'static/app.js').read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     probe=tmp_path/'probe.mjs'
     probe.write_text(r'''
 import assert from 'node:assert/strict';

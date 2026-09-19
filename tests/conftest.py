@@ -13,6 +13,7 @@ authorized test requires personal resources.
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,9 @@ _FORBIDDEN = (
     _REAL_HOME / ".codex",
     _REAL_HOME / ".self-improve",
 )
+
+# Native system policy is a separate resource from personal configuration.
+_SYSTEM_POLICY_ROOTS = ("/Library/Application Support/ClaudeCode", "/etc/claude-code", "C:/Program Files/ClaudeCode")
 
 _violations: list[str] = []
 _armed = False
@@ -63,8 +67,13 @@ _FS_EVENTS = frozenset({
 })
 
 
+def _system_policy_path(text) -> bool:
+    normalized = os.fsdecode(text).replace("\\", "/").casefold()
+    return any(normalized.startswith(root.replace("\\", "/").casefold()) for root in _SYSTEM_POLICY_ROOTS)
+
+
 def _forbidden_prefix(text: str) -> bool:
-    return any(text.startswith(str(root)) for root in _FORBIDDEN)
+    return any(text.startswith(str(root)) for root in _FORBIDDEN) or _system_policy_path(text)
 
 
 def _audit(event: str, args) -> None:
@@ -118,12 +127,21 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_home_reads(request):
+def _no_real_home_reads(request, monkeypatch):
     """Fail any test that touched the operator's real config trees."""
     global _armed
     if request.node.get_closest_marker("reads_real_home"):
         yield
         return
+    # stat/lstat do not emit Python audit events. Refuse system-policy metadata
+    # reads before they occur, even when the default path happens not to exist.
+    for name in ('stat', 'lstat'):
+        original = getattr(os, name)
+        def checked(path, *args, _original=original, **kwargs):
+            if isinstance(path, (str, bytes, Path)) and _system_policy_path(path):
+                raise AssertionError('Test attempted native system policy access: '+str(path))
+            return _original(path, *args, **kwargs)
+        monkeypatch.setattr(os, name, checked)
     _violations.clear()
     _armed = True
     try:

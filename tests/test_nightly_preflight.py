@@ -24,18 +24,21 @@ def _fake_bin(path: Path, name: str, body: str) -> Path:
 
 @pytest.fixture
 def rig(tmp_path):
-    """Returns run(pick_json, uv_rc=0) -> CompletedProcess."""
+    """Execute the real script with isolated state and recorded fake tools."""
     bins = tmp_path / "bin"
     bins.mkdir()
     state = tmp_path / "state"
     ran_marker = tmp_path / "uv_ran"
     caff_marker = tmp_path / "caffeinate_ran"
+    pick_marker = tmp_path / "preflight_ran"
+    project = tmp_path / "project with spaces"
 
-    def run(pick_payload: dict, uv_rc: int = 0, on_ac: bool = False):
+    def run(pick_payload: dict, uv_rc: int = 0, on_ac: bool = False, args=()):
         _fake_bin(
-            bins, "quotapick", f"cat <<'EOF'\n{json.dumps(pick_payload)}\nEOF"
+            bins, "quotapick",
+            f'''echo called > "{pick_marker}"\ncat <<'EOF'\n{json.dumps(pick_payload)}\nEOF''',
         )
-        _fake_bin(bins, "uv", f'echo "$@" > "{ran_marker}"; exit {uv_rc}')
+        _fake_bin(bins, "uv", f'printf "%s\\0" "$@" > "{ran_marker}"; exit {uv_rc}')
         # `pmset -g batt` prints one of these two lines; the script greps it.
         drawing = "AC Power" if on_ac else "Battery Power"
         _fake_bin(bins, "pmset", f"echo \"Now drawing from '{drawing}'\"")
@@ -52,18 +55,22 @@ def rig(tmp_path):
             SI_QUOTAPICK=str(bins / "quotapick"),
             SI_PYTHON3="/usr/bin/python3",
             SI_UV=str(bins / "uv"),
-            SI_PROJECT=str(tmp_path / "project"),
+            SI_PROJECT=str(project),
             SI_PMSET=str(bins / "pmset"),
             SI_CAFFEINATE=str(bins / "caffeinate"),
         )
         proc = subprocess.run(
-            ["/bin/bash", str(SCRIPT)], capture_output=True, text=True, env=env
+            ["/bin/bash", str(SCRIPT), *args], capture_output=True, text=True, env=env
         )
         proc.pipeline_ran = ran_marker.exists()  # type: ignore[attr-defined]
         proc.caffeinated = caff_marker.exists()  # type: ignore[attr-defined]
-        proc.uv_argv = (  # type: ignore[attr-defined]
-            ran_marker.read_text().strip() if ran_marker.exists() else ""
+        proc.uv_args = (  # type: ignore[attr-defined]
+            ran_marker.read_bytes().decode().split("\0")[:-1] if ran_marker.exists() else []
         )
+        proc.project = str(project)  # type: ignore[attr-defined]
+        proc.preflight_ran = pick_marker.exists()  # type: ignore[attr-defined]
+        proc.state_exists = state.exists()  # type: ignore[attr-defined]
+        proc.lock_exists = (tmp_path / "run.lock").exists()  # type: ignore[attr-defined]
         return proc
 
     return run
@@ -405,10 +412,33 @@ def test_caffeinate_does_not_swallow_the_pipelines_exit_code(rig):
     assert proc.returncode == 3, proc.stdout + proc.stderr
 
 
-def test_the_run_arguments_are_unchanged_by_the_wrapper(rig):
-    """--review-only must survive being wrapped. Losing it would turn a
-    review-only night into one that writes to the operator's CLAUDE.md."""
-    for on_ac in (True, False):
-        proc = rig(_decision(True), on_ac=on_ac)
-        assert "--review-only" in proc.uv_argv, (on_ac, proc.uv_argv)
-        assert "selfimprove run" in proc.uv_argv, (on_ac, proc.uv_argv)
+@pytest.mark.parametrize("on_ac", [True, False])
+@pytest.mark.parametrize("args", [(), ("--review-only",)])
+@pytest.mark.parametrize("uv_rc", [0, 3])
+def test_nightly_preserves_explicit_policy_mode_and_child_status(rig, on_ac, args, uv_rc):
+    """Default policy reaches the CLI; only an explicit request adds the veto."""
+    proc = rig(_decision(True), on_ac=on_ac, args=args, uv_rc=uv_rc)
+    assert proc.returncode == uv_rc, proc.stdout + proc.stderr
+    assert proc.uv_args == ["run", "--project", proc.project, "selfimprove", "run", *args]
+    assert proc.caffeinated is on_ac
+    assert proc.preflight_ran
+    assert not proc.lock_exists
+
+
+@pytest.mark.parametrize("args", [
+    ("--review-onyl",),
+    ("--review-only=false",),
+    ("--review-only", "false"),
+    ("--review-only", "--review-only"),
+    ("--dry-run",),
+])
+def test_invalid_nightly_arguments_fail_before_side_effects(rig, args):
+    """A misspelled veto must never become an ordinary policy run."""
+    proc = rig(_decision(True), args=args)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "usage:" in proc.stderr and "[--review-only]" in proc.stderr
+    assert not proc.pipeline_ran
+    assert not proc.preflight_ran
+    assert not proc.caffeinated
+    assert not proc.state_exists
+    assert not proc.lock_exists

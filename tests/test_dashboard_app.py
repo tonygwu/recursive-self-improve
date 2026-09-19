@@ -55,10 +55,15 @@ API_PATHS = (
     "/api/projects",
     "/api/incident-rate",
     "/api/project-exposure",
+    "/api/project-sessions",
+    "/api/project-native-events",
+    "/api/project-measurements",
     "/api/review-queue",
     "/api/eval-attempts",
     "/api/eval-results",
     "/api/eval-health",
+    "/api/class-evidence",
+    "/api/quality-samples",
 )
 
 WRITE_VERBS = ("POST", "PUT", "PATCH", "DELETE")
@@ -75,7 +80,7 @@ PROBE_MIGRATION = (
 
 # Invented counters retain the legacy taxonomy shape, including budget refusals.
 _FULL_STATS = {
-    "run_id": "r1",
+    "run_id": "run-ok",
     "review_only": True,
     "scan": {"files_attempted": 10, "files_succeeded": 10, "files_failed": 0},
     "mine": {"attempted": 7, "succeeded": 6, "failed": 1,
@@ -264,7 +269,7 @@ def test_get_routes_preserve_database_and_use_a_read_only_store(tmp_path, monkey
     app = _app(tmp_path)
     with TestClient(app) as client:
         for path in API_PATHS:
-            assert client.get(path, params={"project_key": "fixture-project"} if path == "/api/project-exposure" else {}).status_code == 200, path
+            assert client.get(path, params={"project_key": "fixture-project"} if path in {"/api/project-exposure", "/api/project-sessions", "/api/project-native-events"} else {}).status_code == 200, path
 
     # The file first. The recorder below cannot see a handle opened by code
     # this test never patched, and printed text cannot see one at all.
@@ -284,7 +289,7 @@ def test_exactly_one_store_serves_every_request(tmp_path, monkeypatch):
     with TestClient(app) as client:
         for _ in range(3):
             for path in API_PATHS:
-                assert client.get(path, params={"project_key": "fixture-project"} if path == "/api/project-exposure" else {}).status_code == 200
+                assert client.get(path, params={"project_key": "fixture-project"} if path in {"/api/project-exposure", "/api/project-sessions", "/api/project-native-events"} else {}).status_code == 200
     assert len(constructions) == 1, constructions
     assert constructions[0] == (str(db), True)
 
@@ -490,7 +495,7 @@ def test_overview_carries_the_v1_panels_and_dates_from_incident_ts(tmp_path):
 
     assert set(payload) == {
         "freshness", "status_line", "grid", "inbox", "backlog", "failures",
-        "gate", "confidence",
+        "gate", "confidence", "audit",
     }
     # created_at on every fixture incident is 2026-08-18T09:00:00Z; ts is not.
     # days_stale is counted from the INJECTED clock (2026-08-25), so a handler
@@ -498,7 +503,9 @@ def test_overview_carries_the_v1_panels_and_dates_from_incident_ts(tmp_path):
     assert payload["freshness"]["as_of"] == "2026-08-18"
     assert payload["freshness"]["days_stale"] == 7
     assert payload["backlog"]["arrivals"]["source_column"] == "incidents.ts"
-    assert payload["backlog"]["net_per_day"] is not None
+    assert payload["backlog"]["net_per_day"] is None
+    assert payload["backlog"]["capacity_unit"] == "model_calls_per_run"
+    assert payload["audit"]["mining"]["window_days"] == 7
     forbidden = ("drain", "nights_to", "eta")
     flat = json.dumps(payload["backlog"]).lower()
     assert not any(word in flat for word in forbidden), flat
@@ -574,7 +581,8 @@ def test_a_missing_database_names_the_path_and_the_fix(tmp_path):
         dashboard_app.open_read_only_store(missing)
     message = str(excinfo.value)
     assert str(missing) in message
-    assert "selfimprove run --dry-run" in message
+    assert "selfimprove upgrade-state --database" in message
+    assert "--initialize --dry-run" in message
 
 
 def test_an_unmigrated_database_is_refused_never_migrated(tmp_path):
@@ -838,12 +846,18 @@ def _approval_body(client, pid, *, note=""):
     if reviewed.status_code == 404:
         return {"decision": "approve", "note": note}
     assert reviewed.status_code == 200, reviewed.text
-    return {"decision": "approve", "note": note, "revision": reviewed.json()["revision"], "request_key": str(uuid4())}
+    preview = client.get('/api/review-preview', params={'proposal_ids': pid})
+    assert preview.status_code == 200, preview.text
+    return {"decision": "approve", "note": note, "revision": reviewed.json()["revision"],
+            "preview_revision": preview.json()['revision'], "request_key": str(uuid4())}
 
 
 def _queued_proposal(tmp_path, *, status="inconclusive", pid="p-queued"):
     """Add one decidable proposal to the fixture DB."""
     store = Store(tmp_path / "state.db")
+    target = tmp_path / (pid + '-CLAUDE.md')
+    target.write_text('invented existing rule\n')
+    from self_improve.propose import make_unified_diff
     if store.query_one("SELECT id FROM learnings WHERE id = ?", ("l-1",)) is None:
       store.insert(
         "learnings",
@@ -861,8 +875,8 @@ def _queued_proposal(tmp_path, *, status="inconclusive", pid="p-queued"):
         "proposals",
         {
             "id": pid, "learning_id": "l-1", "run_id": "", "action": "add",
-            "target_path": "/tmp/x/CLAUDE.md", "target_kind": "global_claude_md",
-            "diff_unified": "", "status": status, "eval_result_id": "",
+            "target_path": str(target), "target_kind": "global_claude_md",
+            "diff_unified": make_unified_diff('invented existing rule\n', 'invented existing rule\nnew rule\n', str(target)), "status": status, "eval_result_id": "",
             "applied_at": "", "snapshot_commit_before": "",
             "snapshot_commit_after": "", "created_at": "2026-08-18T08:00:00Z",
         },
@@ -1268,6 +1282,17 @@ def test_serving_a_copy_writes_to_the_copy_and_never_to_the_live_database(tmp_pa
 def test_default_off_cards_can_be_decided_until_review_is_empty(tmp_path, status):
     """A class-disabled passing card must not fail the endpoint's second guard."""
     _fixture_db(tmp_path)
+    # Every success case reviews a real invented target, including the default
+    # read-only fixture row that previously had no executable diff.
+    from contextlib import closing
+    from self_improve.propose import make_unified_diff
+    with closing(Store(tmp_path / 'state.db')) as store:
+        for row in store.query('SELECT id FROM proposals'):
+            target = tmp_path / (row['id'] + '.md')
+            target.write_text('invented existing rule\n')
+            store.update('proposals', 'id', row['id'], {'target_path': str(target),
+                'diff_unified': make_unified_diff('invented existing rule\n', 'invented existing rule\nnew rule\n', str(target))})
+        store.commit()
     pid = _queued_proposal(tmp_path, status=status, pid="p-policy")
     with TestClient(_app(tmp_path)) as client:
         shown = client.get("/api/review-queue").json()

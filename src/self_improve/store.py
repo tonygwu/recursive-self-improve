@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -851,6 +851,196 @@ CREATE TABLE eval_attempt_events (
 CREATE INDEX eval_attempt_events_owner ON eval_attempt_events(attempt_id, created_at, id);
 """,
     ),
+    (
+        "0029_quality_evidence",
+        """
+CREATE TABLE quality_subjects (
+    id TEXT PRIMARY KEY, target_class TEXT NOT NULL, created_at TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE TABLE quality_samples (
+    id TEXT PRIMARY KEY, target_class TEXT NOT NULL, created_at TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX quality_sample_history ON quality_samples(target_class, created_at, id);
+CREATE TABLE quality_judgments (
+    id TEXT PRIMARY KEY, subject_id TEXT NOT NULL REFERENCES quality_subjects(id),
+    sample_id TEXT NOT NULL REFERENCES quality_samples(id), sequence INTEGER NOT NULL,
+    created_at TEXT NOT NULL, record_json TEXT NOT NULL, record_hash TEXT NOT NULL,
+    UNIQUE(subject_id, sequence)
+);
+CREATE INDEX quality_judgment_history ON quality_judgments(subject_id, sequence);
+CREATE TABLE evidence_command_results (
+    id TEXT PRIMARY KEY REFERENCES commands(id), created_at TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+""",
+    ),
+    (
+        "0030_session_context",
+        """
+CREATE TABLE session_context_batches (
+    observation_id TEXT PRIMARY KEY REFERENCES scan_observations(id),
+    profile TEXT NOT NULL, content_hash TEXT NOT NULL, record_count INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+CREATE TABLE session_context_records (
+    id TEXT PRIMARY KEY,
+    observation_id TEXT NOT NULL REFERENCES session_context_batches(observation_id),
+    line_key TEXT NOT NULL, line_no INTEGER NOT NULL, source TEXT NOT NULL,
+    project_key TEXT NOT NULL, working_copy_id TEXT NOT NULL,
+    logical_session_key TEXT NOT NULL, occurred_at TEXT NOT NULL,
+    kind TEXT NOT NULL, record_json TEXT NOT NULL,
+    UNIQUE(observation_id, line_no)
+);
+CREATE INDEX session_context_project ON session_context_records(project_key, logical_session_key);
+CREATE INDEX session_context_session ON session_context_records(logical_session_key, observation_id);
+""",
+    ),
+    (
+        "0031_native_load_reports",
+        """
+CREATE TABLE native_load_reports (
+    id TEXT PRIMARY KEY, profile TEXT NOT NULL, received_at TEXT NOT NULL,
+    project_key TEXT NOT NULL, logical_session_key TEXT NOT NULL,
+    working_copy_id TEXT NOT NULL, event_name TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX native_load_project ON native_load_reports(project_key, received_at, id);
+CREATE INDEX native_load_session ON native_load_reports(logical_session_key, received_at, id);
+""",
+    ),
+    (
+        "0025_project_measurements",
+        """
+ALTER TABLE project_stats ADD COLUMN record_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE project_stats ADD COLUMN project_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE project_stats ADD COLUMN rule_revision_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE project_stats ADD COLUMN compatibility_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE project_stats ADD COLUMN observed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE project_stats ADD COLUMN record_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE project_stats ADD COLUMN record_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX project_measurement_history ON project_stats(record_type, project_key, observed_at, id);
+CREATE INDEX project_measurement_latest ON project_stats(record_type, project_key, rule_revision_id, compatibility_key, observed_at, id);
+""",
+    ),
+    (
+        "0032_rule_families",
+        """
+CREATE TABLE rule_family_snapshots (
+    id TEXT PRIMARY KEY, profile TEXT NOT NULL, generation INTEGER NOT NULL UNIQUE,
+    created_at TEXT NOT NULL, source_hash TEXT NOT NULL, config_hash TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX rule_family_latest ON rule_family_snapshots(config_hash, source_hash, generation);
+CREATE TABLE rule_family_members (
+    snapshot_id TEXT NOT NULL REFERENCES rule_family_snapshots(id),
+    learning_id TEXT NOT NULL, family_id TEXT NOT NULL, text_hash TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, learning_id)
+);
+CREATE INDEX rule_family_members_page ON rule_family_members(snapshot_id, family_id, learning_id);
+CREATE TABLE rule_family_heads (
+    profile TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL REFERENCES rule_family_snapshots(id),
+    selected_at TEXT NOT NULL
+);
+""",
+    ),
+    (
+        "0033_instruction_text",
+        """
+CREATE TABLE instruction_text_archives (
+    id TEXT PRIMARY KEY, inventory_id TEXT NOT NULL UNIQUE,
+    project_key TEXT NOT NULL, working_copy_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL, run_id TEXT NOT NULL,
+    record_json TEXT NOT NULL, record_hash TEXT NOT NULL
+);
+CREATE INDEX instruction_text_history ON instruction_text_archives(project_key, working_copy_id, observed_at, id);
+""",
+    ),
+    ("0034_queue_history", """
+-- Bounded SQLite-specific observation contract; text primary IDs remain portable.
+-- A future backend needs equivalent transaction-local row observation.
+CREATE TABLE queue_coverage (
+    id TEXT PRIMARY KEY CHECK(id = 'global'), profile TEXT NOT NULL,
+    started_at TEXT NOT NULL, opening_count INTEGER NOT NULL CHECK(opening_count >= 0),
+    opening_unknown_count INTEGER NOT NULL CHECK(opening_unknown_count >= 0)
+);
+INSERT INTO queue_coverage VALUES ('global', 'run-backlog/1',
+    CURRENT_TIMESTAMP || 'Z', (SELECT COUNT(*) FROM incidents WHERE status='new'),
+    (SELECT COUNT(*) FROM incidents WHERE status NOT IN ('new','mined','dismissed')));
+CREATE TABLE queue_events (
+    id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE CHECK(seq > 0),
+    observed_at TEXT NOT NULL, incident_id TEXT NOT NULL,
+    operation TEXT NOT NULL, old_status TEXT, new_status TEXT,
+    queue_delta INTEGER NOT NULL
+);
+CREATE INDEX queue_event_time ON queue_events(observed_at,seq);
+CREATE TABLE queue_processing (
+    event_id TEXT PRIMARY KEY REFERENCES queue_events(id), profile TEXT NOT NULL,
+    outcome TEXT NOT NULL, run_id TEXT NOT NULL, command_id TEXT NOT NULL, call_id TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '', prompt_sha TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE queue_snapshots (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('start','finish')),
+    profile TEXT NOT NULL, observed_at TEXT NOT NULL, event_seq INTEGER NOT NULL CHECK(event_seq >= 0),
+    queue_count INTEGER NOT NULL CHECK(queue_count >= 0),
+    processing_count INTEGER NOT NULL CHECK(processing_count >= 0), settings_json TEXT NOT NULL,
+    UNIQUE(run_id,phase)
+);
+CREATE TRIGGER queue_observe_insert AFTER INSERT ON incidents
+BEGIN
+    INSERT INTO queue_events(id,seq,observed_at,incident_id,operation,old_status,new_status,queue_delta)
+    VALUES (lower(hex(randomblob(16))), (SELECT COALESCE(MAX(seq),0)+1 FROM queue_events),
+        CURRENT_TIMESTAMP || 'Z', NEW.id,
+        'insert', NULL, NEW.status, CASE WHEN NEW.status='new' THEN 1 ELSE 0 END);
+END;
+CREATE TRIGGER queue_observe_update AFTER UPDATE ON incidents WHEN OLD.status IS NOT NEW.status
+BEGIN
+    INSERT INTO queue_events(id,seq,observed_at,incident_id,operation,old_status,new_status,queue_delta)
+    VALUES (lower(hex(randomblob(16))), (SELECT COALESCE(MAX(seq),0)+1 FROM queue_events),
+        CURRENT_TIMESTAMP || 'Z', NEW.id,
+        'update', OLD.status, NEW.status, (CASE WHEN NEW.status='new' THEN 1 ELSE 0 END) - (CASE WHEN OLD.status='new' THEN 1 ELSE 0 END));
+END;
+CREATE TRIGGER queue_observe_delete AFTER DELETE ON incidents
+BEGIN
+    INSERT INTO queue_events(id,seq,observed_at,incident_id,operation,old_status,new_status,queue_delta)
+    VALUES (lower(hex(randomblob(16))), (SELECT COALESCE(MAX(seq),0)+1 FROM queue_events),
+        CURRENT_TIMESTAMP || 'Z', OLD.id,
+        'delete', OLD.status, NULL, CASE WHEN OLD.status='new' THEN -1 ELSE 0 END);
+END;
+CREATE TRIGGER queue_coverage_no_update BEFORE UPDATE ON queue_coverage
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_coverage_no_delete BEFORE DELETE ON queue_coverage
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_events_no_update BEFORE UPDATE ON queue_events
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_events_no_delete BEFORE DELETE ON queue_events
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_processing_no_update BEFORE UPDATE ON queue_processing
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_processing_no_delete BEFORE DELETE ON queue_processing
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_snapshots_no_update BEFORE UPDATE ON queue_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+CREATE TRIGGER queue_snapshots_no_delete BEFORE DELETE ON queue_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'Queue history is append-only');
+END;
+"""),
 ]
 
 
@@ -996,31 +1186,145 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        # Nightly and manual operations can open the database concurrently. Give a
-        # writer time to finish before reporting a lock error; do not silently retry
-        # indefinitely or assume the nightly lock serializes every database caller.
-        self.conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self._migrate()
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            # Nightly and manual operations can open the database concurrently.
+            # The nightly lock does not serialize every database caller.
+            self.conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self._migrate()
+        except BaseException:
+            self.conn.close()
+            raise
+
+    def migration_plan(self) -> dict:
+        """Read supported migration history without changing schema or data."""
+        import hashlib
+        names = [name for name, _ in MIGRATIONS]
+        if len(names) != len(set(names)):
+            raise ValueError('Migration definitions contain duplicate names')
+        present = self.query_one("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
+        if present:
+            applied = [row['name'] for row in self.query('SELECT name FROM schema_migrations')]
+            if any(not isinstance(name, str) or not name for name in applied):
+                raise ValueError('State contains an invalid migration name')
+        else:
+            if self.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+                raise ValueError('Existing state has tables but no migration history')
+            applied = []
+        if set(applied) - set(names):
+            raise ValueError('Migration history contains unknown names')
+        if set(applied) != set(names[:len(applied)]):
+            self._validate_migration_subset(set(applied))
+        return {'applied': [name for name in names if name in applied],
+                'pending': [name for name in names if name not in applied],
+                'migration_source_sha256': hashlib.sha256(json.dumps(MIGRATIONS).encode()).hexdigest()}
+
+    def _validate_migration_subset(self, applied: set[str]) -> None:
+        """Preserve supported additive omissions, never infer a missing receipt."""
+        sql = ("SELECT type,name,tbl_name,sql FROM sqlite_master "
+               "WHERE name NOT LIKE 'sqlite_%' AND name!='schema_migrations' "
+               "AND tbl_name!='schema_migrations' ORDER BY type,name")
+        actual = [tuple(row) for row in self.conn.execute(sql)]
+        with closing(sqlite3.connect(':memory:')) as expected:
+            try:
+                for name, script in MIGRATIONS:
+                    if name in applied:
+                        expected.executescript(script)
+            except sqlite3.Error as exc:
+                raise ValueError('Migration history cannot form a supported schema: ' + str(exc)) from exc
+            if actual != expected.execute(sql).fetchall():
+                raise ValueError('Migration history does not match the recorded subset schema')
+
+    def _apply_pending_migrations(self) -> None:
+        """Execute complete SQL statements without executescript's implicit commit."""
+        if not self.conn.in_transaction:
+            raise RuntimeError('Migration application requires its caller transaction')
+        plan = self.migration_plan()
+        self.conn.execute('CREATE TABLE IF NOT EXISTS schema_migrations ('
+                          'name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)')
+        for name, sql in MIGRATIONS:
+            if name not in plan['pending']:
+                continue
+            start = 0
+            for offset, char in enumerate(sql):
+                # SQLite decides whether semicolons are inside strings, comments
+                # or trigger bodies. Never split SQL on semicolons alone.
+                if char == ';' and sqlite3.complete_statement(sql[start:offset + 1]):
+                    self.conn.execute(sql[start:offset + 1])
+                    start = offset + 1
+            if sql[start:].strip():
+                self.conn.execute(sql[start:])
+            self.conn.execute('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)',
+                              (name, utc_now_iso()))
 
     def _migrate(self) -> None:
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            " name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        applied = {
-            r["name"] for r in self.conn.execute("SELECT name FROM schema_migrations")
-        }
-        for name, sql in MIGRATIONS:
-            if name in applied:
-                continue
-            with self.conn:
-                self.conn.executescript(sql)
-                self.conn.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
-                    (name, utc_now_iso()),
-                )
+        if not self.migration_plan()['pending']:
+            return
+        with self.transaction(write=True):
+            # Re-read under the reservation: another opener can finish first.
+            self._apply_pending_migrations()
+
+    @staticmethod
+    def _logical_digest(connection) -> str:
+        import hashlib
+        digest = hashlib.sha256()
+        for line in connection.iterdump():
+            digest.update(line.encode('utf-8'))
+            digest.update(b'\n')
+        return digest.hexdigest()
+
+    def _backup_upgrade_state(self, destination: Path, plan: dict) -> dict:
+        """Back up committed state while this handle reserves the only writer."""
+        import hashlib
+        import os
+        from .data_boundary import private_destination, manifest_sha, verify_files
+        destination = private_destination(destination)
+        destination.mkdir(parents=True, mode=0o700)
+        backup = destination / 'state.db'
+        with backup.open('xb'):
+            os.chmod(backup, 0o600)
+        with closing(sqlite3.connect(self.db_path.resolve().as_uri() + '?mode=ro', uri=True)) as source, \
+                closing(sqlite3.connect(backup)) as target:
+            # Backing up the connection that holds BEGIN IMMEDIATE can wait on
+            # itself forever. A second reader sees the same committed snapshot;
+            # the reserved writer prevents concurrent commits for this interval.
+            source.backup(target)
+            target.execute('PRAGMA journal_mode=DELETE')
+            if target.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                raise ValueError('Upgrade backup failed SQLite integrity verification')
+            logical = self._logical_digest(source)
+            if self._logical_digest(target) != logical:
+                raise ValueError('Upgrade backup differs from committed source data')
+        with backup.open('rb') as handle:
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        manifest = {'kind': 'state-upgrade-backup', 'version': 1,
+                    'source': str(self.db_path.resolve()), 'created_at': utc_now_iso(),
+                    'migration_plan': plan, 'logical_sha256': logical,
+                    'files': {'state.db': {'sha256': digest, 'bytes': backup.stat().st_size}}}
+        manifest['sha256'] = manifest_sha(manifest)
+        with (destination / 'manifest.json').open('x', encoding='utf-8') as handle:
+            os.chmod(handle.name, 0o600)
+            handle.write(json.dumps(manifest, indent=2) + '\n')
+        if verify_files(destination) != manifest:
+            raise ValueError('Upgrade backup changed during verification')
+        return manifest
+
+    def upgrade_with_backup(self, destination: Path | None) -> dict:
+        """Own backup-before-mutation and all pending migrations in one transaction."""
+        if self.read_only or self.conn.in_transaction:
+            raise ValueError('Upgrade requires a writable handle without pending caller work')
+        with self.transaction(write=True):
+            plan = self.migration_plan()
+            if not plan['pending']:
+                return {'state': 'current', **plan, 'backup': None}
+            if destination is None:
+                raise ValueError('Pending migrations require --backup NEW_PRIVATE_DIRECTORY')
+            manifest = self._backup_upgrade_state(destination, plan)
+            self._apply_pending_migrations()
+            after = self.migration_plan()
+            return {'state': 'upgraded', **after, 'applied_now': plan['pending'],
+                    'backup': str(destination.resolve()), 'backup_sha256': manifest['sha256']}
 
     # ------------------------------------------------------------------
     # Generic helpers — pipeline modules use these (plus the typed helpers
@@ -1070,6 +1374,59 @@ class Store:
     def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         r = self.conn.execute(sql, params).fetchone()
         return dict(r) if r else None
+
+    def schema_tables(self, *, expected_migrations=None) -> dict:
+        """Read table keys and declared references without migrations or writes.
+
+        SQLite-specific metadata stays in the storage adapter. Consumers receive
+        grouped foreign keys, including composite keys in their declared order.
+        """
+        if expected_migrations is not None:
+            # Reconstruct only the supplied applied schema in private memory.
+            # This never opens, migrates or changes the selected database.
+            memory = sqlite3.connect(':memory:')
+            memory.row_factory = sqlite3.Row
+            try:
+                for name, sql in MIGRATIONS:
+                    if name in expected_migrations:
+                        memory.executescript(sql)
+                return self._schema_tables(memory)
+            except sqlite3.Error as exc:
+                raise ValueError('Applied migration set cannot form a supported rebuild schema: '+str(exc)) from exc
+            finally:
+                memory.close()
+        return self._schema_tables(self.conn)
+
+    @staticmethod
+    def _schema_tables(connection) -> dict:
+        def query(sql):
+            return [dict(r) for r in connection.execute(sql)]
+        def quoted(name):
+            return '"' + name.replace('"', '""') + '"'
+        result = {}
+        for row in query("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+            name = row['name']
+            columns = query('PRAGMA table_info(' + quoted(name) + ')')
+            groups = {}
+            for fk in query('PRAGMA foreign_key_list(' + quoted(name) + ')'):
+                groups.setdefault(fk['id'], []).append(fk)
+            result[name] = {
+                'definition': row['sql'],
+                'columns': [c['name'] for c in columns],
+                'primary_key': [c['name'] for c in sorted(columns, key=lambda c: c['pk']) if c['pk']],
+                'foreign_keys': [
+                    {'table': rows[0]['table'], 'columns': [r['from'] for r in rows],
+                     'references': [r['to'] for r in rows]}
+                    for rows in (sorted(group, key=lambda r: r['seq']) for group in groups.values())],
+            }
+        return result
+
+    def check_foreign_keys(self) -> None:
+        """Refuse damaged references, including on a read-only connection."""
+        errors = self.query('PRAGMA foreign_key_check')
+        if errors:
+            first = errors[0]
+            raise ValueError(f"{first['table']} row {first['rowid']}: missing foreign-key parent {first['parent']}")
 
     # ------------------------------------------------------------------
     # Typed helpers.

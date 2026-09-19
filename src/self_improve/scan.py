@@ -1017,6 +1017,17 @@ def _measure_file(
                 ambiguous += len(ids)
                 continue
             kind = "produced" if ids[0] in inserted_incident_ids else "corroborated"
+            if kind == "produced":
+                # The queue pass may begin after metadata or in a file that
+                # changes cwd. Its new incident belongs to the exact trigger,
+                # not the first session row's cwd. Do not rewrite old evidence.
+                position = occs[0]['trigger_line_no'] - 1
+                trigger, native = lines[position], read.lines[position]
+                store.update('incidents', 'id', ids[0], {
+                    'project_key': trigger['project_key'],
+                    'project_path': native.project_path,
+                    'session_id': native.session_id,
+                })
             occs[0]["incident_links"].append({"incident_id": ids[0], "link_kind": kind})
             links += 1
         counts.update(
@@ -1049,6 +1060,10 @@ def _measure_file(
         },
     }
     so.record_scan(store, observation=observation, lines=lines, occurrences=occurrences)
+    from .session_context import record_scan_context
+    record_scan_context(store, observation=observation, lines=lines,
+        contexts=[(rec.line_no, rec.session_context) for rec, line in zip(read.lines, lines)
+                  if rec.session_context is not None and line['exclusion'] != 'denied'])
     counters.update(
         {
             "lines_observed": len(lines),

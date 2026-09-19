@@ -86,12 +86,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("scan", help="incremental transcript indexing + filter-incidents only")
     sub.add_parser("status", help="DB and last-run summary")
     sub.add_parser('observe-availability', help='inspect actual known working copies and persist rule availability; no model calls or target writes')
+    p_native = sub.add_parser('record-session-event', help='record one native provider hook report from stdin; no model calls, target writes or stdout')
+    p_native.add_argument('--receipt-id', help='stable UUID for replaying one transport receipt')
+    p_native_settings = sub.add_parser('session-hook-settings', help='print reviewable provider hook settings; does not install hooks')
+    for native_parser in (p_native, p_native_settings):
+        native_parser.add_argument('--provider', choices=['claude','codex'], default='claude', help='native input provider; selected explicitly in generated settings')
     p_worker = sub.add_parser("worker", help="recover instruction writes and deliver approved commands using the existing state database")
     worker_mode = p_worker.add_mutually_exclusive_group()
     worker_mode.add_argument("--once", action="store_true", help="process one queued command or interrupted instruction operation, then exit")
+    worker_mode.add_argument("--check", action="store_true", help="read-only schema and database preflight; no work is executed")
     worker_mode.add_argument("--operation", metavar="ID", help="retry or reconcile one recorded instruction operation, then exit; no model calls")
     p_jobs = sub.add_parser('jobs',help='execute explicitly requested model jobs independently of instruction delivery')
-    p_jobs.add_argument('--once',action='store_true',help='execute or resume one authorized model job, then exit')
+    jobs_mode = p_jobs.add_mutually_exclusive_group()
+    jobs_mode.add_argument('--check',action='store_true',help='read-only schema and database preflight; no model calls')
+    jobs_mode.add_argument('--once',action='store_true',help='execute or resume one authorized model job, then exit')
 
     p_rb = sub.add_parser("rollback", help="revert an applied proposal")
     p_rb.add_argument("proposal_id")
@@ -234,8 +242,19 @@ def main(argv: list[str] | None = None) -> int:
         "redacted transcript excerpts, so a non-loopback bind is refused.",
     )
 
+    p_upgrade = sub.add_parser('upgrade-state', help='explicit schema upgrade with verified private backup; no models or target writes')
+    p_upgrade.add_argument('--database', metavar='PATH', help='select an explicit private database path instead of configured state.db')
+    upgrade_mode = p_upgrade.add_mutually_exclusive_group()
+    upgrade_mode.add_argument('--backup', metavar='NEW_PRIVATE_DIRECTORY')
+    upgrade_mode.add_argument('--initialize', action='store_true', help='create missing state; never overwrite an existing database')
+    p_upgrade.add_argument('--dry-run', action='store_true', help='read-only migration plan; creates no state or backup')
+
     p_ld = sub.add_parser("install-launchd", help="install the nightly launchd job")
     p_ld.add_argument("--uninstall", action="store_true")
+
+    p_service = sub.add_parser('service', help='explicit delivery/model-worker service installation and inspection')
+    p_service.add_argument('service', choices=['delivery', 'models'])
+    p_service.add_argument('action', choices=['install', 'uninstall', 'status'])
 
     args = parser.parse_args(argv)
     # Resolve dataset selection and export targets BEFORE reading configuration
@@ -261,7 +280,36 @@ def main(argv: list[str] | None = None) -> int:
         except (DataBoundaryError, OSError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if args.command in {'record-session-event','session-hook-settings'}:
+        from .native_loads import native_cli
+        return native_cli(args)
+    if args.command in {'worker', 'jobs'} and args.config:
+        from pathlib import Path
+        if not Path(args.config).is_file():
+            print(f'Worker config does not exist: {args.config}', file=sys.stderr)
+            return 2
     cfg = load_config(args.config)
+
+    if args.command == 'service':
+        from .worker_services import manage, ServiceError
+        try:
+            print(manage(cfg, args.service, args.action, config_path=args.config))
+        except (ServiceError, OSError, ValueError) as exc:
+            print(f'Service setup failed: {exc}', file=sys.stderr)
+            return 2
+        return 0
+
+    if args.command == 'upgrade-state':
+        import sqlite3
+        from .data_boundary import DataBoundaryError
+        from .state_upgrade import upgrade_state
+        try:
+            result = upgrade_state(cfg, database=args.database, backup=args.backup, initialize=args.initialize, dry_run=args.dry_run)
+        except (DataBoundaryError, OSError, ValueError, sqlite3.Error) as exc:
+            print(f'State upgrade failed: {exc}', file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2))
+        return 0
 
     # Construct read-only handles for query commands. A normal Store can migrate
     # before the command performs its first query.
@@ -279,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "rebuild-state":
         from .rebuild import rebuild_state
+        import sqlite3
 
         try:
             store = Store(cfg.state_path("state.db"), read_only=args.dry_run, migrate=False)
@@ -291,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             finally:
                 store.close()
-        except (DataBoundaryError, OSError) as exc:
+        except (DataBoundaryError, OSError, ValueError, sqlite3.Error) as exc:
             print(str(exc), file=sys.stderr)
             return 2
         print(json.dumps(stats, indent=2))
@@ -329,16 +378,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result['status'] != 'partial' else 1
 
     if args.command in {"worker","jobs"}:
-        if args.command=='jobs':
-            from .job_worker import serve
-        else:
-            from .worker import serve
+        from .worker_services import check_runtime, ServiceError
         from .commands import CommandError
         try:
+            if args.check:
+                print(json.dumps(dict(check_runtime(cfg), worker='delivery' if args.command == 'worker' else 'models')))
+                return 0
+            if args.command == 'jobs':
+                from .job_worker import serve
+            else:
+                from .worker import serve
             return serve(cfg, once=args.once,**({'operation_id':args.operation} if args.command=='worker' else {}))
         except KeyboardInterrupt:
             return 0
-        except (CommandError, FileNotFoundError) as exc:
+        except (CommandError, ServiceError, FileNotFoundError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
 

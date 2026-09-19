@@ -15,7 +15,7 @@ from tests.test_apply import store, insert_proposal, init_git_repo, make_diff, r
 
 @pytest.fixture
 def cfg(tmp_path):
-    return Config(state_dir=str(tmp_path/'state'), global_claude_md=str(tmp_path/'home/CLAUDE.md'),
+    return Config(state_dir=str(tmp_path/'state'), claude_managed_dir=str(tmp_path/'managed'), global_claude_md=str(tmp_path/'home/CLAUDE.md'),
                   codex_global_agents_md=str(tmp_path/'codex/AGENTS.md'), skills_dir=str(tmp_path/'home/skills'),
                   claude_projects_dir=str(tmp_path/'transcripts/claude'), codex_sessions_dir=str(tmp_path/'transcripts/codex'),
                   codex_archived_dir=str(tmp_path/'transcripts/archived'))
@@ -294,25 +294,20 @@ def test_foreign_copy_is_not_read_and_unrelated_human_bullet_is_not_owned(cfg,st
     assert rows(store)[-1]['inspection']['file_count']==0
 
 
-def test_rebuild_exports_and_preserves_availability_after_proposal_deletion(cfg,store,tmp_path):
+def test_rebuild_preserves_availability_and_its_application_source(cfg,store,tmp_path):
     from self_improve.rebuild import rebuild_state
     repo=init_git_repo(tmp_path/'project','AGENTS.md','# Human instructions\n')
     key=known_copy(store,repo);delivery(store,cfg,repo);run_git(['merge','--ff-only',cfg.project_branch_name],repo)
     observe(store,cfg,1)
     before={table:store.query(f'SELECT * FROM {table} ORDER BY id') for table in revisions.TABLES}
+    operations=store.query('SELECT * FROM instruction_operations')
     destination=tmp_path/'private-backup'
-    with pytest.raises(ValueError,match='retained execution history'):
-        rebuild_state(store,export_path=destination)
-    assert not destination.exists()
-    for table,records in before.items():assert store.query(f'SELECT * FROM {table} ORDER BY id')==records
-    # A legacy database can retain delivered snapshots without operation rows.
-    # Exercise that supported rebuild shape separately from the refusal above.
-    store.conn.execute('DELETE FROM instruction_operations');store.commit()
     rebuild_state(store,export_path=destination)
     backup=json.loads((destination/'preserved.json').read_text())
     assert backup['rule_availability']==before
     for table,records in before.items():assert store.query(f'SELECT * FROM {table} ORDER BY id')==records
-    assert store.query('SELECT * FROM proposals')==[]
+    assert store.query('SELECT * FROM instruction_operations')==operations
+    assert store.query('SELECT * FROM proposals')
     assert availability.project_availability(store,project_key=key)['records'][0]['status']=='available'
     assert observe(store,cfg,2)['outcomes']=={'available':1}
 

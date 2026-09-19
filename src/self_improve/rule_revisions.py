@@ -214,3 +214,28 @@ def record_revision(store, record):
 def retained_revisions(store):
     require_schema(store)
     return [read_record(row, 'rule_revisions') for row in store.query('SELECT * FROM rule_revisions ORDER BY created_at,id')]
+
+
+def application_end(store, revision):
+    """Read the exact application's closed lifetime, without current-file inference.
+
+    A successor proposal does not share its predecessor's application identity.
+    Missing origin/lifecycle evidence is unknown and cannot establish an open life.
+    """
+    origin=store.query_one("SELECT id FROM proposal_events WHERE id=? AND proposal_id=? AND event='applied'",
+                           (revision['application_event_id'],revision['proposal_id']))
+    if not origin:
+        return {'at':None,'cause':'application_history_missing','event_id':None}
+    endings=[]
+    for event in store.query("SELECT id,ts,note FROM proposal_events WHERE proposal_id=? AND event='rolled_back' ORDER BY ts,id",(revision['proposal_id'],)):
+        when=timestamp(event['ts'],'rollback event '+event['id'])
+        if when<revision['applied_at']: continue
+        try: note=json.loads(event['note'])
+        except (ValueError,TypeError): note=None
+        if not isinstance(note,dict) or not note.get('applied_event_id'):
+            endings.append({'at':when,'cause':'rollback_application_unbound','event_id':event['id']})
+        elif note['applied_event_id']==revision['application_event_id']:
+            if note.get('application_id')!=revision['application_id']:
+                raise AvailabilityError('rollback event '+event['id']+': application binding differs')
+            endings.append({'at':when,'cause':'verified_rollback','event_id':event['id']})
+    return min(endings,key=lambda r:(r['at'],r['event_id'])) if endings else None

@@ -1,13 +1,45 @@
 # Upgrade an existing preview installation
 
-Version 0.1.1 adds rule availability, instruction inventories, and retained
-evaluation attempts. The schema identifiers are `0024_rule_availability`,
-`0028_instruction_inventory`, and `0023_eval_attempts`. Identifiers do not specify
-execution order. The Store applies missing migrations in its declared order.
+Version 0.1.2 adds observational recurrence measurements, human quality
+judgments, native session context and loading reports, display-only rule
+families, retained instruction text, and queue history. Its schema identifiers
+are `0025_project_measurements`, `0029_quality_evidence`, `0030_session_context`,
+`0031_native_load_reports`, `0032_rule_families`, `0033_instruction_text`, and
+`0034_queue_history`.
+
+Version 0.1.1 added rule availability, instruction inventories, and retained
+evaluation attempts, as `0024_rule_availability`, `0028_instruction_inventory`,
+and `0023_eval_attempts`. An installation still on 0.1.0 applies both sets in one
+upgrade. Identifiers do not specify execution order. The Store applies missing
+migrations in its declared order.
 
 Dashboard readers and both workers do not migrate at startup. An old database
 can show unavailable evidence or refuse new evaluation and inventory operations.
 The disposable demo creates its own current schema and needs no upgrade.
+
+## The supported command
+
+`selfimprove upgrade-state` performs this upgrade. It makes no model calls and
+writes no instruction target. Inspect the pending work first:
+
+```sh
+uv run selfimprove --config /absolute/private/config.toml upgrade-state --dry-run
+```
+
+Apply it only after the command has written and verified a new private backup:
+
+```sh
+uv run selfimprove --config /absolute/private/config.toml upgrade-state \
+    --backup /absolute/private/backups/before-0.1.2
+```
+
+The backup directory must be new and outside every Git checkout. Use
+`--database /absolute/private/copy.db` to upgrade one selected copy instead of the
+configured state. Use `--initialize` only when no database exists yet. Stop the
+dashboard, workers, and scheduled runs first; this command does not manage them.
+
+The equivalent inline procedure below remains published and tested. Either path
+is sufficient. Use the command unless you need to inspect each step.
 
 ## Back up and upgrade
 
@@ -17,7 +49,7 @@ Choose an existing private backup directory outside every Git checkout.
 Replace both example paths in this command with your configuration and a new backup filename.
 
 ```sh
-uv run python - /absolute/private/config.toml /absolute/private/backups/before-0.1.1.db <<'PY'
+uv run python - /absolute/private/config.toml /absolute/private/backups/before-0.1.2.db <<'PY'
 from contextlib import closing
 from pathlib import Path
 import sys
@@ -48,7 +80,10 @@ with closing(Store(database, read_only=True)) as source:
 print('Verified private backup:', backup)
 
 with closing(Store(database, migrate=True)) as upgraded:
-    required = {'0024_rule_availability', '0028_instruction_inventory', '0023_eval_attempts'}
+    required = {'0023_eval_attempts', '0024_rule_availability', '0025_project_measurements',
+                '0028_instruction_inventory', '0029_quality_evidence', '0030_session_context',
+                '0031_native_load_reports', '0032_rule_families', '0033_instruction_text',
+                '0034_queue_history'}
     installed = {row['name'] for row in upgraded.query('SELECT name FROM schema_migrations')}
     if not required <= installed:
         raise SystemExit('Required migrations are missing.')
@@ -71,9 +106,13 @@ The upgrade preserves existing rows. It does not invent historical prompts,
 model identities, rule availability, or evaluation-attempt links. New evaluations
 retain their source evidence. Older unlinked results remain visible separately.
 
-State rebuild refuses populated evaluation-attempt history because it cannot yet
-preserve that complete execution graph. This includes `rebuild-state --dry-run`.
-That refusal is a guard, not a reason to delete retained records.
+State rebuild now preserves retained execution history instead of refusing it.
+It keeps command, operation, evaluation-attempt and quality roots together with
+the source rows they reference, and it keeps `runs` and `llm_calls` untouched.
+A rebuild still requires a new private backup directory outside Git, and it
+verifies that backup before any deletion. A source transcript that changed or
+became unreadable cannot qualify as rebuildable. Preview first with
+`rebuild-state --dry-run --export /absolute/private/new-backup`.
 
 The backup represents the state before this upgrade. Restoring it after further
 work loses newer decisions and evidence. Stop all state users before recovery.
