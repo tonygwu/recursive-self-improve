@@ -4,6 +4,7 @@ import json
 
 from . import queries, scan_data
 from .. import scan_reporting, availability_reporting
+from ..failure_presentation import failure_copy, taxonomy_rows
 
 
 class RunDataError(ValueError):
@@ -72,7 +73,16 @@ def detail(store, run_id):
         payload=stats.get(name)
         if name in stats and not isinstance(payload,dict):
             raise RunDataError(f'run {run_id}: {name} is not an object')
-        stages.append({'name':name,'recorded':name in stats,'payload':payload})
+        try:
+            causes = taxonomy_rows(payload['taxonomy'], owner=f'run {run_id}.{name}.taxonomy') if payload and 'taxonomy' in payload else None
+        except ValueError as exc:
+            raise RunDataError(str(exc)) from exc
+        try:
+            accounting = queries._stage_cell(row,name,stats)
+        except queries.DashboardDataError as exc:
+            raise RunDataError(str(exc)) from exc
+        stages.append({'name':name,'recorded':name in stats,'payload':payload, 'causes':causes,
+                       'accounting':accounting, 'state':accounting['state']})
     calls=store.query_one('SELECT COUNT(*) AS n,COALESCE(SUM(tokens_in),0) AS tokens_in,COALESCE(SUM(tokens_out),0) AS tokens_out FROM llm_calls WHERE run_id=?',(run_id,))
     llm=stats.get('llm')
     if llm is not None and not isinstance(llm,dict):raise RunDataError('run '+run_id+': llm is not an object')
@@ -89,7 +99,8 @@ def detail(store, run_id):
             'tokens_in':calls['tokens_in'],'tokens_out':calls['tokens_out'],
             'reason':'No call total was recorded in run statistics.' if reconciled is None else
                      'Recorded call rows differ from the run total; retained history may be incomplete.' if not reconciled else ''},
-        'command_ids':_commands(store,run_id),
+        'command_ids':_commands(store,run_id), 'flow':flow(store,run_id),
+        'inspection':inspection(store, run_id, stats, limits),
         'missing_job_schemas':[migration for migration in JOB_SCHEMAS.values() if not _available(store,migration)],
         'scan_summary':scan_reporting.summary(stats.get('scan'), owner='run '+run_id+'.scan'),
         'availability_summary': availability_reporting.summary(
@@ -97,12 +108,77 @@ def detail(store, run_id):
         'provenance_note':'Calls and job results use explicit run links. Current proposal references are labeled separately from historical execution.'}
 
 
-KINDS=('calls','evaluations','proposals','deliveries','scans')
+KINDS=('calls','attempts','evaluations','proposals','deliveries','scans','learnings')
+
+
+def _flow_sources(store, run_id):
+    from .. import mining_history
+    recorded = _available(store, mining_history.MIGRATION)
+    # Group only explicit run identities. Scan time and current proposal evals
+    # never establish which execution mined a rule.
+    history = []
+    if recorded:
+        for row in store.query('SELECT * FROM mining_history WHERE run_id=? ORDER BY created_at,id', (run_id,)):
+            if row['kind'] not in mining_history.KINDS:
+                raise RunDataError(f"run {run_id}: unknown mining kind {row['kind']!r} in mining_history.{row['id']}")
+            try: history.append(mining_history.read(row))
+            except mining_history.HistoryError as exc: raise RunDataError(str(exc)) from exc
+    proposals = store.query('SELECT learning_id,COUNT(*) n FROM proposals WHERE run_id=? GROUP BY learning_id', (run_id,))
+    return recorded, history, proposals
+
+
+def flow(store, run_id):
+    recorded, history, proposals = _flow_sources(store,run_id)
+    observed = {r['learning_id'] for r in history}
+    proposed = {r['learning_id'] for r in proposals}
+    kinds = {}
+    for row in history: kinds[row['kind']] = kinds.get(row['kind'],0)+1
+    return {'mining_recorded':recorded,
+        'observation_count':len(history) if recorded else None,
+        'observed_learning_count':len(observed) if recorded else None,
+        'observation_kinds':kinds if recorded else None,
+        'created_proposal_count':sum(r['n'] for r in proposals),
+        'proposal_learning_count':len(proposed),
+        'observed_without_proposal_count':len(observed-proposed) if recorded else None,
+        'multiple_proposal_learning_count':sum(r['n']>1 for r in proposals),
+        'rule_group_count':len(observed|proposed),
+        'reason':'' if recorded else 'This database has no mining-history schema; historical mining observations are unknown.',
+        'note':'Mining observations and created proposals are separate cohorts. Older candidate rules can be proposed in this run. No proposal here does not establish that a rule was never routed. Retained links may not cover older historical work.'}
+
+
+def _learning_groups(store, run_id):
+    recorded, history, proposals = _flow_sources(store,run_id)
+    groups = {lid:{'id':lid,'mining_recorded':recorded,'observations':[],'proposals':[]}
+              for lid in sorted({r['learning_id'] for r in history+proposals})}
+    for observation in history:
+        groups[observation['learning_id']]['observations'].append(observation)
+    for row in store.query('SELECT * FROM proposals WHERE run_id=? ORDER BY created_at,id',(run_id,)):
+        groups[row['learning_id']]['proposals'].append(row)
+    # One selected-cohort join avoids a query for each rule without reading all
+    # unrelated learning rows. Deleted current content stays absent.
+    clause = 'id IN (SELECT learning_id FROM proposals WHERE run_id=?)'
+    args = [run_id]
+    if recorded:
+        clause += ' OR id IN (SELECT learning_id FROM mining_history WHERE run_id=?)'
+        args.append(run_id)
+    current = {r['id']:r for r in store.query('SELECT * FROM learnings WHERE '+clause, args)}
+    for lid, group in groups.items():
+        group['learning'] = current.get(lid)
+        group['association'] = 'Observations are immutable records of this run. Rule content and proposal content/status below are current and may reflect later work.'
+    return list(groups.values())
 
 
 def _records(store, run_id, kind, stats):
+    if kind=='learnings':
+        return _learning_groups(store,run_id),'Groups use exact mining-history and proposal run links. Empty retained links do not prove zero historical work.'
     if kind=='calls':
-        return store.query('SELECT * FROM llm_calls WHERE run_id=? ORDER BY created_at,id',(run_id,)),''
+        rows=store.query('SELECT * FROM llm_calls WHERE run_id=? ORDER BY created_at,id',(run_id,))
+        for row in rows:
+            row['outcome_description']=failure_copy(row['outcome'])
+            if row['outcome_description'] is None and row['outcome'] not in queries.LLM_SUCCESS_OUTCOMES:
+                row['outcome_description']={'name':'Unclassified outcome',
+                    'explanation':'No explanation is registered for this recorded call outcome.'}
+        return rows,''
     if kind=='proposals':
         rows=store.query('SELECT * FROM proposals WHERE run_id=? ORDER BY created_at,id',(run_id,))
         for row in rows:row['association']='Created by this run; content, status, eval reference, and snapshots are current and may reflect later work.'
@@ -154,6 +230,10 @@ def records(store, run_id, *, kind, limit=50, cursor=None):
     if kind not in KINDS:raise RunDataError('Unknown run record kind: '+str(kind))
     if type(limit) is not int or not 1<=limit<=100:raise RunDataError('Record limit must be 1 through 100.')
     stats=_stats(_run(store,run_id))
+    if kind == 'attempts':
+        from . import eval_data
+        page=eval_data.attempts(store,run_id=run_id,limit=limit,cursor=cursor)
+        return {**page,'run_id':run_id,'kind':kind}
     if kind == 'scans':
         page = scan_data.history_page(store, run_id=run_id, limit=limit, cursor=cursor)
         return {**page, 'run_id': run_id, 'kind': kind, 'reason_code': page['reason'], 'reason': page['reason_text']}
@@ -168,3 +248,36 @@ def records(store, run_id, *, kind, limit=50, cursor=None):
     page=rows[offset:offset+limit]
     return {'run_id':run_id,'kind':kind,'records':page,'count':len(rows),'reason':reason,
         'next_cursor':json.dumps([run_id,kind,page[-1]['id']],separators=(',',':')) if offset+limit<len(rows) else None}
+
+
+def inspection(store, run_id, stats, limits):
+    """Recorded limits are independent from durable job reservations."""
+    owner='run '+run_id
+    llm=stats.get('llm',{})
+    maps={}
+    for key in ('calls_made','refused'):
+        value=llm.get(key,{})
+        if not isinstance(value,dict) or any(type(v) is not int or v<0 for v in value.values()):
+            raise RunDataError(owner+': invalid llm.'+key)
+        maps[key]=value
+    waits=llm.get('policy_waits')
+    if waits is not None and (type(waits) is not int or waits<0):raise RunDataError(owner+': invalid policy waits')
+    pools=sorted(set(limits or {})|set(maps['calls_made'])|set(maps['refused']))
+    pipeline=[{'pool':p,'limit':(limits or {}).get(p),'used':maps['calls_made'].get(p),'refused':maps['refused'].get(p)} for p in pools]
+    clock=stats.get('wall_clock')
+    if clock is not None:
+        if not isinstance(clock,dict):raise RunDataError(owner+': invalid wall clock')
+        for name in ('wall_seconds','model_seconds','unaccounted_seconds','unaccounted_pct','largest_gap_seconds'):
+            if name in clock and (type(clock[name]) not in (int,float)):
+                raise RunDataError(owner+': invalid wall clock '+name)
+    from .. import jobs
+    summaries=[]
+    for cid in _commands(store,run_id):
+        row=store.query_one('SELECT * FROM commands WHERE id=?',(cid,))
+        if row is None:raise RunDataError(owner+': missing job command '+cid)
+        data=jobs.status(store,row)
+        if data['run_id']!=run_id:raise RunDataError(owner+': mismatched job '+cid)
+        summaries.append({k:data[k] for k in ('id','action','state','budget','failure_taxonomy')}|{
+            'completed_calls':sum(c['state']=='completed' for c in data['calls']),
+            'unresolved_calls':sum(c['state']=='started' for c in data['calls'])})
+    return {'pipeline_pools':pipeline,'policy_waits':waits,'jobs':summaries,'wall_clock':clock}

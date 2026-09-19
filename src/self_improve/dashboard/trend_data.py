@@ -25,21 +25,34 @@ def _index(value):
     return int(value[:4]) * 12 + int(value[5:]) - 1
 
 
-def _deliveries(store, requested, cursor):
-    scope = {k: requested[k] for k in ('project_key', 'start', 'end')}
-    after = None
-    if cursor is not None:
-        try:
-            token = json.loads(base64.urlsafe_b64decode(cursor.encode()))
-            after = token['after']
-            if (token['scope'] != scope or not isinstance(after, list) or len(after) != 2
-                    or not all(isinstance(v, str) and v for v in after)
-                    or scans.normalize_timestamp(after[0]) != after[0]
-                    or not re.fullmatch(r'[a-f0-9]{64}', after[1])):
-                raise ValueError('different scope or position')
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            raise ExposureRequestError('Invalid delivery cursor for this trend selection') from exc
-    out = {'records': [], 'count': None, 'next_cursor': None, 'by_month': {}, 'reason': '',
+def _delivery_cursor(cursor):
+    if cursor is None:
+        return None
+    try:
+        token = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        scope, after = token['scope'], token['after']
+        if (set(scope) not in ({'project_key', 'start', 'end'},
+                              {'project_key', 'start', 'end', 'months', 'end_month'})
+                or not isinstance(after, list) or len(after) != 2
+                or not all(isinstance(v, str) and v for v in after)
+                or scans.normalize_timestamp(after[0]) != after[0]
+                or not re.fullmatch(r'[a-f0-9]{64}', after[1])
+                or any(not isinstance(scope[k], str) or scans.normalize_timestamp(scope[k]) != scope[k]
+                       for k in ('start', 'end'))
+                or not scope['start'] <= after[0] < scope['end']
+                or scope['start'][7:] != '-01T00:00:00.000000Z'):
+            raise ValueError('invalid scope or position')
+        return token
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        raise ExposureRequestError('Invalid delivery cursor for this trend selection') from exc
+
+
+def _deliveries(store, requested, token):
+    scope = {k: requested[k] for k in ('project_key', 'start', 'end', 'months', 'end_month')}
+    after = token['after'] if token else None
+    if token and any(scope.get(k) != v for k, v in token['scope'].items()):
+        raise ExposureRequestError('Invalid delivery cursor for this trend selection')
+    out = {'records': [], 'count': None, 'next_cursor': None, 'by_month': {}, 'by_day': {}, 'reason': '',
            'note': 'Retained rule revisions use the application event timestamp. Older applications without a retained revision are unknown. Delivery does not prove instruction availability, session receipt, or a causal effect.'}
     if not store.query_one('SELECT name FROM schema_migrations WHERE name=?', (rule_revisions.MIGRATION,)):
         out['reason'] = 'schema_unavailable'
@@ -52,6 +65,8 @@ def _deliveries(store, requested, cursor):
     for r in records:
         month = r['applied_at'][:7]
         out['by_month'][month] = out['by_month'].get(month, 0) + 1
+        day = r['applied_at'][:10]
+        out['by_day'][day] = out['by_day'].get(day, 0) + 1
     page = [r for r in records if after is None or [r['applied_at'], r['id']] < after]
     out['records'] = [{k: r[k] for k in ('id', 'learning_id', 'proposal_id', 'application_id',
                                         'application_event_id', 'applied_at', 'project_key', 'content_hash')}
@@ -67,8 +82,8 @@ def monthly_exposure(store, *, now_utc, project_key=None, compatibility_key=None
                      months=7, end_month=None, min_sessions=20, delivery_cursor=None):
     """One version at a time, across one canonical project or all known projects.
 
-    Missing periods remain visible. Small samples retain raw rates and an advisory
-    adequacy flag. Unknown-time and failed-reconciliation coverage is unallocated,
+    Missing periods remain visible. Small samples retain observed arithmetic but
+    have no primary trend rate. Unknown-time and failed-reconciliation coverage is unallocated,
     reported once per project, and never copied into each month's denominator.
     """
     if not isinstance(now_utc, datetime) or now_utc.tzinfo is None or now_utc.utcoffset() is None:
@@ -78,11 +93,22 @@ def monthly_exposure(store, *, now_utc, project_key=None, compatibility_key=None
             raise ExposureRequestError(f'{name} must be non-empty when supplied')
     if type(months) is not int or not 1 <= months <= 24:
         raise ExposureRequestError('months must be an integer from 1 to 24')
-    if type(min_sessions) is not int or min_sessions < 1:
-        raise ExposureRequestError('min_sessions must be a positive integer')
+    if type(min_sessions) is not int or min_sessions < 20:
+        raise ExposureRequestError('min_sessions must be an integer of at least 20')
     clock = now_utc.astimezone(timezone.utc)
+    latest_month = f'{clock.year:04d}-{clock.month:02d}'
+    token = _delivery_cursor(delivery_cursor)
+    cursor_anchor = None
+    if token:
+        frozen_end = token['scope']['end']
+        if frozen_end > scans.normalize_timestamp(clock.isoformat()):
+            raise ExposureRequestError('Invalid future delivery cursor')
+        clock = datetime.fromisoformat(frozen_end.replace('Z', '+00:00'))
+        # Derive from start, not end minus an instant: a current-month request
+        # made exactly at midnight on day one still includes that empty month.
+        cursor_anchor = _month(_index(token['scope']['start'][:7]) + months - 1)
     current = f'{clock.year:04d}-{clock.month:02d}'
-    anchor = _index(end_month or current)
+    anchor = _index(end_month or cursor_anchor or current)
     if anchor > _index(current) or anchor - months + 1 < 12:
         raise ExposureRequestError('The requested months must be in years 0001–9999 and not in the future')
     start = _month(anchor - months + 1) + '-01T00:00:00.000000Z'
@@ -92,17 +118,19 @@ def monthly_exposure(store, *, now_utc, project_key=None, compatibility_key=None
         raise ExposureRequestError('The requested interval has no elapsed time; select an earlier month or more months')
     requested = dict(project_key=project_key, compatibility_key=compatibility_key,
                      months=months, end_month=_month(anchor), start=start, end=end)
-    result = {'contract_version': 2, 'requested': requested, 'partial_month': current,
+    result = {'contract_version': 3, 'requested': requested, 'partial_month': latest_month,
               'primary_series': 'signal_occurrences_per_100k_physical_lines', 'min_sessions': min_sessions,
               'series': [], 'dropped_months': [], 'version_groups': [], 'compatibility_key': None,
               'project_options': [], 'coverage_by_project': [], 'computable': False,
               'reason': '', 'reason_text': '', 'signal_types': list(scans.SIGNALS),
               'denominator_note': 'Counts use uncapped signal occurrences and eligible physical JSONL lines at their own timestamps. One version is selected; incompatible versions are never pooled. Different signals can describe the same underlying mistake.',
-              'retention_note': 'Only retained scan observations are represented. A blank month means no eligible observed lines, not zero incidents. Earlier deleted transcripts are unknown. Current-month totals stop at the reference time.',
-              'deliveries': _deliveries(store, requested, delivery_cursor)}
+              'retention_note': 'Only retained scan observations are represented. An unavailable month has no primary rate; inspect its named cause and raw observations. Earlier deleted transcripts are unknown. Current-month totals stop at the reference time.',
+              'deliveries': _deliveries(store, requested, token)}
 
     def unavailable(reason):
-        result.update(reason=reason, reason_text=REASONS[reason])
+        text = (f'No month has at least {min_sessions} known sessions. Raw counts and observed arithmetic remain inspectable; trend rates are unavailable.'
+                if reason == 'insufficient_sessions' else REASONS[reason])
+        result.update(reason=reason, reason_text=text)
         return result
 
     if not store.query_one('SELECT name FROM schema_migrations WHERE name=?', (scans.MIGRATION,)):
@@ -208,10 +236,16 @@ def monthly_exposure(store, *, now_utc, project_key=None, compatibility_key=None
                  projects=len(project_sets.get(month, set())),
                  session_size={'total': sum(values), 'median': statistics.median(values) if values else None,
                                'max': max(values) if values else None}, small_sample=len(values) < min_sessions)
-        p['rate_per_100k'] = 100000 * p['occurrences'] / p['eligible_lines'] if identifiable and p['eligible_lines'] else None
-        p['reason'] = 'unknown_version' if not identifiable else 'zero_eligible_exposure' if not p['eligible_lines'] else ''
+        p['observed_rate_per_100k'] = 100000 * p['occurrences'] / p['eligible_lines'] if identifiable and p['eligible_lines'] else None
+        p['reason'] = ('unknown_version' if not identifiable else 'zero_eligible_exposure'
+                       if not p['eligible_lines'] else 'insufficient_sessions' if p['small_sample'] else '')
+        p['rate_per_100k'] = None if p['reason'] else p['observed_rate_per_100k']
         for signal in p['signals'].values():
-            signal['rate_per_100k'] = 100000 * signal['count'] / p['eligible_lines'] if identifiable and p['eligible_lines'] else None
+            signal['observed_rate_per_100k'] = 100000 * signal['count'] / p['eligible_lines'] if identifiable and p['eligible_lines'] else None
+            signal['rate_per_100k'] = None if p['reason'] else signal['observed_rate_per_100k']
     result['series'] = list(points.values())
     result['computable'] = any(p['rate_per_100k'] is not None for p in result['series'])
-    return result if result['computable'] else unavailable('unknown_version' if not identifiable else 'zero_eligible_exposure')
+    if result['computable']:
+        return result
+    return unavailable('unknown_version' if not identifiable else 'insufficient_sessions'
+                       if any(p['eligible_lines'] for p in result['series']) else 'zero_eligible_exposure')

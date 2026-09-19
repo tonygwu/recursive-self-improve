@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import sys
 import sysconfig
 import tomllib
 from dataclasses import dataclass, field
@@ -23,6 +24,15 @@ _SEARCH_CLI = Path(sysconfig.get_path("scripts")) / ("selfimprove.exe" if os.nam
 
 class ConfigError(Exception):
     """Raised for unknown keys, wrong types, or missing required paths."""
+
+
+def default_claude_managed_dir() -> str:
+    """Native provider location; selecting a default performs no filesystem I/O."""
+    if sys.platform == "darwin":
+        return "/Library/Application Support/ClaudeCode"
+    if sys.platform == "win32":
+        return "C:/Program Files/ClaudeCode"
+    return "/etc/claude-code"
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,10 @@ class Config:
     # Empty derives .agents/skills beside the configured Codex home. Override
     # when the user's skill root and CODEX_HOME do not share a parent.
     codex_skills_dir: str = ""
+    # Observation only. This is never an instruction-delivery destination.
+    claude_managed_dir: str = field(default_factory=default_claude_managed_dir)
+    # Empty derives plugins/ beside the configured global Claude instruction file.
+    claude_plugins_dir: str = ""
     # Line budget for the global CLAUDE.md: at/over budget an addition must be
     # paired with a deletion proposal or demoted to a skill.
     global_claude_md_line_budget: int = 250
@@ -286,6 +300,10 @@ class Config:
         __post_init__ runs for every Config. validate also checks source
         directories and is reserved for entry points that need those paths.
         """
+        if not isinstance(self.claude_managed_dir, str) or not Path(self.claude_managed_dir).is_absolute():
+            raise ConfigError("claude_managed_dir must be an absolute directory")
+        if not isinstance(self.claude_plugins_dir, str) or (self.claude_plugins_dir and not Path(self.claude_plugins_dir).is_absolute()):
+            raise ConfigError("claude_plugins_dir must be empty or an absolute directory")
         from .store import PROPOSAL_ACTIONS
 
         unknown = sorted(set(self.review_queue_actions) - PROPOSAL_ACTIONS)

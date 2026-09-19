@@ -64,5 +64,13 @@ and rolls the transaction back on failure. Its export preserves otherwise
 unrecoverable rows; it is not a complete database backup. Inspect help and the
 preview before deliberately running an actual rebuild.
 
+The rebuild now keeps retained execution history rather than refusing it. Command,
+operation, evaluation-attempt and quality roots are preserved together with the
+source rows they reference, and `runs` and `llm_calls` are never touched. Preview
+reports separate orphan retention from execution-history retention. A source
+counted as reconstructible must stay a readable, unchanged regular file through
+backup verification; a changed source aborts the deletion. A verified backup can
+survive a later failure, so retry with a new private backup directory.
+
 `run --dry-run` is different: it writes scan and incident state. It is not a
 read-only test rehearsal. Use invented fixtures and temporary databases for tests.

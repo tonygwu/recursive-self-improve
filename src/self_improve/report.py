@@ -14,6 +14,9 @@ from pathlib import Path
 
 from .config import Config
 from .store import Store, QUEUEING_STATUSES, LLM_SUCCESS_OUTCOMES
+from .failure_presentation import taxonomy_rows
+from .stage_accounting import OUTCOMES, numbers, mining_failure_counts
+from . import mining_history
 
 # llm_calls stages in pipeline order, for stable taxonomy rendering.
 #: The two miner stages. `mine` is the cheap single-call miner; `mine_agentic`
@@ -404,11 +407,12 @@ def _table(headers: list[str], rows: list[list[object]]) -> str:
 
 
 def _session_scope(run: dict) -> tuple[str, tuple]:
-    """SQL condition + params scoping sessions to this run's scan window.
+    """Select unlinked current session diagnostics by the run's wall-time window.
 
     The sessions table has no run_id; scoping uses last_scanned_at (an ISO-UTC
     processing timestamp written at scan time) against the run's started /
-    finished bounds. For an unfinished run only the lower bound applies.
+    finished bounds. This cannot prove scan membership, even when counts match.
+    For an unfinished run only the lower bound applies.
     """
     if run["finished"]:
         return "last_scanned_at >= ? AND last_scanned_at <= ?", (
@@ -689,59 +693,42 @@ def _unnamed_failure_lines(store, run_id: str) -> list[str]:
     ]
 
 
+def _native_count(stats: dict, stage: str, key: str) -> int | str:
+    """Read a recorded counter, preserving missing versus measured zero."""
+    payload = stats.get(stage, {})
+    if not isinstance(payload, dict):
+        raise ReportError(f'{stage}: expected an object')
+    if key not in payload:
+        return "not recorded"
+    value = payload[key]
+    if type(value) is not int or value < 0:
+        raise ReportError(f'{stage}.{key}: expected a nonnegative integer')
+    return value
+
+
 def _mine_stat(stats: dict, key: str) -> int | str:
-    """One counter from this run's own mine stage, or a stated absence."""
-    mine = stats.get("mine")
-    value = mine.get(key) if isinstance(mine, dict) else None
-    return value if isinstance(value, int) else "not recorded"
+    return _native_count(stats, 'mine', key)
 
 
 def _run_scan_int(stats: dict, key: str) -> int | str:
-    """One integer from this run's own scan stats, or a stated absence.
-
-    Never a zero default: a missing counter and a counter that really is zero
-    are different facts, and a funnel row is exactly where the difference gets
-    lost.
-    """
-    scan = stats.get("scan")
-    value = scan.get(key) if isinstance(scan, dict) else None
-    return value if isinstance(value, int) else "not recorded"
+    return _native_count(stats, 'scan', key)
 
 
 def _scan_drift_lines(stats: dict, sessions_in_scope: int) -> list[str]:
-    """Report when the current session scope differs from the recorded scan.
-
-    Later scans overwrite last_scanned_at, so regenerating an old report can
-    exclude previously scanned sessions. Compare with the run's recorded stats
-    and disclose drift rather than presenting a smaller count as the original."""
-    scan = stats.get("scan")
-    if not isinstance(scan, dict):
-        return []
-    scanned = scan.get("files_succeeded")
-    failed = scan.get("files_failed")
-    if not isinstance(scanned, int) or not isinstance(failed, int):
-        return []
-    expected = scanned + failed
-    if expected == sessions_in_scope or expected == 0:
-        return []
-    moved = expected - sessions_in_scope
-    if moved > 0:
-        return [
-            f"- **{moved} of the {expected} sessions this run scanned have "
-            "since been re-scanned by a later run.** Sessions are scoped by "
-            "`last_scanned_at`, which the later scan overwrote, so every "
-            "session number in this report is from the rows as they are NOW, "
-            "not as this run left them. The run's own stats are in the "
-            "appendix and are immutable.",
-            "",
-        ]
-    return [
-        f"- **{-moved} more sessions fall in this run's scan window than it "
-        f"reported scanning** ({sessions_in_scope} in scope, {expected} "
-        "recorded). Another process wrote `last_scanned_at` inside this run's "
-        "window; the session numbers below are not this run's alone.",
-        "",
+    """Compare counts without inventing scan identity or a cause of drift."""
+    note = [
+        "- Session-window diagnostics use **unlinked current session rows** selected by "
+        "`last_scanned_at`. They are not retained scan membership; matching counts do not "
+        "establish run ownership. Later scans and concurrent processes can change this selection.",
     ]
+    scanned = _run_scan_int(stats, 'files_succeeded')
+    failed = _run_scan_int(stats, 'files_failed')
+    if type(scanned) is int and type(failed) is int:
+        expected = scanned + failed
+        if expected != sessions_in_scope:
+            note.append(f"- Recorded file scan outcomes: {expected}; unlinked current session rows: "
+                        f"{sessions_in_scope}. This difference does not identify which files changed or why.")
+    return [*note, ""]
 
 
 def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> str:
@@ -756,10 +743,32 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         raise ReportError(f"run {run_id!r} not found in runs table")
     try:
         stats = json.loads(run["stats_json"])
+        json.dumps(stats, allow_nan=False)
     except ValueError as exc:
         raise ReportError(f"run {run_id!r}: stats_json is not strict JSON: {exc}") from exc
     if not isinstance(stats, dict):
         raise ReportError(f"run {run_id!r}: stats_json must be a JSON object")
+
+    try:
+        for stage in OUTCOMES:
+            if stage in stats:
+                if not isinstance(stats[stage], dict):
+                    raise ValueError(f'{stage}: expected an object')
+                numbers(stage, stats[stage])
+        mine_failures = mining_failure_counts(stats.get('mine', {}))
+    except ValueError as exc:
+        raise ReportError(f'run {run_id}: {exc}') from exc
+
+    history = None
+    if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (mining_history.MIGRATION,)):
+        try:
+            history = [mining_history.read(row) for row in store.query(
+                'SELECT * FROM mining_history WHERE run_id=? ORDER BY created_at,id', (run_id,))]
+        except mining_history.HistoryError as exc:
+            raise ReportError(str(exc)) from exc
+    kinds = {}
+    for row in history or []:
+        kinds[row['kind']] = kinds.get(row['kind'], 0) + 1
 
     scope_sql, scope_params = _session_scope(run)
     sessions = store.query(
@@ -770,12 +779,10 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         f"FROM sessions WHERE {scope_sql} GROUP BY status",
         scope_params,
     )
-    sess_by_status = {r["status"]: r for r in sessions}
     sessions_total = sum(r["n"] for r in sessions)
     lines_total = sum(r["lines_scanned"] for r in sessions)
     malformed_total = sum(r["malformed_lines"] for r in sessions)
     bytes_total = sum(r["bytes_scanned"] for r in sessions)
-    sessions_skipped = stats.get("scan", {}).get("files_skipped_unchanged")
     scan_drift = _scan_drift_lines(stats, sessions_total)
 
     incidents_by_signal = store.query(
@@ -814,30 +821,11 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
 
     mine_att, mine_ok, mine_fail = _stage_asf(*MINE_STAGES)
 
-    # Scoped by WHEN the learning was created, not by the run that created its
-    # incident. `learnings` has no run_id, and the old join went through
-    # `incidents.run_id`, which identifies the scan that found the incident.
-    # A later run can mine it. Use the same time-window approach as _session_scope.
-    if run["finished"]:
-        learnings_run = store.query_one(
-            "SELECT COUNT(*) AS n FROM learnings "
-            "WHERE created_at >= ? AND created_at <= ?",
-            (run["started"], run["finished"]),
-        )["n"]
-    else:
-        learnings_run = store.query_one(
-            "SELECT COUNT(*) AS n FROM learnings WHERE created_at >= ?",
-            (run["started"],),
-        )["n"]
     proposals_by_status = store.query(
         "SELECT status, COUNT(*) AS n FROM proposals WHERE run_id = ? "
         "GROUP BY status ORDER BY status",
         (run_id,),
     )
-    applied_count = next(
-        (r["n"] for r in proposals_by_status if r["status"] == "applied"), 0
-    )
-
     # ---- assemble --------------------------------------------------------
     out: list[str] = []
     out.append(f"# self-improve run report — `{run_id}`")
@@ -861,13 +849,9 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
     out.extend(_global_routing_lines(store, cfg))
     out.extend(_contradiction_starved_lines(stats, store))
     funnel: list[list[object]] = [
-        ["Sessions scanned (ok)", sess_by_status.get("ok", {}).get("n", 0)],
-        ["Sessions partial", sess_by_status.get("partial", {}).get("n", 0)],
-        ["Sessions failed", sess_by_status.get("error", {}).get("n", 0)],
-        [
-            "Sessions skipped",
-            sessions_skipped if sessions_skipped is not None else "not recorded",
-        ],
+        ["File scan passes completed (this run)", _run_scan_int(stats, "files_succeeded")],
+        ["File scan passes failed (this run)", _run_scan_int(stats, "files_failed")],
+        ["Files skipped unchanged (this run)", _run_scan_int(stats, "files_skipped_unchanged")],
         # Use this run's immutable counters. sessions.lines_scanned holds each
         # session's lifetime total, used separately under "Window efficiency".
         ["Lines scanned (this run)", _run_scan_int(stats, "lines_scanned")],
@@ -891,14 +875,28 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         ["Mine calls succeeded", mine_ok],
         ["Mine calls failed", mine_fail],
         ["Incidents THIS RUN mined", _mine_stat(stats, "succeeded")],
-        ["Learnings (this run)", learnings_run],
+        ["Mining execution failures (excluding explicit refusals)",
+         mine_failures['execution'] if mine_failures['execution'] is not None else 'not recorded'],
+        ["Mining attempts refused at call cap",
+         mine_failures['refused'] if mine_failures['refused'] is not None else 'not recorded'],
+        ["Rules with retained mining observations (this run)",
+         len({row['learning_id'] for row in history}) if history is not None else 'not recorded'],
+        ["Retained mining observations (this run)", len(history) if history is not None else 'not recorded'],
     ]
+    for kind, count in sorted(kinds.items()):
+        funnel.append([f"— observations: {kind}", count])
     for row in proposals_by_status:
-        funnel.append([f"Proposals: {row['status']}", row["n"]])
+        funnel.append([f"Current proposals: {row['status']}", row["n"]])
     if not proposals_by_status:
-        funnel.append(["Proposals (this run)", 0])
-    funnel.append(["Applied", applied_count])
+        funnel.append(["Current proposals linked to this run", 0])
+    funnel.append(["Automatic edits recorded (this run)", _native_count(stats, "apply", "applied")])
     out.append(_table(["Stage", "Count"], funnel))
+    out.append("")
+    out.append("Retained observations may be incomplete for older runs. These counts use explicit mining run links; "
+               "zero retained observations does not establish zero historical mining work. Current proposal status "
+               "can change after the run; it does not measure historical delivery. Automatic edits use the run's "
+               "native application counter. Explicit call-cap refusals remain in the native mining failed bucket "
+               "but are excluded from execution failures. Stored historical health is shown as recorded.")
     out.append("")
 
     out.extend(_routing_loss_lines(stats))
@@ -932,6 +930,25 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
     else:
         out.append("No LLM calls recorded for this run.")
     out.append("")
+    out.append("### Recorded causes in plain language")
+    out.append("")
+    out.append("Stage entries and call outcomes are separate records that can overlap. These counts are not unique failures or incidents.")
+    cause_groups = [(f"Call stage {r['stage']}", {r['outcome']:r['n']})
+                    for r in llm_taxonomy if r['outcome'] not in LLM_SUCCESS_OUTCOMES]
+    cause_groups += [(f"Run stage {stage}", payload['taxonomy']) for stage, payload in stats.items()
+                     if isinstance(payload, dict) and 'taxonomy' in payload]
+    for label, taxonomy in cause_groups:
+        try:
+            rows = taxonomy_rows(taxonomy, owner=f"run {run_id}.{label}.taxonomy")
+        except ValueError as exc:
+            raise ReportError(str(exc)) from exc
+        if not rows:
+            out.append(f"- {label}: no entries in the retained taxonomy.")
+        for row in rows:
+            out.append(f"- **{label}: {row['name']}** — {row['count']} recorded entries. {row['explanation']} (`{row['class']}`)")
+    if not cause_groups:
+        out.append("No cause taxonomy was retained for this run; missing coverage does not establish success.")
+    out.append("")
     out.append("### Scan")
     out.append("")
     error_sessions = store.query(
@@ -939,11 +956,11 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         "ORDER BY file_path",
         scope_params,
     )
-    out.append(f"- Sessions with status=error: {len(error_sessions)}")
+    out.append(f"- Unlinked current session rows with status=error: {len(error_sessions)}")
     # Cumulative over the sessions in scope, like the lines figure below it —
     # NOT this run's own count, which the funnel reports separately.
     out.append(
-        f"- Malformed lines, cumulative over this run's sessions (counted, "
+        f"- Malformed lines, cumulative over unlinked current session rows (counted, "
         f"skipped, surfaced): {malformed_total} (this run itself saw "
         f"{_run_scan_int(stats, 'malformed_lines')})"
     )
@@ -1103,28 +1120,30 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         )
     )
     out.append(
-        f"- Lines scanned, cumulative over this run's sessions: {lines_total} "
-        "(each session's lifetime total, which is what the ratio below needs; "
+        f"- Lines scanned, cumulative over unlinked current session rows: {lines_total} "
+        "(each selected row's lifetime total; "
         f"this run itself read {_run_scan_int(stats, 'lines_scanned')})"
     )
-    out.append(f"- Bytes scanned: {bytes_total}")
+    out.append(f"- Bytes scanned, cumulative over unlinked current session rows: {bytes_total}")
     out.append(
         f"- Chars sent toward mining (sum of incident window_json): {window_chars} "
         f"across {window_stats['n']} incidents"
     )
+    out.append("These diagnostic ratios mix exact-run incident windows with unlinked current session lifetimes. "
+               "They are not measured reduction or efficiency for this run.")
     if bytes_total > 0:
         out.append(
-            f"- Reduction ratio (window chars / bytes scanned): "
+            f"- Unlinked diagnostic ratio (window chars / current lifetime bytes): "
             f"{window_chars / bytes_total:.4%}"
         )
     else:
-        out.append("- Reduction ratio: n/a (0 bytes scanned)")
+        out.append("- Unlinked diagnostic ratio: n/a (0 lifetime bytes in selected rows)")
     if lines_total > 0:
         out.append(
-            f"- Window chars per line scanned: {window_chars / lines_total:.2f}"
+            f"- Unlinked diagnostic window chars per lifetime line: {window_chars / lines_total:.2f}"
         )
     else:
-        out.append("- Window chars per line scanned: n/a (0 lines scanned)")
+        out.append("- Unlinked diagnostic window chars per lifetime line: n/a (0 lifetime lines in selected rows)")
     out.append("")
 
     out.append("## Caps that bit")
@@ -1320,6 +1339,16 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
     if run["status"] == "budget_exhausted":
         out.append("- **Run ended with status `budget_exhausted`.**")
     out.append("")
+
+    families = stats.get('rule_families')
+    if families:
+        out.extend(['## Display family coverage', '',
+                    f"- Snapshot: `{families['snapshot_id']}`; coverage: {families['status']}.",
+                    f"- Current vectors: {families['embedded_members']} of {families['members_total']} learning members.",
+                    f"- Local inference: {families['inference_attempted']} attempted, {families['inference_succeeded']} succeeded, {families['inference_failed']} failed.",
+                    f"- Cache-only collection: {families['cache_only']}.",
+                    f"- Coverage cause: {families['error'] or 'none'}.",
+                    '- Display membership grants no shared execution authorization.', ''])
 
     out.append("## Appendix: raw run stats_json")
     out.append("")

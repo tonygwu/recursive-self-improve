@@ -214,9 +214,11 @@
   --font-mono: "Fira Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", "Courier New", monospace;
 
-  --t-display: 600 26px/1.15 var(--font-sans);
+  --t-display: 600 28px/34px var(--font-sans);
   --t-h1: 600 20px/26px var(--font-sans);
   --t-h2: 600 13px/20px var(--font-sans);
+  --t-section: 600 16px/22px var(--font-sans);
+  --t-section-compact: 600 13px/18px var(--font-sans);
   --t-h3: 500 11px/16px var(--font-sans);
   --t-body: 400 13px/20px var(--font-sans);
   --t-body-strong: 500 13px/20px var(--font-sans);

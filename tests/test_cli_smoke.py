@@ -24,7 +24,7 @@ READ_ONLY = ["status", "contradictions"]
 HELP_ONLY = [
     "run", "scan", "rescan", "report", "rollback", "self-eval",
     "search-learnings", "eval-retrieval", "backfill-project-keys",
-    "rebuild-state", "install-launchd", "worker",
+    "rebuild-state", "install-launchd", "worker", "upgrade-state", "service",
 ]
 
 
@@ -42,6 +42,7 @@ def cfg_file(tmp_path):
                 f'codex_sessions_dir = "{tmp_path}/codex/sessions"',
                 f'codex_archived_dir = "{tmp_path}/codex/archived"',
                 f'state_dir = "{tmp_path}/state"',
+                f'claude_managed_dir = "{tmp_path}/managed"',
                 f'global_claude_md = "{tmp_path}/global/CLAUDE.md"',
                 f'codex_global_agents_md = "{tmp_path}/codex/AGENTS.md"',
                 f'skills_dir = "{tmp_path}/skills"',
@@ -81,6 +82,26 @@ def test_subcommand_help_parses(cmd, capsys):
     # or the test proves nothing about the command it claims to cover.
     assert out.startswith("usage:")
     assert cmd in out.splitlines()[0]
+
+
+@pytest.mark.parametrize("args,expected", [((), False), (("--review-only",), True)])
+def test_run_dispatch_preserves_explicit_review_only(cfg_file, tmp_path, monkeypatch, args, expected):
+    """Exercise the actual parser/dispatch without invoking the model pipeline."""
+    from self_improve import pipeline
+
+    calls = []
+
+    def captured_run(cfg, store, **kwargs):
+        assert cfg.state_path("state.db") == tmp_path / "state" / "state.db"
+        assert store.query_one("SELECT COUNT(*) AS n FROM runs")["n"] == 0
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(pipeline, "run_pipeline", captured_run)
+    assert main(["--config", cfg_file, "run", *args]) == 0
+    assert len(calls) == 1
+    assert calls[0]["review_only"] is expected
+    assert calls[0]["dry_run"] is False
 
 
 @pytest.mark.parametrize("cmd", READ_ONLY)

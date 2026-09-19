@@ -14,6 +14,8 @@ def test_run_routing_pagination_and_late_responses(tmp_path):
     assert node, "Node is required for dashboard behavior checks."
     source = Path(app.__file__).parent / "static" / "app.js"
     (tmp_path / "app.mjs").write_bytes(source.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     (tmp_path / "vocabulary.json").write_text(json.dumps({'stages':STAGES,'kinds':KINDS}))
     probe = tmp_path / "probe.mjs"
     probe.write_text(r'''
@@ -31,7 +33,24 @@ globalThis.document = {activeElement:null, getElementById(id){
  return nodes.get(id);
 }};
 const pending = [];
-globalThis.fetch = url => new Promise(resolve=>pending.push({url,resolve}));
+let automaticDeliveryReads=true;
+const deliveryReads=[];
+globalThis.fetch = url => {
+ if(url.endsWith('/backlog')){
+  const id=decodeURIComponent(url.split('/runs/')[1].split('/')[0]);
+  return Promise.resolve({ok:true,json:async()=>({run_id:id,profile:'run-backlog/1',snapshot:null,queue_count:null,reasons:['No retained snapshot']})});
+ }
+ if(url.includes('/related-deliveries?')){
+  const id=decodeURIComponent(url.split('/runs/')[1].split('/')[0]);
+  return Promise.resolve({ok:true,json:async()=>({run_id:id,kind:'related_deliveries',records:[],count:null,reason:'No retained observations',next_cursor:null})});
+ }
+ if(automaticDeliveryReads && url.includes('/records?kind=deliveries')){
+  deliveryReads.push(url);
+  const id=decodeURIComponent(url.split('/runs/')[1].split('/')[0]);
+  return Promise.resolve({ok:true,json:async()=>({run_id:id,kind:'deliveries',records:[],count:0,reason:'No exact links retained',next_cursor:null})});
+ }
+ return new Promise(resolve=>pending.push({url,resolve}));
+};
 const answer = (i, data) => pending[i].resolve({ok:true,json:async()=>data});
 const response = id => ({run:{id,started:'2030-01-02T02:00:00Z',finished:'',status:'running'},
  stats:{},stages:[{name:'scan',recorded:false,payload:null},{name:'gate',recorded:true,payload:{attempted:3,gated_pass:1,refused:2}}],
@@ -44,8 +63,12 @@ const shown = body.innerHTML;
 answer(0,response('a')); await one;
 assert.equal(body.innerHTML,shown);
 assert.equal(m.state.runDetail.id,'b');
+assert.equal(deliveryReads.length,1);assert.match(deliveryReads[0],/\/runs\/b\/records/);
 assert.match(shown,/Budget limits were not recorded/);
-assert.match(shown,/refused: 2/);
+// This old/incomplete response has no normalized accounting. Retain its raw
+// refusal count without presenting an inferred zero or native-unit total.
+assert.match(shown,/&quot;refused&quot;: 2/);
+assert.match(shown,/<td class="run-count" data-run-count="input"><span class="run-count-label">unknown<\/span><\/td>/);
 assert.match(shown,/Not recorded/);
 assert.doesNotMatch(shown,/succeeded: 1/);
 const calls = m.loadRunRecords('calls');
@@ -79,6 +102,7 @@ for(const stage of vocabulary.stages){
  answer(index,response('a')); await request;
  assert.equal(m.state.runDetail.error,'');
 }
+automaticDeliveryReads=false;
 for(const kind of vocabulary.kinds){
  const index = pending.length;
  const request = m.loadRunRecords(kind);
@@ -86,6 +110,30 @@ for(const kind of vocabulary.kinds){
  answer(index,{run_id:'a',kind,records:[],count:0,next_cursor:null}); await request;
  assert.equal(m.state.runDetail.pages[kind].error,'');
 }
+automaticDeliveryReads=true;
+// A successful file inspection replaces stale missing-file metadata.
+let idx=pending.length;
+const artifactPage=m.loadRunRecords('artifacts');
+answer(idx,{run_id:'a',records:[{key:'report',label:'Run report',state:'ArtifactMissing',reason:'File was missing',bytes:null}],count:1,next_cursor:null});await artifactPage;
+idx=pending.length;const inspect=m.inspectRunArtifact('report');
+answer(idx,{run_id:'a',key:'report',bytes:8,preview_bytes:8,omitted_bytes:0,encoding:'utf-8',version:'v1',text:'<script>'});await inspect;
+assert.doesNotMatch(body.innerHTML,/File was missing/);
+assert.match(body.innerHTML,/8 bytes in the selected bundle/);
+assert.match(body.innerHTML,/&lt;script&gt;/);
+assert.doesNotMatch(body.innerHTML,/<script>/);
+assert.equal(document.activeElement.id,'artifact-result-report');
+// An unrelated response preserves focused artifact text.
+document.getElementById('artifact-text-report').focus();
+idx=pending.length;const unrelated=m.loadRunRecords('calls');
+answer(idx,{run_id:'a',kind:'calls',records:[],count:0,next_cursor:null});await unrelated;
+assert.equal(document.activeElement.id,'artifact-text-report');
+// An artifact response from the old run cannot overwrite the new route.
+idx=pending.length;const late=m.inspectRunArtifact('report');
+const changed=m.openRunRoute('run/b');answer(idx+1,response('b'));await changed;
+answer(idx,{run_id:'a',key:'report',bytes:7,preview_bytes:7,omitted_bytes:0,text:'old run'});await late;
+assert.equal(m.state.runDetail.id,'b');assert.doesNotMatch(body.innerHTML,/old run/);
+const noCalls=response('b');noCalls.calls.recorded=0;
+assert.match(m.renderRunDetail({kind:'run',id:'b',data:noCalls,pages:{}}),/Token usage not recorded/);
 console.log('RUN_ROUTES_OK');
 ''')
     result = subprocess.run([node, str(probe)], capture_output=True, text=True, timeout=30)

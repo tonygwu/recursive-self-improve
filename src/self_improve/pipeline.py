@@ -395,13 +395,21 @@ def run_pipeline(
     run_started = utc_now_iso()
     from .execution_policy import policy_snapshot, automatic_permission
 
+    from .queue_history import capture as capture_queue
+    queue_settings = {
+        "mine_order": cfg.mine_order, "project_filter": project_filter, "dry_run": dry_run,
+        "cheap_call_cap": cfg.max_cheap_calls_per_run if max_cheap_calls is None else max_cheap_calls,
+        "strong_call_cap": cfg.max_strong_calls_per_run if max_strong_calls is None else max_strong_calls,
+        "gate_call_cap": cfg.max_gate_calls_per_run,
+    }
     stats: dict = {"run_id": run_id, "dry_run": dry_run, "review_only": review_only,
                   "execution_policy": policy_snapshot(store)}
     # Persist execution intent before any proposal exists. A concurrent reader
     # must not interpret a running review-only run's missing stats as permission.
-    store.insert("runs", {"id": run_id, "started": run_started,
-                          "stats_json": json.dumps(stats)})
-    store.commit()
+    with store.transaction(write=True):
+        store.insert("runs", {"id": run_id, "started": run_started,
+                              "stats_json": json.dumps(stats)})
+        capture_queue(store, run_id, phase="start", settings=queue_settings)
     stats["stale_runs_reaped"] = stats_reaped
 
     try:
@@ -989,6 +997,18 @@ def run_pipeline(
             stats["llm"] = llm.stats()
             store.commit()
 
+        # Publish retained observations after mining links have committed. This
+        # collector owns its transaction and never opens files or invokes models.
+        store.commit()
+        from .project_measurements import collect_project_measurements
+        stats["project_measurements"] = collect_project_measurements(store, run_id=run_id)
+
+        # Display membership is independent of mining dedupe and authorization.
+        # The collector owns publication; dry runs may only reuse retained vectors.
+        from .rule_families import collect_families
+        stats["rule_families"] = collect_families(
+            store, cfg, embedder=embedder if not dry_run else None, cache_only=dry_run)
+
         # ---- 5. report ----
         violations = check_stage_invariants(stats)
         if violations:
@@ -1022,6 +1042,7 @@ def run_pipeline(
                 "report_path": str(report_path),
             },
         )
+        capture_queue(store, run_id, phase="finish", settings=queue_settings)
         store.commit()
         report.generate(store, cfg, run_id, report_path)
         return stats
@@ -1036,6 +1057,7 @@ def run_pipeline(
             else "error"
         )
         store.update("runs", "id", run_id, {"finished": utc_now_iso(), "status": status})
+        capture_queue(store, run_id, phase="finish", settings=queue_settings)
         store.commit()
         raise
 
@@ -1049,6 +1071,7 @@ def run_pipeline(
 HEALTH_STAGES: dict[str, tuple[str, tuple[str, ...], str]] = {
     "scan": ("files_attempted", ("files_succeeded",), "files_failed"),
     "mine": ("attempted", ("succeeded",), "failed"),
+    "rule_families": ("inference_attempted", ("inference_succeeded",), "inference_failed"),
     # A verdict of any kind means the gate ran. `gated_fail` is a working gate
     # doing its job, so it counts as success here; `failed` is the gate itself
     # breaking.
@@ -1080,15 +1103,18 @@ def derive_run_status(stats: dict) -> tuple[str, list[str]]:
             # A stage that reported none of its counters — `{"skipped": ...}`
             # is a real and legal shape. Nothing to judge.
             continue
-        missing = [k for k in wanted if not isinstance(payload.get(k), int)]
+        missing = [k for k in wanted if type(payload.get(k)) is not int or payload[k] < 0]
         if missing:
             raise ValueError(
                 f"stage {stage!r} reported an incomplete health triple: "
-                f"missing or non-numeric {missing}, got keys {sorted(payload)}"
+                f"missing, non-numeric or invalid nonnegative counts {missing}, got keys {sorted(payload)}"
             )
         attempted = payload[att_key]
         succeeded = sum(payload[k] for k in ok_keys)
         failed = payload[fail_key]
+        if stage == 'mine':
+            from .stage_accounting import mining_failure_counts
+            failed = mining_failure_counts(payload)['execution']
         if attempted > 0 and succeeded == 0 and failed > 0:
             reasons.append(
                 f"{stage}: 0 of {attempted} attempts succeeded ({failed} failed)"

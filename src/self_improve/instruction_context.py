@@ -31,8 +31,9 @@ def summarize(files):
             row['observed_bytes'] += size
             row['unresolved_bytes'] += size-covered
         rows.append(row)
+    has_fields = any(path['source'] == 'embedded_memory' for file in files for path in file['loading_paths'])
     return {'version': 1, 'groups': rows, 'runtime_loading_verified': False,
-            'meaning': 'Physical bytes under the recorded source profile. Startup candidates, conditional rules and on-demand bodies are separate. Skill metadata budgets, runtime overrides and session receipt are not measured.'}
+            'meaning': ('Distinct file and embedded-field bytes under the recorded source profile. Embedded fields have unresolved runtime selection. ' if has_fields else 'Physical bytes under the recorded source profile. ') + 'Startup candidates, conditional rules and on-demand bodies are separate. Skill metadata budgets, runtime overrides and session receipt are not measured.'}
 
 
 def project_summary(store, *, project_key, _revisions=None):
@@ -48,6 +49,7 @@ def project_summary(store, *, project_key, _revisions=None):
     base.update(inventory_id=record['id'], profile=record['profile'], total_bytes=record['totals']['bytes'],
                 file_count=record['totals']['files'], copies=page['count'],
                 selection='First copy in stable inventory order; latest observation for that copy. Inspect other copies in Project detail.')
+    base['measurements'] = record.get('measurements')
     if 'context' not in record:
         return {**base, 'computable': False, 'reason': 'source_profile_upgrade_required'}
     if record['status'] == 'partial' and not record['files']:

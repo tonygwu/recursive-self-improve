@@ -12,6 +12,14 @@ Read [preview scope](docs/RESEARCH_PREVIEW.md), [workflow](docs/WORKFLOW.md), an
 - Package changes must pass `uv run pytest -q tests/test_distribution.py`.
 - Inspector changes must pass `uv run pytest -q tests/test_gate_inspection.py`.
   `ops/inspect-gate-verdicts.sh` uses the read-only Store and selected private state.
+- Upgrade-guide changes must pass `uv run --extra dashboard pytest -q
+  tests/test_upgrade_guide.py tests/test_state_upgrade.py`. The published
+  procedure in `docs/UPGRADING.md` is executed by that test, so keep exactly one
+  heredoc in it and keep its required-migration set current.
+- Browser contracts live in `tests/browser/`. Each verifier owns one contract and
+  runs against its own temporary fixture server. Serve the fixture, run the
+  verifier, then stop the fixture. They require a free port, an installed
+  Playwright browser, invented state and zero model calls.
 - Use temporary invented histories, databases and instruction targets in tests.
   Do not read personal configuration, session trees, sibling checkouts or live state.
   Preserve every runtime/safety regression; use subprocesses for import isolation.
@@ -38,6 +46,18 @@ Automatic target classes start off. Only new gated-pass proposals in an explicit
 enabled class can apply automatically. Special manual-only cases remain manual.
 Use `automatic_permission` and `waiting_proposals` from `execution_policy.py`.
 The legacy `auto_apply` field never grants consent.
+
+An approval binds the complete reviewed base: every new approval supplies its
+`preview_revision`, and a changed target requires a fresh review. A rejection
+binds only its member revisions, so it must not carry `preview_revision`.
+Rule families, recurrence measurements and native session reports are read-only
+evidence. None of them grants approval or delivery authority.
+
+Two workers exist and neither migrates at startup. `worker` executes approved
+instruction commands without model calls. `jobs` executes only explicitly
+requested model jobs, against a frozen per-job budget, under its own lock.
+Completed steps replay without new calls; an interrupted step of unknown outcome
+blocks instead of inventing a verdict.
 
 The dashboard records exact-revision intent. It does not import the file writer.
 Instruction writes stay in `apply.py` and the explicit worker, with snapshots,

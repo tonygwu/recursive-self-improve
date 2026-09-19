@@ -10,14 +10,13 @@ It requires a new private backup directory outside Git. It writes and verifies
 the retained evidence before deletion, with all database changes in one transaction.
 
 What is kept:
-  - sessions whose ``file_path`` no longer exists on disk
-  - incidents belonging to those sessions (their window_json IS the evidence)
+  - sessions without readable regular transcripts and their incident windows
+  - command/evaluation/application history and its connected source evidence
 
 What goes:
-  - every other session and incident, which a rescan can reconstruct
-  - all learnings, proposals, incident_learnings, contradictions and eval
-    results derived from them
-  - cached learning embeddings, which point at learning ids that no longer exist
+  - unrelated sessions and incidents whose unchanged transcripts remain readable
+  - unrelated mining drafts, proposal/eval sources, contradictions and projections
+  - cached learning embeddings whose owners are deleted
 
 What is never touched:
   - ``runs`` and ``llm_calls`` — the cost/audit ledger. Those record what was
@@ -28,6 +27,8 @@ What is never touched:
 from __future__ import annotations
 
 from pathlib import Path
+import stat
+import os
 
 from .data_boundary import backup_rebuild_rows, private_destination
 from .store import Store, utc_now_iso
@@ -46,39 +47,39 @@ _DERIVED_TABLES = (
 )
 
 
+def _transcript_version(file_path: str | None):
+    """Return readable regular-file metadata without reading transcript bytes."""
+    if not (file_path or '').strip():
+        return None
+    fd = None
+    try:
+        fd = os.open(file_path, os.O_RDONLY | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _transcript_exists(file_path: str | None) -> bool:
-    """Whether this session's transcript is still readable on disk.
-
-    A blank path is NOT "exists". ``Path("").exists()`` is True — it resolves
-    to the current directory — so asking the naive question about a session
-    with no recorded path answers "the transcript is still there", and the wipe
-    below then deletes its incidents. That is the dangerous direction, and it
-    is the failure this whole module exists to prevent.
-
-    Everything unprovable fails toward PRESERVATION. The cost of being wrong
-    that way is a row kept that did not need keeping; the cost of being wrong
-    the other way is evidence destroyed permanently, silently, and looking like
-    a clean rebuild while it happens.
-    """
-    if not (file_path or "").strip():
-        return False
-    return Path(file_path).exists()
+    return _transcript_version(file_path) is not None
 
 
-def _orphaned_sessions(store: Store) -> list[dict]:
-    """Sessions whose transcript file is gone — the only unrebuildable rows."""
-    return [
-        dict(r)
-        for r in store.query("SELECT * FROM sessions")
-        if not _transcript_exists(r["file_path"])
-    ]
+def _orphaned_sessions(store: Store, exists=_transcript_exists) -> list[dict]:
+    """Preserve when a readable regular transcript cannot be established."""
+    return [dict(r) for r in store.query('SELECT * FROM sessions') if not exists(r['file_path'])]
 
 
 def _marks(values) -> str:
     return ", ".join("?" for _ in values)
 
 
-def _scan_retention(store: Store, orphan_files: set[str]) -> dict:
+def _scan_retention(store: Store, orphan_files: set[str], history_files: set[str], exists=_transcript_exists,
+                    measurement_scan_ids=()) -> dict:
     """Split scan measurement rows into rebuildable and unrecoverable.
 
     Observations and manifests are an audit ledger, like ``runs``, and are
@@ -91,10 +92,12 @@ def _scan_retention(store: Store, orphan_files: set[str]) -> dict:
     from .scan_observations import require_schema
 
     require_schema(store)
-    paths = store.query("SELECT DISTINCT transcript_id, session_file FROM scan_observations")
-    live = {r["transcript_id"] for r in paths if _transcript_exists(r["session_file"])}
+    paths = store.query("SELECT id, transcript_id, session_file FROM scan_observations")
+    live = {r["transcript_id"] for r in paths if exists(r["session_file"])}
     orphans = sorted({r["transcript_id"] for r in paths} - live)
-    orphan_set = set(orphans)
+    preserved = sorted(set(orphans) | {r['transcript_id'] for r in paths
+                       if r['session_file'] in history_files or r['id'] in measurement_scan_ids})
+    orphan_set = set(preserved)
 
     def split(sql: str) -> tuple[int, int]:
         rows = store.query(sql)
@@ -119,8 +122,9 @@ def _scan_retention(store: Store, orphan_files: set[str]) -> dict:
     links_kept = sum(r["n"] for r in link_rows if r["session_file"] in orphan_files)
     return {
         "orphan_transcripts": orphans,
+        "preserved_transcripts": preserved,
         "preserved_counts": {
-            "scan_transcripts": len(orphans),
+            "scan_transcripts": len(preserved),
             "scan_observations": store.query_one("SELECT COUNT(*) AS n FROM scan_observations")["n"],
             "scan_lines": lines_kept,
             "scan_occurrences": occ_kept,
@@ -168,7 +172,7 @@ def _scan_export(store: Store, scan: dict) -> dict:
 
 
 def _delete_scan_projections(store: Store, scan: dict, orphan_files: set[str]) -> None:
-    orphans = scan["orphan_transcripts"]
+    orphans = scan["preserved_transcripts"]
     files = tuple(orphan_files)
     if files:
         store.conn.execute(
@@ -223,26 +227,12 @@ def rebuild_state(
 def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, reason: str) -> dict:
     """Read, export, verify, and delete under the caller's owned transaction."""
 
-    # Execution history is not a reproducible mining cache. Its source rows
-    # remain referenced by durable command and operation records. Until the
-    # rebuild can preserve their full dependency closure, refuse before export
-    # or deletion instead of failing halfway through on a foreign key.
-    execution_records = {}
-    from . import eval_history
-    if eval_history.available(store):
-        count=store.query_one('SELECT COUNT(*) AS n FROM eval_attempts')['n']
-        if count:execution_records['eval_attempts']=count
-    for migration, table in (('0010_dashboard_commands', 'commands'),
-                             ('0012_instruction_operations', 'instruction_operations'),
-                             ('0010_dashboard_commands', 'proposal_revisions')):
-        if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (migration,)):
-            count = store.query_one(f'SELECT COUNT(*) AS n FROM {table}')['n']
-            if count: execution_records[table] = count
-    if execution_records:
-        raise ValueError('Rebuild unavailable: retained execution history references source rows; '
-                         'selective execution-history preservation is required. Retained rows: '+str(execution_records))
-
-    orphan_sessions = _orphaned_sessions(store)
+    transcript_versions = {}
+    def exists(path):
+        if path not in transcript_versions:
+            transcript_versions[path] = _transcript_version(path)
+        return transcript_versions[path] is not None
+    orphan_sessions = _orphaned_sessions(store, exists)
     orphan_files = {s["file_path"] for s in orphan_sessions}
     orphan_incidents = [
         dict(r)
@@ -258,7 +248,9 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
     has_scan = bool(
         store.query_one("SELECT name FROM schema_migrations WHERE name = ?", (SCAN_MIGRATION,))
     )
-    scan = _scan_retention(store, orphan_files) if has_scan else None
+    if has_scan:
+        from .scan_observations import require_schema
+        require_schema(store)
     from .rule_revisions import MIGRATION as AVAILABILITY_MIGRATION, TABLES as AVAILABILITY_TABLES, require_schema as require_availability
     has_availability = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (AVAILABILITY_MIGRATION,)))
     if has_availability:
@@ -267,17 +259,54 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
     has_inventory = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (instruction_inventory.MIGRATION,)))
     if has_inventory:
         instruction_inventory.require_schema(store)
+    from . import instruction_text
+    has_text = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (instruction_text.MIGRATION,)))
+    if has_text:
+        instruction_text.require_schema(store)
+    from . import queue_history
+    has_queue = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (queue_history.MIGRATION,)))
+    if has_queue:
+        queue_history.require_schema(store)
+    queue_keys = {'queue_processing': 'event_id', 'queue_events': 'seq'}
+    queue_before = {t: store.query('SELECT * FROM '+t+' ORDER BY '+queue_keys.get(t, 'id'))
+                    for t in queue_history.TABLES} if has_queue else {}
+    from .rebuild_history import plan_history, delete_unretained
+    history = plan_history(store)
+    initial_counts = {t: store.query_one('SELECT COUNT(*) n FROM '+t)['n'] for t in history['tables']}
+    history_files = {r['file_path'] for r in history['kept']['sessions']}
+    preserved_files = orphan_files | history_files
+    extras = {'sessions': {(r['file_path'],) for r in orphan_sessions},
+              'incidents': {(r['id'],) for r in orphan_incidents}}
+    source_keys = {t: keys | extras.get(t, set()) for t, keys in history['source_keys'].items()}
+    kept_sessions = [r for r in history['rows']['sessions'] if (r['file_path'],) in source_keys['sessions']]
+    kept_incidents = [r for r in history['rows']['incidents'] if (r['id'],) in source_keys['incidents']]
+    scan = _scan_retention(store, preserved_files, history_files, exists,
+                           history['measurement_scan_ids']) if has_scan else None
     derived_tables=tuple(t for t in _DERIVED_TABLES if t!='mining_history' or has_history)
     counts = {
         t: store.query_one(f"SELECT COUNT(*) AS n FROM {t}")["n"]
         for t in derived_tables
     }
+    for table in derived_tables:
+        if table in source_keys:
+            counts[table] = len(history['rows'][table]) - len(source_keys[table])
+    fingerprints = store.query('SELECT * FROM error_fingerprints')
+    deleted_fingerprints = [r for r in fingerprints if r['session_file'] not in preserved_files]
+    counts['error_fingerprints'] = len(deleted_fingerprints)
+    kept_learning_ids = {key[0] for key in source_keys['learnings']}
+    deleted_embeddings = [r for r in store.query("SELECT owner_kind,owner_key,model FROM embeddings WHERE owner_kind='learning'")
+                          if r['owner_key'] not in kept_learning_ids]
+    counts['embeddings'] = len(deleted_embeddings)
+    from .project_measurements import MIGRATION as MEASUREMENT_MIGRATION, PROFILE as MEASUREMENT_PROFILE
+    has_measurements = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (MEASUREMENT_MIGRATION,)))
+    if has_measurements:
+        counts['project_stats'] = store.query_one('SELECT COUNT(*) n FROM project_stats WHERE record_type<>?', (MEASUREMENT_PROFILE,))['n']
     counts["sessions"] = (
-        store.query_one("SELECT COUNT(*) AS n FROM sessions")["n"] - len(orphan_sessions)
+        store.query_one("SELECT COUNT(*) AS n FROM sessions")["n"] - len(kept_sessions)
     )
     counts["incidents"] = (
         store.query_one("SELECT COUNT(*) AS n FROM incidents")["n"]
-        - len(orphan_incidents)
+        - len(kept_incidents)
     )
     if scan is not None:
         counts.update(scan["delete_counts"])
@@ -286,12 +315,17 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         "dry_run": dry_run,
         "reason": reason,
         "preserved": {
-            "sessions": len(orphan_sessions),
-            "incidents": len(orphan_incidents),
+            **{t: len(keys) for t, keys in source_keys.items()},
+            'error_fingerprints': len(fingerprints) - len(deleted_fingerprints),
+            'embeddings': store.query_one('SELECT COUNT(*) n FROM embeddings')['n'] - len(deleted_embeddings),
             **(scan["preserved_counts"] if scan is not None else {}),
         },
         "would_delete" if dry_run else "deleted": counts,
         "export_path": str(export_path),
+        'retention': {'orphaned_transcripts': len(orphan_sessions),
+                      'orphaned_incidents': len(orphan_incidents),
+                      'execution_history': history['counts'], 'reasons': history['reasons'],
+                      'measurement_scan_observations': sorted(history['measurement_scan_ids'])},
     }
     # Zero orphans on a populated corpus is legitimate (every transcript still
     # exists) AND is byte-for-byte what a broken orphan check looks like. The
@@ -299,7 +333,7 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
     # outcomes are identical — so the suspicious combination says so rather
     # than being left for the operator to infer.
     total_sessions = store.query_one("SELECT COUNT(*) AS n FROM sessions")["n"]
-    if total_sessions and not orphan_sessions:
+    if total_sessions and not kept_sessions:
         stats["warning"] = (
             f"zero orphan sessions found across {total_sessions} sessions, so "
             "NOTHING will be preserved. That is correct if every transcript is "
@@ -315,12 +349,17 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         "exported_at": utc_now_iso(),
         "reason": reason,
         "note": (
-            "These rows' transcripts no longer exist on disk. window_json is "
-            "the only surviving evidence for them and cannot be re-derived."
+            'Preserved orphan windows and execution-history source dependencies. '
+            'The retention report distinguishes their reasons; history may pin live transcripts.'
         ),
-        "sessions": orphan_sessions,
-        "incidents": orphan_incidents,
+        'sessions': kept_sessions,
+        'incidents': kept_incidents,
+        'execution_history': history['kept'],
+        'retention': stats['retention'],
+        'error_fingerprints': [r for r in fingerprints if r['session_file'] in preserved_files],
     }
+    if has_queue:
+        payload['queue_history'] = queue_before
     if has_history:
         payload['mining_history']=store.query('SELECT * FROM mining_history ORDER BY created_at,id')
     if scan is not None:
@@ -332,30 +371,100 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
                                         for table in AVAILABILITY_TABLES}
     if has_inventory:
         payload['instruction_inventories'] = store.query('SELECT * FROM instruction_inventories ORDER BY id')
+    if has_text:
+        payload['instruction_text_archives'] = store.query('SELECT * FROM instruction_text_archives ORDER BY id')
+    from .session_context import MIGRATION as CONTEXT_MIGRATION, TABLES as CONTEXT_TABLES
+    if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (CONTEXT_MIGRATION,)):
+        # Retain native context with the original scan observations. Rebuilding
+        # derived lines must not erase the only surviving creation/scope evidence.
+        payload['session_context'] = {table: store.query(f'SELECT * FROM {table} ORDER BY observation_id')
+                                      for table in CONTEXT_TABLES}
+    from .native_loads import MIGRATION as NATIVE_MIGRATION
+    if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (NATIVE_MIGRATION,)):
+        payload['native_load_reports'] = store.query('SELECT * FROM native_load_reports ORDER BY received_at,id')
+    if has_measurements:
+        payload['project_measurements'] = store.query('SELECT * FROM project_stats WHERE record_type=? ORDER BY observed_at,id', (MEASUREMENT_PROFILE,))
+    from .rule_families import MIGRATION as FAMILY_MIGRATION, TABLES as FAMILY_TABLES, family_snapshot
+    if store.query_one('SELECT name FROM schema_migrations WHERE name=?', (FAMILY_MIGRATION,)):
+        # Display membership is historical evidence, not an active learning FK.
+        for row in store.query('SELECT id FROM rule_family_snapshots ORDER BY generation'):
+            family_snapshot(store, row['id'])
+        payload['rule_families'] = {
+            table: store.query(f'SELECT * FROM {table} ORDER BY ' +
+                               ({'rule_family_snapshots':'generation', 'rule_family_members':'snapshot_id,learning_id', 'rule_family_heads':'profile'}[table]))
+            for table in FAMILY_TABLES}
+    if scan is not None and set(scan['preserved_transcripts']) != set(scan['orphan_transcripts']):
+        retained_scan = {**scan, 'orphan_transcripts': scan['preserved_transcripts']}
+        retained_export = _scan_export(store, retained_scan)
+        payload['execution_scan_projections'] = {k: v for k, v in retained_export.items() if k.startswith('orphan_')}
+    payload['learning_embeddings'] = [r for r in store.query("SELECT * FROM embeddings WHERE owner_kind='learning'")
+                                      if r['owner_key'] in kept_learning_ids]
+    payload['execution_audit'] = {
+        table: store.query('SELECT * FROM '+table)
+        for table in ('runs', 'llm_calls', 'execution_policies', 'execution_policy_events',
+                      'project_identity_cache', 'scan_working_copies') if table in history['tables']}
     manifest = backup_rebuild_rows(payload, export_path)
     stats["backup_sha256"] = manifest["sha256"]
+    # A backup may take time. Refuse if a source counted as reconstructible
+    # changed or disappeared before deletion; the verified backup remains.
+    for path, version in transcript_versions.items():
+        if version is not None and _transcript_version(path) != version:
+            raise ValueError('Transcript changed during rebuild backup: '+path)
 
     # Scan links reference incidents, so they go before any incident delete.
     if scan is not None:
-        _delete_scan_projections(store, scan, orphan_files)
+        _delete_scan_projections(store, scan, preserved_files)
     for table in derived_tables:
-        store.conn.execute(f"DELETE FROM {table}")
-    # Learning vectors point at ids that are about to stop existing. Rule-unit
-    # vectors are keyed by file+text and stay valid, so they are kept.
-    store.conn.execute("DELETE FROM embeddings WHERE owner_kind = 'learning'")
-
-    if orphan_files:
-        marks = ", ".join("?" for _ in orphan_files)
-        store.conn.execute(
-            f"DELETE FROM incidents WHERE session_file NOT IN ({marks})",
-            tuple(orphan_files),
-        )
-        store.conn.execute(
-            f"DELETE FROM sessions WHERE file_path NOT IN ({marks})",
-            tuple(orphan_files),
-        )
-    else:
-        store.conn.execute("DELETE FROM incidents")
-        store.conn.execute("DELETE FROM sessions")
-
+        if table == 'project_stats' and has_measurements:
+            store.conn.execute('DELETE FROM project_stats WHERE record_type<>?', (MEASUREMENT_PROFILE,))
+        elif table in source_keys:
+            deleted = delete_unretained(store, history, table)
+            if deleted != counts[table]:
+                raise ValueError('Rebuild count changed for '+table)
+        elif table == 'error_fingerprints':
+            store.conn.executemany('DELETE FROM error_fingerprints WHERE fingerprint=? AND session_file=?',
+                                   [(r['fingerprint'], r['session_file']) for r in deleted_fingerprints])
+        else:
+            store.conn.execute(f"DELETE FROM {table}")
+    # Preserve vectors for surviving learning IDs. Other learning vectors are stale.
+    store.conn.executemany('DELETE FROM embeddings WHERE owner_kind=? AND owner_key=? AND model=?',
+                           [(r['owner_kind'], r['owner_key'], r['model']) for r in deleted_embeddings])
+    for table in ('incidents', 'sessions'):
+        deleted = delete_unretained(store, history, table, extra_keys=extras[table])
+        if deleted != counts[table]:
+            raise ValueError('Rebuild count changed for '+table)
+    store.check_foreign_keys()
+    if has_queue:
+        # Every deleted incident appends a removal, including terminal members
+        # with zero occupancy delta. No preserved queue record may change.
+        old_seq = max((r['seq'] for r in queue_before['queue_events']), default=0)
+        appended = store.query('SELECT * FROM queue_events WHERE seq>? ORDER BY seq', (old_seq,))
+        deleted_incidents = {r['id']: r for r in history['rows']['incidents']
+                             if (r['id'],) not in source_keys['incidents']}
+        if (len(appended) != len(deleted_incidents) or
+                {r['incident_id'] for r in appended} != set(deleted_incidents) or
+                any(r['operation'] != 'delete' or r['new_status'] is not None or
+                    r['old_status'] != deleted_incidents[r['incident_id']]['status'] or
+                    r['queue_delta'] != -int(r['old_status'] == 'new') or r['seq'] != old_seq+i+1
+                    for i, r in enumerate(appended))):
+            raise ValueError('Rebuild queue removal history differs from planned deletion')
+        for table, expected_rows in queue_before.items():
+            actual_rows = store.query('SELECT * FROM '+table +
+                (' WHERE seq<=?' if table == 'queue_events' else '') +
+                ' ORDER BY '+queue_keys.get(table, 'id'),
+                (old_seq,) if table == 'queue_events' else ())
+            if actual_rows != expected_rows:
+                raise ValueError('Rebuild changed retained queue history: '+table)
+    for table, before_count in initial_counts.items():
+        actual = store.query_one('SELECT COUNT(*) n FROM '+table)['n']
+        added = counts['incidents'] if has_queue and table == 'queue_events' else 0
+        if actual != before_count - counts.get(table, 0) + added:
+            raise ValueError('Rebuild count differs from plan for '+table)
+    for table, expected in history['kept'].items():
+        columns = history['keys'][table]
+        for row in expected:
+            actual = store.query_one('SELECT * FROM '+table+' WHERE '+' AND '.join(c+'=?' for c in columns),
+                                     tuple(row[c] for c in columns))
+            if actual != row:
+                raise ValueError('Rebuild changed retained '+table+' record '+repr(tuple(row[c] for c in columns)))
     return stats

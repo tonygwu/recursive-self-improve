@@ -261,7 +261,7 @@ def test_every_fetch_names_the_get_method(js_text: str):
 def test_app_js_declares_only_the_endpoints_the_product_has(js_text: str):
     """Collection routes and parameterized resource routes are explicit."""
     urls = set(re.findall(r"""["'](/api/[a-z0-9/_-]+)["']""", js_text))
-    assert urls == {"/api/overview", "/api/rules", "/api/projects", "/api/review-queue", "/api/commands", "/api/review-preview", "/api/operations", "/api/incidents", "/api/runs", "/api/incident-rate", "/api/eval-attempts", "/api/eval-results", "/api/eval-health"}, (
+    assert urls == {"/api/overview", "/api/rules/browse", "/api/projects", "/api/review-queue", "/api/commands", "/api/review-preview", "/api/operations", "/api/incidents", "/api/runs", "/api/incident-rate", "/api/eval-attempts", "/api/eval-results", "/api/eval-health", "/api/class-evidence", "/api/quality-preview", "/api/quality-samples", "/api/project-measurements/", "/api/rules/", "/api/rule-families/", "/api/evidence", "/api/learnings/", "/api/proposals/"}, (
         f"app.js fetches an unexpected endpoint set: {sorted(urls)}"
     )
     code = _strip_js_comments(js_text)
@@ -281,9 +281,16 @@ def test_app_js_declares_only_the_endpoints_the_product_has(js_text: str):
 
 
 def test_app_js_contains_no_countdown(js_text: str):
-    """The backlog is a race between two rates. The queue grows, so a drain
-    date would be fiction (PRD section 7, V1)."""
-    code = _strip_js_comments(js_text).lower()
+    """Only the v2 retained Run comparison may show a conditional drain scenario.
+
+    test_queue_history and test_run_backlog exercise compatible windows and the
+    growing/unknown cases. Every other view keeps the original V1 guard.
+    """
+    before, renderer = js_text.split('export function renderRunBacklog(entry) {')
+    renderer, after = renderer.split('export async function loadRunBacklog() {')
+    assert 'data.rates' in renderer and 'only if these observed rates continue' in renderer
+    assert 'data.scenario.days' in renderer
+    code = _strip_js_comments(before + after).lower()
     assert "drain" not in code, "app.js code mentions draining the queue"
     assert "nights_to" not in code and "eta" not in re.findall(r"\b\w+\b", code), (
         "app.js code names a countdown"
@@ -544,6 +551,11 @@ globalThis.document = {
   documentElement: root,
   activeElement: null,
   getElementById: (id) => elements.get(id) || null,
+  querySelectorAll: (selector) => {
+    const attribute = selector.match(/^\[(data-[\w-]+)\]$/)?.[1];
+    if (!attribute) throw new Error("Unsupported Document selector: " + selector);
+    return [...elements.values()].filter(element => element.getAttribute(attribute) !== null);
+  },
   // Recording stub: the app scrolls and focuses the selected card, and a
   // highlight the operator cannot see is the bug this exists to catch.
   querySelector: (sel) => {
@@ -577,7 +589,7 @@ globalThis.localStorage = {
 const fetchCalls = [];
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url, init });
-  const broken = mode === "fail" && url === "/api/rules";
+  const broken = mode === "fail" && url === "/api/rules/browse";
   if (broken) return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
   if (url.startsWith('/api/commands?')) {
     return { ok: true, status: 200, json: async () => ({ commands: [], next_cursor: null, more_available: false }) };
@@ -704,14 +716,14 @@ const OVERVIEW = {
   failures: {
     open: [{ class: "parse_error", name: "No answer we could read", explanation: "The model's reply was not the JSON contract we asked for.", has_copy: true, stages: ["mine_agentic"], total: 17, recent: 17, recent_window_days: 7, recent_window_from: "2026-08-12", last_seen: { run_id: "b", started: "2026-08-18T00:00:00Z", count: 17 }, status: "open" }],
     quiet: [],
-    fixed: [{ class: "IntegrityError", name: "Duplicate evidence link", explanation: "Two mine attempts tried to link the same incident to the same learning.", has_copy: true, stages: ["mine"], total: 8, recent: 0, recent_window_days: 7, recent_window_from: "2026-08-12", last_seen: null, status: "fixed", fixed_at: "2026-08-16T10:56:04Z", fix_commit: "cfd6410", fix: "linking is idempotent" }],
+    fixed: [{ class: "IntegrityError:unique:incident_learnings", name: "A database constraint rejected a write", explanation: "SQLite refused the recorded incident-learning constraint.", has_copy: true, stages: ["mine"], total: 8, recent: 0, recent_window_days: 7, recent_window_from: "2026-08-12", last_seen: null, status: "fixed", fixed_at: "2026-08-16T10:56:04Z", fix_commit: "cfd6410b5469b2e2c718c16c1c042e2f1c3f123a", fix: "linking is idempotent" }],
     regressed: [],
     unknown_classes: [],
     not_failures: [{ class: "budget_exhausted", count: 64, why: "incidents the run's cap never reached" }],
     llm_by_stage: {},
     success_outcomes: ["ok", "oauth_transient_retried", "parse_recovered"],
     latest_run_day: "2026-08-18",
-    note: "Nothing was lost — every failed incident stays queued and is retried."
+    note: "Stage taxonomy entries and call outcomes can overlap; these are not unique incidents."
   },
   gate: {
     eval_rows_total: 10, proposal_evals: 2, seed_evals: 7, learning_subject_evals: 1,
@@ -772,7 +784,7 @@ const RULE_ONE = {
     incidents_shown: 1, incidents_total: 4, incidents_cut: 3,
     cut_reason: "evidence sample capped at 5 incidents per rule"
   },
-  enforcement_gap: { violated_existing_rule: "", flagged: false, label: "No prior rule violation was recorded" }
+  enforcement_gap: { violated_existing_rule: "", flagged: false, label: "No violation report was retained. Prior rule receipt and violation are unknown." }
 };
 
 const RULE_TWO = {
@@ -789,7 +801,7 @@ const RULE_TWO = {
             class: "inconclusive", label: "The scenarios disagreed", why: "the majority gate's scenarios disagreed" }
   }],
   target_summary: "/Users/example/.codex/AGENTS.md",
-  enforcement_gap: { violated_existing_rule: "Never accept-and-guess", flagged: true, label: "Written but ignored — a rule already covered this" }
+  enforcement_gap: { violated_existing_rule: "Never accept-and-guess", flagged: true, label: "The miner reported an existing rule. Agent receipt and violation are unverified." }
 };
 
 const RULE_THREE = {
@@ -852,7 +864,7 @@ const PROJECTS = {
       exposure: { rate_per_100k: 75.8, occurrences: 1895, eligible_lines: 2500000, computable: true, coverage: {coverage_complete: false} },
       top_signal: { signal_type: "repeated_error", count: 1200, tied_with: [], tie_break: "highest count, then the alphabetically first signal_type" },
       signals: { repeated_error: 1200, friction_loop: 695 },
-      rules_written_here: 2, rules_received: 0, rules_received_detail: [],
+      rules_written_here: 2, rules_applied_here: 1, rules_received: 0, rules_received_detail: [],
       context_weight: WEIGHT_OK, context_path: "/a",
       context_path_reason: "the working copy with the most sessions that is still on disk",
       benefit: BENEFIT
@@ -865,7 +877,7 @@ const PROJECTS = {
       exposure: { rate_per_100k: null, occurrences: null, eligible_lines: null, computable: false, reason_text: "No physical-line observations are recorded for this scope." },
       top_signal: { signal_type: "friction_loop", count: 12, tied_with: [], tie_break: "highest count" },
       signals: { friction_loop: 12 },
-      rules_written_here: 0, rules_received: 0, rules_received_detail: [],
+      rules_written_here: 0, rules_applied_here: 0, rules_received: 0, rules_received_detail: [],
       context_weight: { ...WEIGHT_OK, has_instruction_files: false, files: [], file_count: 0, total_bytes: 0, always_loaded_bytes: 0 },
       context_path: "/c", context_path_reason: "the only working copy on disk", benefit: BENEFIT
     },
@@ -874,7 +886,7 @@ const PROJECTS = {
       key_method: "unresolved", key_methods: ["unresolved"], sessions: 8, clones: 1,
       clone_paths: ["/"], clones_on_disk: 1, lines_scanned: 0, incidents: 0,
       exposure: { rate_per_100k: null, computable: false, reason_text: "Version unknown" },
-      top_signal: null, signals: {}, rules_written_here: 0, rules_received: 0,
+      top_signal: null, signals: {}, rules_written_here: 0, rules_applied_here: 0, rules_received: 0,
       rules_received_detail: [],
       context_weight: { value: "—", computable: false, reason: "not measured" },
       context_path: "", context_path_reason: "none", benefit: BENEFIT
@@ -961,7 +973,7 @@ OVERVIEW.status_line.text = OVERVIEW.status_line.text.replace(
 
 const PAYLOAD = {
   "/api/overview": OVERVIEW,
-  "/api/rules": RULES,
+  "/api/rules/browse": RULES,
   "/api/projects": PROJECTS,
   "/api/review-queue": REVIEW,
 };
@@ -1079,7 +1091,8 @@ if (mode === "ok") {
     ["ok", "partial", "running", "skipped", "refused", "unreadable"].forEach((state) => {
       expect(legend.indexOf('data-state="' + state + '"') !== -1, "legend omits " + state);
     });
-    expect(legend.indexOf("unmapped") !== -1, "legend does not flag the unmapped states");
+    expect(legend.indexOf("Outcome unknown (unreadable)") !== -1, "legend does not explain the unreadable outcome");
+    expect(legend.indexOf("unmapped") === -1, "legend exposes rendering jargon");
   });
 
   check("run_grid_footnote_states_the_two_caveats", () => {
@@ -1149,7 +1162,8 @@ if (mode === "ok") {
     expect(text.indexOf("1,863") !== -1, "queued is missing");
     expect(text.indexOf("80") !== -1, "capacity is missing");
     expect(text.indexOf("125.5") !== -1, "arrival rate is missing");
-    expect(text.indexOf("+45.5") !== -1, "net rate is missing");
+    expect(text.indexOf("+45.5") === -1, "model-call slots must not create an incident net rate");
+    expect(text.indexOf("calls per run") !== -1, "capacity unit is missing");
     expect(text.toLowerCase().indexOf("drain") === -1, "the backlog names a drain");
     expect(/\bin \d+ (nights|days)\b/.test(text) === false, "the backlog states a countdown");
     expect(text.indexOf("signal_then_recent") !== -1, "the queue order is not stated");
@@ -1191,7 +1205,7 @@ if (mode === "ok") {
     const inbox = el("ov-inbox").html();
     expect(inbox.indexOf(REVIEW.count + " items waiting on you") !== -1,
       "the queue line is missing: " + inbox);
-    expect(inbox.indexOf("3 auto-applicable, blocked by --review-only") !== -1, "the blocker is not named");
+    expect(inbox.indexOf(REVIEW.auto_apply_pending + " passing proposals await automatic delivery") !== -1, "automatic delivery is not separate from review");
     expect(inbox.indexOf('data-state="unknown_status"') !== -1, "an unknown proposal status was not flagged");
     expect(el("nav-inbox-count").textContent === String(REVIEW.count),
       "the nav count reads " + el("nav-inbox-count").textContent);
@@ -1202,7 +1216,7 @@ if (mode === "ok") {
     expect(failures.indexOf("No answer we could read") !== -1, "the open failure is missing");
     expect(failures.indexOf("failure--fixed") !== -1, "the fixed failure is not muted");
     expect(failures.indexOf("budget_exhausted") !== -1, "budget keys are not reported");
-    expect(failures.indexOf("Nothing was lost") !== -1, "the reassurance the panel needs is missing");
+    expect(failures.indexOf("not unique incidents") !== -1, "the counting limitation is missing");
   });
 
   check("rules_table_renders_one_row_per_rule", () => {
@@ -1347,7 +1361,7 @@ if (mode === "ok") {
   check("enforcement_gap_flag_shows_on_the_rule_that_has_one", () => {
     el("main").dispatch("click", { target: rowTarget({ "data-rule-id": "b2222222" }) });
     const body = el("inspector-body").html();
-    expect(body.indexOf("Written but ignored") !== -1, "the enforcement gap is not flagged");
+    expect(body.indexOf("Reported violation") !== -1, "the enforcement gap is not flagged");
     expect(body.indexOf("Never accept-and-guess") !== -1, "the rule that was violated is not named");
   });
 
@@ -1355,7 +1369,7 @@ if (mode === "ok") {
     const html = el("projects-tbody").html();
     const rows = (html.match(/<tr data-project-key="/g) || []).length;
     expect(rows === 3, "expected 3 repo rows, saw " + rows);
-    expect(html.indexOf("2 clones") !== -1, "the clones affordance is missing");
+    expect(html.indexOf("2 paths") !== -1, "the clones affordance is missing");
     expect(el("projects-foot").html().indexOf("collapsed from 4 working copies") !== -1,
       "the footer does not say what was collapsed");
   });
@@ -1392,7 +1406,7 @@ if (mode === "ok") {
   check("context_column_shows_observed_bytes_without_session_claims", () => {
     const html_ = el("projects-tbody").html();
     expect(html_.includes('16.0 kB</span><span class="caption muted"> observed'), 'observed bytes missing');
-    expect(html_.includes('2 physical files observed at 2030-01-01'), 'observation time missing');
+    expect(html_.includes('2 instruction sources observed at 2030-01-01'), 'observation time missing');
     expect(!html_.includes('loads into every session'), 'invented session receipt');
     expect(html_.includes('0 B'), 'observed empty inventory is not numeric zero');
   });
@@ -1409,11 +1423,11 @@ if (mode === "ok") {
       totals:{files:2,bytes:16000},context:{meaning:"Observed profile; session loading unverified",groups:[{provider:"claude",origin:"all",files:2,observed_bytes:16000,startup_bytes:12000,conditional_bytes:0,on_demand_bytes:4000,unresolved_bytes:0}]},
       files:WEIGHT_OK.files.map(f=>({...f,aliases:[f.path, "/fixture/CLAUDE.md"],loading_paths:[{provider:"claude",origin:"project",scope:{kind:f.always_loaded?"project_always_loaded":"on_demand"},conditions:[],import_chain:[],path:f.path,eligible_prefix_bytes:f.bytes}]}))
     }],count:1};
-    el("main").dispatch("click", { target: rowTarget({ "data-project-key": "github:1000000001", "data-focus": "context" }) });
+    el("main").dispatch("click", { preventDefault() {}, target: rowTarget({ "data-project-key": "github:1000000001", "data-focus": "context" }) });
     const body = el("project-detail-body").html();
     expect(el("project-detail").visible() && !el("inspector").visible(), "project context did not use the dedicated page");
     expect(body.includes("Startup candidates"), "startup candidates missing");
-    expect(body.includes("On-demand skill bodies"), "skill body budget missing");
+    expect(body.includes("On-demand skill and command bodies"), "on-demand body budget missing");
     expect(!body.includes("every session"), "invented session receipt");
     expect(body.indexOf("12.0 kB") !== -1, "the always-loaded byte count is missing");
   });
@@ -1426,7 +1440,7 @@ if (mode === "ok") {
   });
 
   check("the_clones_chip_opens_the_working_copies_tab", () => {
-    el("main").dispatch("click", {
+    el("main").dispatch("click", { preventDefault() {},
       target: rowTarget({ "data-project-key": "github:1000000001", "data-focus": "copies" }),
     });
     const body = el("project-detail-body").html();
@@ -1770,6 +1784,22 @@ if (mode === "ok") {
     } finally {
       app.state.review = saved;
       app.paintReview();
+    }
+  });
+
+  check("current_failure_count_includes_recent_post_fix_records_only", () => {
+    const saved = app.state.overview;
+    const row = {class:'IntegrityError:unique:incident_learnings',name:'Constraint rejected',
+      explanation:'Recorded constraint',has_copy:true,total:2,recent:1,stages:['mine'],status:'regressed'};
+    try {
+      app.state.overview = {...saved, failures:{open:[{...row,class:'timeout',status:'open',recent:2}],
+        regressed:[row,{...row,class:'old-only',recent:0}],quiet:[],fixed:[],not_failures:[],latest_run_day:'2030-01-15'}};
+      app.paintOverview();
+      expect(el('ov-failures-meta').textContent === '2 recent classes',
+        'current failure summary disagrees with the recent classes: '+el('ov-failures-meta').textContent);
+    } finally {
+      app.state.overview = saved;
+      app.paintOverview();
     }
   });
 
@@ -2167,6 +2197,183 @@ if (mode === "ok") {
   });
 
 
+
+  async function withReviewReadFixture(fn, legacy = false) {
+    const names = ["review", "route", "reviewPreviews", "reviewMembers", "reviewExcluded", "reviewIndividual", "deciding", "decided", "commandRequests", "selectedFamily", "dashboardErrors"];
+    const saved = Object.fromEntries(names.map(name => [name, app.state[name]]));
+    const originalFetch = globalThis.fetch;
+    const queue = structuredClone(REVIEW), posts = [];
+    const fullRevisions = Object.fromEntries(queue.families.flatMap(f => f.proposals).map(p => [p.id, p.revision]));
+    if (!legacy) for (const p of queue.families.flatMap(f => f.proposals)) {
+      p.content_revision = (p.id === "P1" ? "e" : "f").repeat(64); delete p.revision;
+    }
+    const fixture = {queue, posts, reads:0, delay:null, mismatch:false};
+    Object.assign(app.state, {review:queue, route:"overview", reviewPreviews:{}, reviewMembers:{}, reviewExcluded:{}, reviewIndividual:{L1:true}, deciding:{}, decided:{}, commandRequests:{}, selectedFamily:"L1", dashboardErrors:new Map()});
+    globalThis.fetch = async (url, init) => {
+      if (url === "/api/review-queue") return {ok:true, json:async()=>structuredClone(queue)};
+      if (url.startsWith("/api/review-preview?")) {
+        fixture.reads++;
+        const ids = new URL("http://localhost" + url).searchParams.get("proposal_ids").split(",");
+        const data = {ready:true, revision:"d".repeat(64), targets:[], members:queue.families.flatMap(f=>f.proposals).filter(p=>ids.includes(p.id)).map(p=>({
+          proposal_id:p.id, revision:fixture.reads > 1 && !legacy ? "9".repeat(64) : fullRevisions[p.id],
+          content_revision:fixture.mismatch ? "0".repeat(64) : p.content_revision,
+          snapshot:{proposal:p, evidence:[{id:"retained",signal_type:"correction",matched_text:"Complete retained explanation",window_json:"[]"}], evaluation:null}
+        }))};
+        if (fixture.delay) await fixture.delay;
+        return {ok:true, json:async()=>data};
+      }
+      if (url === "/api/commands" && init?.method === "POST") posts.push(JSON.parse(init.body));
+      return originalFetch(url, init);
+    };
+    try {return await fn(fixture);} finally {globalThis.fetch=originalFetch;Object.assign(app.state,saved);}
+  }
+
+  await checkAsync("pending_decision_stays_disabled_until_refusal_refresh_finishes", () => withReviewReadFixture(async f => {
+    const family=f.queue.families[0];
+    await app.loadReviewPreview(family);
+    const originalFetch=globalThis.fetch;
+    let release, entered, posts=0;
+    const held=new Promise(resolve=>{release=resolve;});
+    const refreshing=new Promise(resolve=>{entered=resolve;});
+    globalThis.fetch=async(url,init)=>{
+      if(url==="/api/commands" && init?.method==="POST") {
+        posts++;
+        return {ok:false,status:409,json:async()=>({detail:"Held refusal"})};
+      }
+      if(url==="/api/review-queue"){entered();await held;}
+      return originalFetch(url,init);
+    };
+    const pending=app.decideFamily("L1","reject_target");
+    try {
+      await refreshing;
+      const actions=app.renderReviewActions(family);
+      expect((actions.match(/data-decision="[^"]+"[^>]* disabled/g) || []).length===3,
+        "decisions appear enabled while refusal refresh is pending: "+actions);
+      expect(el("review-body").html().includes("Processing this decision"),
+        "starting a decision did not render its visible pending status");
+      expect((await app.decideFamily("L1","approve")).skipped==="in flight" && posts===1,
+        "a pending decision sent a duplicate command");
+    } finally {release();await pending;globalThis.fetch=originalFetch;}
+    await app.loadReviewPreview(app.state.review.families[0]);
+    expect(!app.state.deciding.L1 && !app.renderReviewActions(app.state.review.families[0]).includes("disabled"),
+      "decision controls did not recover after refusal refresh");
+    expect(posts===1,"refusal recovery submitted another command");
+  }));
+
+  await checkAsync("queue_content_hashes_bind_preview_but_decisions_send_full_revisions", () => withReviewReadFixture(async f => {
+    const family=f.queue.families[0];app.state.reviewExcluded={P2:true};
+    const entry=await app.loadReviewPreview(family);
+    expect(entry.data && !entry.error, "the retained-content queue could not load its full preview: " + entry.error);
+    expect(app.renderReviewMembers(family).includes("Complete retained explanation"), "complete selected evidence was hidden by the content binding");
+    const result=await app.decideFamily("L1","approve");
+    expect(result.ok===1 && f.posts.length===1, "the selected command was not submitted");
+    expect(f.posts[0].members[0].revision==="a".repeat(64), "content hash replaced full authorization revision");
+  }));
+
+  await checkAsync("changed_retained_content_refuses_a_selected_preview", () => withReviewReadFixture(async f => {
+    f.mismatch=true;
+    const entry=await app.loadReviewPreview(f.queue.families[0]);
+    expect(entry.error.includes("changed") && !entry.data, "changed evidence did not refuse the preview");
+    expect(Object.keys(app.state.reviewMembers).length===0, "mismatched members were published");
+    const result=await app.decideFamily("L1","reject_target");
+    expect(result.ok===0 && f.posts.length===0, "changed evidence allowed a decision");
+  }));
+
+  await checkAsync("queue_refresh_discards_full_previews_even_when_content_is_unchanged", () => withReviewReadFixture(async f => {
+    const first=await app.loadReviewPreview(f.queue.families[0]);
+    expect(first.data, "first preview missing");
+    expect(await app.refreshReviewSnapshot(), "queue refresh was not published");
+    expect(!app.state.reviewPreviews.L1 && !app.state.reviewMembers.P1, "queue refresh retained destination-dependent authorization");
+    const second=await app.loadReviewPreview(app.state.review.families[0]);
+    expect(f.reads===2 && second.data.members[0].revision==="9".repeat(64), "changed destination did not obtain a new full preview");
+  }));
+
+  for (const change of ["selection", "queue_refresh"]) {
+    await checkAsync("late_preview_after_" + change + "_cannot_publish_or_decide", () => withReviewReadFixture(async f => {
+      let release;f.delay=new Promise(resolve=>{release=resolve;});
+      const pending=app.decideFamily("L1","approve");
+      expect(f.reads===1, "the command did not start a selected preview");
+      if(change==="selection")app.state.reviewExcluded={P2:true};
+      else await app.refreshReviewSnapshot();
+      release();
+      const result=await pending;
+      expect(result.ok===0 && f.posts.length===0, "the invalidated preview sent a decision");
+      expect(Object.keys(app.state.reviewMembers).length===0, "late preview members survived invalidation");
+    }, true));
+  }
+
+  await checkAsync("overview_initial_failure_stops_loading_and_retry_has_real_progress", async () => {
+    const saved={...app.state}, original=globalThis.fetch, hash=globalThis.location.hash;
+    try {
+      globalThis.location.hash="#/overview";
+      Object.assign(app.state,{route:"overview",overview:null,dashboardErrors:new Map()});
+      el("ov-statusline").textContent="Loading…";
+      el("nav-freshness").textContent="Loading…";
+      el("ov-grid").innerHTML='<div class="loading"><span class="loading__bar"></span></div>';
+      globalThis.fetch=async url=>url===app.API.overview
+        ? {ok:false,status:503,json:async()=>({detail:"Invented initial read unavailable"})}
+        : {ok:true,json:async()=>PAYLOAD[url]};
+      await app.load();
+      expect(!el("ov-statusline").textContent.includes("Loading"),"Settled initial failure still says Loading");
+      expect(!el("nav-freshness").textContent.includes("Loading"),"Sidebar still says Loading after the initial read failed");
+      expect(!el("ov-grid").html().includes('class="loading"'),"Settled initial failure retains its skeleton");
+      expect(app.state.overview===null,"A failed read fabricated Overview values");
+      expect(el("global-error").html().includes("Invented initial read unavailable"),"Initial failure lost its cause");
+      let release;
+      globalThis.fetch=async url=>({ok:true,json:async()=>url===app.API.overview
+        ? new Promise(resolve=>{release=resolve;}) : PAYLOAD[url]});
+      const pending=app.retryDashboardReads();
+      await new Promise(resolve=>setTimeout(resolve,0));
+      expect(el("ov-statusline").textContent.includes("Loading"),"Held retry does not show pending work");
+      expect(el("ov-grid").html().includes('class="loading"'),"Held initial retry has no loading state");
+      release(OVERVIEW);await pending;
+      expect(el("ov-statusline").textContent.includes("Ran 2"),"Successful retry did not publish real values");
+      expect(!el("global-error").visible(),"Successful retry retained its error");
+      const previous=el("ov-statusline").textContent;
+      globalThis.fetch=async url=>url===app.API.overview
+        ? {ok:false,status:503,json:async()=>({detail:"Invented refresh unavailable"})}
+        : {ok:true,json:async()=>PAYLOAD[url]};
+      await app.load();
+      expect(el("ov-statusline").textContent===previous,"Failed refresh erased the prior read");
+      expect(el("ov-read-state").textContent.includes("previous"),"Retained values are not identified as previous data");
+      expect(!el("ov-grid").html().includes('class="loading"'),"Failed refresh replaced retained history with a skeleton");
+    } finally {globalThis.fetch=original;globalThis.location.hash=hash;Object.assign(app.state,saved);}
+  });
+
+  await checkAsync("overview_older_read_cannot_clear_newer_progress_or_publish_values", async () => {
+    const saved={...app.state}, original=globalThis.fetch, hash=globalThis.location.hash;
+    try {
+      globalThis.location.hash="#/overview";Object.assign(app.state,{route:"overview",overview:null});
+      const releases=[];
+      globalThis.fetch=async url=>({ok:true,json:async()=>url===app.API.overview
+        ? new Promise(resolve=>releases.push(resolve)) : PAYLOAD[url]});
+      const older=app.load(),newer=app.load();
+      await new Promise(resolve=>setTimeout(resolve,0));
+      releases[0]({...OVERVIEW,status_line:{...OVERVIEW.status_line,rules_learned_total:111}});await older;
+      expect(app.state.overview===null,"Superseded read published old values");
+      expect(el("ov-statusline").textContent.includes("Loading"),"Older completion cleared the current read's progress");
+      releases[1]({...OVERVIEW,status_line:{...OVERVIEW.status_line,rules_learned_total:222}});await newer;
+      expect(el("ov-statusline").textContent.includes("222 rules learned"),"The current read did not publish");
+      expect(!app.state.overviewLoading,"Successful current read stayed pending");
+    } finally {globalThis.fetch=original;globalThis.location.hash=hash;Object.assign(app.state,saved);}
+  });
+
+  await checkAsync("overview_mutation_invalidated_read_settles_without_stale_publication", async () => {
+    const saved={...app.state}, original=globalThis.fetch, hash=globalThis.location.hash;
+    try {
+      globalThis.location.hash="#/overview";Object.assign(app.state,{route:"overview",overview:OVERVIEW});
+      let release;
+      globalThis.fetch=async url=>({ok:true,json:async()=>url===app.API.overview
+        ? new Promise(resolve=>{release=resolve;}) : PAYLOAD[url]});
+      const pending=app.load();await new Promise(resolve=>setTimeout(resolve,0));
+      app.state.reviewMutationGeneration++;app.state.review={...REVIEW,count:1};
+      release({...OVERVIEW,status_line:{...OVERVIEW.status_line,rules_learned_total:999}});await pending;
+      expect(app.state.overview===OVERVIEW && app.state.review.count===1,"Pre-decision read overwrote current data");
+      expect(!app.state.overviewLoading,"Invalidated read stayed pending after its response");
+      expect(el("ov-read-state").textContent.includes("Refresh"),"Discarded read offers no way to get current values");
+    } finally {globalThis.fetch=original;globalThis.location.hash=hash;Object.assign(app.state,saved);}
+  });
+
   check("an_unknown_route_is_loud", () => {
     globalThis.location.hash = "#/nope";
     app.showRoute(app.parseRoute(globalThis.location.hash));
@@ -2177,11 +2384,16 @@ if (mode === "ok") {
 }
 
 if (mode === "fail") {
+  check("dashboard_read_retry_is_explicit_and_named", () => {
+    const html=el("global-error").html();
+    expect(html.includes('data-dashboard-retry="true"') && html.includes("Retry dashboard reads"),
+      "A failed read has no explicit retry control: "+html);
+  });
   check("a_failed_endpoint_is_loud_and_names_the_request", () => {
     const error = el("global-error");
     expect(error.visible(), "a 404 was swallowed");
     const html = error.html();
-    expect(html.indexOf("/api/rules") !== -1, "the error does not name the URL: " + html);
+    expect(html.indexOf("/api/rules/browse") !== -1, "the error does not name the URL: " + html);
     expect(html.indexOf("404") !== -1, "the error does not name the status: " + html);
     expect(html.indexOf("Could not read 1 of " + ENDPOINT_COUNT) !== -1,
       "the error does not say how many failed: " + html);
@@ -2192,6 +2404,32 @@ if (mode === "fail") {
       "the overview was blanked by an unrelated failure");
     expect(el("rules-results").html() === "", "the rules table rendered from a failed request");
   });
+}
+
+if (mode === "fail") {
+  await checkAsync("dashboard_read_retry_is_get_only_single_flight_and_keeps_route", async () => {
+    const original=globalThis.fetch,hash="#/rules/p1?query=retained";
+    const requests=[];let release;
+    globalThis.location.hash=hash;
+    globalThis.fetch=async(url,init)=>{
+      requests.push({url,method:init.method});
+      if(url===app.API.overview)await new Promise(resolve=>{release=resolve;});
+      return {ok:true,json:async()=>url.startsWith("/api/rules/browse") ? PAYLOAD["/api/rules/browse"] : PAYLOAD[url]};
+    };
+    try {
+      const target=rowTarget({"data-dashboard-retry":"true"});
+      const pending=app.handleMainClick({target});
+      expect(requests.length===ENDPOINT_COUNT,"Retry did not start the shared reads");
+      await app.handleMainClick({target});
+      expect(requests.length===ENDPOINT_COUNT,"Repeated retry duplicated reads");
+      expect(el("global-error").visible(),"Retry hid the previous cause before a result");
+      release();await pending;
+      expect(requests.every(r=>r.method==="GET"),"Retry sent a decision");
+      expect(globalThis.location.hash===hash,"Retry changed the route or query");
+      expect(!el("global-error").visible(),"Successful reads left the failure visible");
+      expect(!app.state.dashboardRetrying,"Retry stayed busy after completion");
+    } finally {globalThis.fetch=original;}
+  },true);
 }
 
 process.stdout.write(JSON.stringify({ results }));
@@ -2212,6 +2450,8 @@ def js_results(tmp_path_factory) -> dict:
     # under .mjs rather than edited. The bytes are identical.
     app_mjs = workdir / "app.mjs"
     app_mjs.write_bytes(APP_JS.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(workdir)
     harness = workdir / "harness.mjs"
     harness.write_text(HARNESS, encoding="utf-8")
 
@@ -2242,6 +2482,11 @@ def _js(results: dict, name: str):
 
 
 JS_CHECKS = [
+    "overview_initial_failure_stops_loading_and_retry_has_real_progress",
+    "overview_older_read_cannot_clear_newer_progress_or_publish_values",
+    "overview_mutation_invalidated_read_settles_without_stale_publication",
+    "dashboard_read_retry_is_explicit_and_named",
+    "dashboard_read_retry_is_get_only_single_flight_and_keeps_route",
     "recovery_binds_known_target_and_reuses_uncertain_intent",
     "selected_mining_previews_one_incident_and_reuses_uncertain_intent",
     "reapplication_returns_to_review_and_reuses_uncertain_intent",
@@ -2311,6 +2556,7 @@ JS_CHECKS = [
     "the_rules_inspector_links_into_the_queue_and_states_the_reason",
     "the_rules_inspector_never_offers_to_decide",
     "a_rule_with_nothing_waiting_says_so_rather_than_going_blank",
+    "current_failure_count_includes_recent_post_fix_records_only",
     "j_and_k_move_the_selection_and_stop_at_the_ends",
     "the_first_j_moves_off_the_card_that_is_already_open",
     "a_shared_target_is_not_reprinted_once_per_proposal",
@@ -2324,6 +2570,12 @@ JS_CHECKS = [
     "review_note_names_the_auto_appliable_and_the_unknown_statuses",
     "approving_a_family_submits_one_command_with_exact_revisions",
     "reapproval_gets_a_new_key_but_an_uncertain_retry_reuses_its_key",
+    "pending_decision_stays_disabled_until_refusal_refresh_finishes",
+    "queue_content_hashes_bind_preview_but_decisions_send_full_revisions",
+    "changed_retained_content_refuses_a_selected_preview",
+    "queue_refresh_discards_full_previews_even_when_content_is_unchanged",
+    "late_preview_after_selection_cannot_publish_or_decide",
+    "late_preview_after_queue_refresh_cannot_publish_or_decide",
     "an_unknown_route_is_loud",
     "a_failed_endpoint_is_loud_and_names_the_request",
     "a_failed_endpoint_does_not_blank_the_ones_that_worked",
@@ -2378,6 +2630,8 @@ def novalue_cases(tmp_path_factory) -> dict:
     assert node, "node is required; a silently skipped test is the same as no test"
     workdir = tmp_path_factory.mktemp("novalue")
     (workdir / "app.mjs").write_bytes(APP_JS.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(workdir)
     probe = workdir / "probe.mjs"
     probe.write_text(_NOVALUE_PROBE, encoding="utf-8")
     done = subprocess.run(
@@ -2536,9 +2790,16 @@ def test_keyboard_activation_covers_both_row_kinds_and_stops_space_scrolling(js_
     assert "preventDefault" in body, "Space would scroll the page instead of opening the row"
 
 
-def test_a_focusable_row_carries_an_interactive_role(js_text: str):
-    """tabindex without a role tells assistive tech 'focus me' and nothing else."""
-    assert js_text.count('tabindex="0" role="button"') >= 2
+def test_legacy_rules_keep_native_rows_and_keyboard_opening_links():
+    """Legacy readers also retain table semantics and an actual keyboard control."""
+    from tests.test_navigation import node
+    from tests.test_rule_interactions import Elements
+    html = node('console.log(JSON.stringify(app.renderRuleRows([{id:"fixture",title:"Fixture",rule_text:"Invented text"}],"fixture")));')
+    tags = Elements(html).tags
+    assert all('role' not in attrs and 'tabindex' not in attrs for tag, attrs in tags if tag == 'tr')
+    links = [attrs for tag, attrs in tags if tag == 'a']
+    assert links[0]['href'] == '#/rules/fixture'
+    assert links[0]['data-rule-id'] == 'fixture' and links[0]['aria-current'] == 'true'
 
 
 # ---------------------------------------------------------------------------
@@ -2780,6 +3041,8 @@ def _spa_constants(tmp_path) -> dict:
     assert node, "node is required; a silently skipped test is the same as no test."
     app_mjs = tmp_path / "app.mjs"
     app_mjs.write_bytes(APP_JS.read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     dump = tmp_path / "dump.mjs"
     dump.write_text(
         f"import * as m from {json.dumps(str(app_mjs))};\n"
@@ -2980,8 +3243,8 @@ def test_every_queueing_reason_the_api_can_send_has_a_tint():
 def test_every_carve_out_action_the_config_declares_has_an_english_label():
     """Require a readable label for every configured or mandatory review action.
 
-    Reconcile the label map with both action sets. Missing labels and labels
-    for actions outside those sets must each fail.
+    Every supported action can be configured for manual review. Reconcile the
+    complete vocabulary, including ordinary actions outside the defaults.
     """
     from self_improve.config import Config
 
@@ -2990,8 +3253,8 @@ def test_every_carve_out_action_the_config_declares_has_an_english_label():
     labelled = set(re.findall(r"^\s+([a-z_]+):", block, re.M))
     assert labelled, "the scan found no labels; it is broken"
 
-    from self_improve.execution_policy import MANDATORY_REVIEW_ACTIONS
-    declared = set(Config(state_dir="/tmp/does-not-need-to-exist").review_queue_actions) | MANDATORY_REVIEW_ACTIONS
+    from self_improve.store import PROPOSAL_ACTIONS
+    declared = PROPOSAL_ACTIONS
     assert not (declared - labelled), (
         "the config declares carve-out actions the panel has no English name "
         f"for, so it renders a raw identifier: {sorted(declared - labelled)}"

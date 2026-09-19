@@ -15,13 +15,16 @@ import tomllib
 import yaml
 
 from .dashboard.context_weight import find_imports
-from .rule_revisions import marked_units, text_hash
+from .rule_revisions import AvailabilityError, marked_units, text_hash
+from .instruction_commands import command_metadata, resolve_commands
+from .instruction_policy import inspect_policy, unchecked
+from .instruction_plugins import inspect_plugins, unchecked as unchecked_plugins
 
 MAX_FILE_BYTES = 1 << 20
 MAX_FILES = 2000
 MAX_IMPORT_DEPTH = 5
 MAX_DISCOVERY_ENTRIES = 10000
-PROFILE = 'instruction-surfaces/2'
+PROFILE = 'instruction-surfaces/6'
 
 
 def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
@@ -32,11 +35,14 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
     turn an arbitrary absolute file into an instruction source.
     """
     root = Path(working_copy_path).resolve()
-    result = {'files': [], 'issues': [], 'deduplicated': [], 'profile': PROFILE,
+    managed_root = Path(cfg.claude_managed_dir)
+    result = {'plugin_discovery': unchecked_plugins(), 'policy_discovery': unchecked(managed_root), 'managed_discovery': {'root': str(managed_root), 'memory_status': 'not_checked', 'skills_status': 'not_checked'},
+              'files': [], 'issues': [], 'deduplicated': [], 'profile': PROFILE,
+              'uninspected_commands': [], 'incomplete_command_roots': [],
               'limits': {'max_file_bytes': MAX_FILE_BYTES, 'max_files': MAX_FILES, 'max_import_depth': MAX_IMPORT_DEPTH,
                          'max_discovery_entries_per_root': MAX_DISCOVERY_ENTRIES},
               'runtime_loading_verified': False,
-              'unobserved_sources': ['managed_policy', 'runtime_plugins', 'additional_directories',
+              'unobserved_sources': ['embedded_policy_imports', 'effective_managed_policy', 'remote_os_policy', 'codex_managed_sources', 'runtime_plugins', 'additional_directories',
                                      'session_receipts', 'skill_catalog_metadata_budget', 'runtime_exclusions'],
               'scope_note': 'Observed configured instruction surfaces; per-session loading, runtime flags and policy exclusions are not inferred.'}
     if not root.is_dir():
@@ -50,7 +56,9 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         return result
     ancestors = list(reversed([root, *root.parents[:len(root.parents) - len(git_root.parents)]]))
     queue = deque()
-    cache, visited = {}, set()
+    cache, physical, visited = {}, {}, set()
+    multiply_linked = set()
+    physical_ids = {}
 
     def issue(cause, path, **extra):
         result['issues'].append({'cause': cause, 'path': str(path), **extra})
@@ -64,9 +72,16 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             before = path.stat()
             if not stat.S_ISREG(before.st_mode):
                 issue('not_regular_file', path); return None
+            physical_key = (before.st_dev, before.st_ino)
+            if physical_key in physical:
+                return physical[physical_key]
             if len(cache) >= MAX_FILES:
                 issue('file_count_limit', path, limit=MAX_FILES, omitted_at_least=1); return None
-            with path.open('rb') as handle:
+            flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+            with os.fdopen(os.open(real, flags), 'rb') as handle:
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    issue('not_regular_file', path); return None
                 raw = handle.read(MAX_FILE_BYTES + 1)
                 after = os.fstat(handle.fileno())
             current = path.stat()
@@ -83,22 +98,46 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         item = {'path': lexical, 'real_path': real, 'aliases': [lexical], 'bytes': len(raw),
                 'content_hash': text_hash(text), 'loading_paths': [], '_text': text,
                 'marked_units': marked_units(text)}
+        if before.st_nlink > 1: multiply_linked.add(real)
+        physical_ids[real] = physical_key
         cache[real] = item
+        physical[physical_key] = item
         return item
 
-    def seed(path, provider, mode, *, origin='project', source='memory', optional=True):
+    def seed(path, provider, mode, *, origin='project', source='memory', optional=True, discovery_root=None):
         if optional and not os.path.lexists(path):
             return
-        queue.append((path, provider, {'kind': mode, 'paths': []}, 0, [], [], origin, source))
+        queue.append((path, provider, {'kind': mode, 'paths': []}, 0, [], [], origin, source, discovery_root))
 
-    def discover(base, *, skills=False):
-        if not os.path.lexists(base): return []
-        pending, seen, found, visited_entries = [base], set(), [], 0
+    def present(path):
+        try:
+            path.lstat()
+            return True
+        except FileNotFoundError:
+            # A missing child below a dangling directory link is a failed read,
+            # not a known absent source. Stop at the nearest existing ancestor.
+            for parent in path.parents:
+                try:
+                    info = parent.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    parent.stat()  # expose broken/denied link resolution
+                break
+            return False
+
+    def discover(base, *, skills=False, preserve_alias_names=False):
+        try:
+            if not present(base): return []
+        except (OSError, RuntimeError) as exc:
+            issue('directory_unreadable:'+type(exc).__name__, base)
+            return []
+        pending, seen, found, visited_entries = [(base, ())], set(), [], 0
         while pending:
-            directory = pending.pop()
+            directory, parents = pending.pop()
             try:
                 real = str(directory.resolve(strict=True))
-                if real in seen:
+                if real in parents or (not preserve_alias_names and real in seen):
                     result['deduplicated'].append({'path': str(directory), 'real_path': real, 'cause': 'directory_alias_or_cycle'})
                     continue
                 seen.add(real)
@@ -116,9 +155,9 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
                     if entry.is_dir(follow_symlinks=True):
                         if skills:
                             candidate = path/'SKILL.md'
-                            if os.path.lexists(candidate): found.append(candidate)
+                            if present(candidate): found.append(candidate)
                         else:
-                            pending.append(path)
+                            pending.append((path, (*parents, real)))
                     elif not skills and path.suffix == '.md':
                         found.append(path)
                     if len(found) > MAX_FILES:
@@ -127,6 +166,13 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             except (OSError, RuntimeError) as exc:
                 issue('directory_unreadable:'+type(exc).__name__, directory)
         return sorted(found)
+
+    def discover_commands(base, *, skills=False):
+        before = len(result['issues'])
+        found = discover(base, skills=skills, preserve_alias_names=not skills)
+        if len(result['issues']) > before:
+            result['incomplete_command_roots'] = sorted(set(result['incomplete_command_roots']) | {str(base.absolute())})
+        return found
 
     # Retain only discovery settings and the source hash, never unrelated
     # provider configuration. Runtime overrides are still unverified.
@@ -191,8 +237,11 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         for path in discover(rules):
             seed(path, 'claude', 'project_always_loaded', source='rule')
         for base in (directory/'.claude/skills', directory/'.agents/skills'):
-            for path in discover(base, skills=True):
-                seed(path, 'claude' if base.parent.name == '.claude' else 'codex', 'on_demand', source='skill')
+            for path in (discover_commands(base, skills=True) if base.parent.name == '.claude' else discover(base, skills=True)):
+                seed(path, 'claude' if base.parent.name == '.claude' else 'codex', 'on_demand', source='skill', discovery_root=base)
+        commands = directory/'.claude/commands'
+        for path in discover_commands(commands):
+            seed(path, 'claude', 'on_demand', source='command', discovery_root=commands)
 
     # Only configured global targets can produce global availability. A random
     # absolute file with a matching marker is not automatically an instruction.
@@ -210,24 +259,150 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
     skill_roots = [(Path(cfg.skills_dir), 'claude'), (codex_skills, 'codex')]
     result['configured_skill_roots'] = [{'path': str(base.absolute()), 'provider': provider} for base, provider in skill_roots]
     for base, provider in skill_roots:
-        for path in discover(base, skills=True):
-            seed(path, provider, 'on_demand', origin='global', source='skill')
+        for path in (discover_commands(base, skills=True) if provider == 'claude' else discover(base, skills=True)):
+            seed(path, provider, 'on_demand', origin='global', source='skill', discovery_root=base)
+    commands = Path(cfg.global_claude_md).parent/'commands'
+    for path in discover_commands(commands):
+        seed(path, 'claude', 'on_demand', origin='global', source='command', discovery_root=commands)
     for raw in sorted(selected):
         path = Path(raw)
         for base, provider in skill_roots:
             if path.is_relative_to(base.resolve()) and path.name == 'SKILL.md' and path.parent.parent == base.resolve():
-                seed(path, provider, 'on_demand', origin='global', source='skill', optional=False)
+                seed(path, provider, 'on_demand', origin='global', source='skill', optional=False, discovery_root=base.resolve())
+
+    # Native managed file surfaces are observations, never writer targets.
+    # lstat distinguishes an absent entry from denied or broken discovery.
+    managed = result['managed_discovery']
+    def managed_entry(path, field):
+        try:
+            if not present(path):
+                managed[field] = 'absent'
+                return False
+        except (OSError, RuntimeError) as exc:
+            issue('managed_entry_unreadable:'+type(exc).__name__, path)
+            managed[field] = 'failed'
+            return False
+        managed[field] = 'observed'
+        return True
+
+    memory = managed_root/'CLAUDE.md'
+    if managed_entry(memory, 'memory_status'):
+        seed(memory, 'claude', 'global', origin='managed', optional=False)
+    enterprise = managed_root/'.claude/skills'
+    result['configured_skill_roots'].append({'path': str(enterprise), 'provider': 'claude'})
+    if managed_entry(enterprise, 'skills_status'):
+        before = len(result['issues'])
+        for path in discover_commands(enterprise, skills=True):
+            seed(path, 'claude', 'on_demand', origin='managed', source='skill', discovery_root=enterprise)
+        if len(result['issues']) > before:
+            managed['skills_status'] = 'failed'
+    elif managed['skills_status'] == 'failed':
+        result['incomplete_command_roots'] = sorted(set(result['incomplete_command_roots']) | {str(enterprise)})
+
+    # Identify configuration containers before any Markdown import expansion.
+    # A whole-container alias is still configuration, not archived instructions.
+    policy_containers = set()
+    policy_main_paths, policy_directories = set(), set()
+    for path, destinations in ((managed_root/'managed-settings.json', policy_main_paths),
+                               (managed_root/'managed-settings.d', policy_directories)):
+        destinations.add(os.path.abspath(path))
+        try: destinations.add(str(path.resolve()))
+        except (OSError, RuntimeError): pass  # Native entry checks retain the failure.
+    def native_policy_path(path):
+        candidate = Path(os.path.abspath(path))
+        return str(candidate) in policy_main_paths or (str(candidate.parent) in policy_directories
+                and not candidate.name.startswith('.') and candidate.name.endswith('.json'))
+    def policy_signature(path):
+        try:
+            signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+            return (signature(path.lstat()), signature(path.stat()))
+        except (OSError, RuntimeError) as exc:
+            return type(exc).__name__
+    policy_signatures = {path: policy_signature(path) for path in
+                         (managed_root/'managed-settings.json', managed_root/'managed-settings.d')}
+    def read_policy(path):
+        policy_signatures.setdefault(path, policy_signature(path))
+        item = read(path)
+        if item is not None: policy_containers.add(item['real_path'])
+        return item
+    result['policy_discovery'], embedded = inspect_policy(managed_root, read=read_policy, present=present,
+                                                         issue=issue, max_entries=MAX_DISCOVERY_ENTRIES)
+
+    plugin_containers, plugin_container_paths, plugin_signatures = set(), set(), {}
+    plugin_container_inodes = set()
+    def plugin_present(path):
+        plugin_signatures.setdefault(path, policy_signature(path))
+        return present(path)
+    def protect_plugin_config(path):
+        plugin_signatures.setdefault(path, policy_signature(path))
+        plugin_container_paths.add(os.path.abspath(path))
+        try:
+            plugin_container_paths.add(str(path.resolve()))
+            info = path.stat()
+            plugin_container_inodes.add((info.st_dev, info.st_ino))
+        except (OSError, RuntimeError): pass
+    def read_plugin_config(path, *, required=False):
+        protect_plugin_config(path)
+        try:
+            if not required and not plugin_present(path): return None
+        except (OSError, RuntimeError) as exc:
+            issue('plugin_configuration_unreadable', path, error_type=type(exc).__name__)
+            return None
+        item = read(path)
+        if item is not None: plugin_containers.add(item['real_path'])
+        return item
+    def plugin_container(item, path):
+        return (physical_ids.get(item['real_path']) in plugin_container_inodes
+                or item['real_path'] in plugin_containers or str(path.absolute()) in plugin_container_paths
+                or item['real_path'] in plugin_container_paths
+                or path.name == 'plugin.json' and path.parent.name == '.claude-plugin'
+                or Path(item['real_path']).name == 'plugin.json' and Path(item['real_path']).parent.name == '.claude-plugin')
+    def read_plugin_body(path, *, uncertain=False):
+        item = read(path)
+        if item is not None and uncertain and item['real_path'] in multiply_linked:
+            issue('plugin_alias_identity_unresolved', path); return None
+        if item is not None and (plugin_container(item, path) or item['real_path'] in policy_containers
+                                or native_policy_path(path) or native_policy_path(item['real_path'])):
+            issue('plugin_configuration_not_instruction', path); return None
+        return item
+    result['plugin_discovery'] = inspect_plugins(cfg, root, ancestors=ancestors, read_config=read_plugin_config,
+        read_body=read_plugin_body, protect_config=protect_plugin_config, present=plugin_present, discover=discover, issue=issue,
+        max_entries=MAX_DISCOVERY_ENTRIES, policy=result['policy_discovery'], issues=result['issues'])
+    plugin_exclusions = set(result['plugin_discovery']['plain_skill_exclusions'])
+    failed_plugin_roots = {entry['path'] for entry in result['plugin_discovery']['skill_roots'] if entry['status']=='failed'}
 
     while queue:
-        path, provider, scope, depth, chain, conditions, origin, source = queue.popleft()
+        path, provider, scope, depth, chain, conditions, origin, source, discovery_root = queue.popleft()
+        command = command_metadata(path.absolute(), source=source, discovery_root=Path(discovery_root).absolute()) if provider == 'claude' and source in {'skill', 'command'} else {}
+        if source == 'skill' and provider == 'claude' and str(path.absolute()) in plugin_exclusions:
+            continue
         item = read(path)
         if item is None:
+            if origin == 'managed' and source in {'memory', 'skill'}:
+                managed['memory_status' if source == 'memory' else 'skills_status'] = 'failed'
+                if source == 'memory':
+                    issue('managed_memory_read_failed', path)
+            if command:
+                result['uninspected_commands'].append({**command, 'path': str(path.absolute()), 'source': source, 'provider': provider})
+            continue
+        is_plugin_container = plugin_container(item, path)
+        is_container = is_plugin_container or item['real_path'] in policy_containers or native_policy_path(path) or native_policy_path(item['real_path'])
+        unresolved_alias = (result['policy_discovery']['selection'] == 'unknown' or result['plugin_discovery']['status'] == 'failed') and item['real_path'] in multiply_linked
+        if is_container or unresolved_alias:
+            issue('policy_container_not_instruction' if item['real_path'] in policy_containers or native_policy_path(path) or native_policy_path(item['real_path']) else 'plugin_configuration_not_instruction' if is_plugin_container else 'policy_alias_identity_unresolved',
+                  path, container_real_path=item['real_path'])
+            if origin == 'managed' and source == 'memory':
+                managed['memory_status'] = 'failed'
+                issue('managed_memory_read_failed', path)
+            if command:
+                result['uninspected_commands'].append({**command, 'path': str(path.absolute()), 'source': source, 'provider': provider})
+                if origin == 'managed': managed['skills_status'] = 'failed'
             continue
         text = item['_text']
         current_scope = dict(scope)
         current_conditions = list(conditions)
         metadata, eligibility_reason = {}, ''
-        scoped_surface = source in {'rule', 'skill'}
+        scoped_surface = source in {'rule', 'skill', 'command'}
         metadata_text = text.replace('\r\n', '\n')
         if scoped_surface and metadata_text.startswith('---\n'):
             end = metadata_text.find('\n---', 4)
@@ -238,14 +413,14 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
                 if end < 0: raise ValueError('unterminated frontmatter')
                 metadata = yaml.safe_load(metadata_text[4:end]) or {}
                 if not isinstance(metadata, dict): raise ValueError('frontmatter is not an object')
-                globs = metadata.get('paths') if provider == 'claude' else None
+                globs = metadata.get('paths') if provider == 'claude' and source != 'command' else None
                 if globs is not None:
                     if isinstance(globs, str): globs = [globs]
                     if not isinstance(globs, list) or any(not isinstance(g, str) or not g for g in globs):
                         raise ValueError('invalid paths')
                     current_scope = {'kind': 'on_demand' if current_scope['kind'] == 'on_demand' else 'path_scoped', 'paths': globs}
                     current_conditions.append({'path': str(path), 'paths': globs})
-            except (yaml.YAMLError, ValueError) as exc:
+            except (yaml.YAMLError, ValueError, RecursionError) as exc:
                 issue('frontmatter_invalid', path, error_type=type(exc).__name__)
                 eligibility_reason = 'frontmatter_invalid'
                 metadata = {}
@@ -263,9 +438,16 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             settings = [s['enabled'] for s in codex['skill_overrides'] if s['path'] == item['real_path']]
             if settings and not all(settings):
                 eligibility_reason = 'skill_disabled'
+        if origin == 'managed' and source == 'skill':
+            if eligibility_reason:
+                managed['skills_status'] = 'failed'
+            elif path.parent.name.casefold() == 'synced':
+                eligibility_reason = 'reserved_skill_directory'
+        if source == 'skill' and provider == 'claude' and str(path.parent.parent.absolute()) in failed_plugin_roots:
+            eligibility_reason = 'plugin_namespace_unresolved'
         alias = str(path.absolute())
         if alias not in item['aliases']: item['aliases'].append(alias)
-        identity = (item['real_path'], provider, origin, source, str(current_scope), str(current_conditions))
+        identity = (item['real_path'], provider, origin, source, str(current_scope), str(current_conditions), alias if command else '')
         if identity in visited:
             result['deduplicated'].append({'path': str(path), 'real_path': item['real_path'], 'provider': provider})
             continue
@@ -273,11 +455,12 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         item['loading_paths'].append({'provider': provider, 'scope': current_scope, 'conditions': current_conditions,
                                       'origin': origin, 'source': source,
                                       'skill_name': skill_name,
+                                      **command,
                                       'import_chain': chain, 'path': alias,
                                       'eligible_prefix_bytes': 0 if eligibility_reason else item['bytes'],
                                       'eligibility_reason': eligibility_reason, 'runtime_loading_verified': False})
         # Codex AGENTS.md does not implement Claude's @-import directive.
-        if provider != 'claude' or source == 'skill' or eligibility_reason:
+        if provider != 'claude' or source in {'skill', 'command'} or eligibility_reason:
             continue
         imports = find_imports(text)
         if imports and depth >= MAX_IMPORT_DEPTH:
@@ -288,20 +471,15 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             if str(target.resolve()) in chain + [item['real_path']]:
                 result['deduplicated'].append({'path': str(target), 'cause': 'import_cycle'})
                 continue
-            queue.append((target, provider, current_scope, depth+1, chain+[item['real_path']], current_conditions, origin, 'import'))
-    result['files'] = [item for item in cache.values() if item['loading_paths']]
-    # Claude's runtime may shadow same-name skills at different scopes. Until
-    # that precedence is observed, neither body can establish availability.
-    skill_names = {}
-    for item in result['files']:
-        for path in item['loading_paths']:
-            if path['provider'] == 'claude' and path['source'] == 'skill' and path['skill_name']:
-                skill_names.setdefault(path['skill_name'], []).append((item, path))
-    for paths in skill_names.values():
-        if len({item['real_path'] for item, path in paths}) > 1:
-            for item, path in paths:
-                path.update(eligible_prefix_bytes=0, eligibility_reason='skill_name_precedence_unresolved')
-                issue('skill_name_precedence_unresolved', path['path'])
+            queue.append((target, provider, current_scope, depth+1, chain+[item['real_path']], current_conditions, origin, 'import', None))
+    for path, signature in policy_signatures.items():
+        if policy_signature(path) != signature:
+            raise AvailabilityError('Managed policy source changed during observation: ' + str(path))
+    for path, signature in plugin_signatures.items():
+        if policy_signature(path) != signature:
+            raise AvailabilityError('Plugin source changed during observation: ' + str(path))
+    result['files'] = [item for item in cache.values() if item['loading_paths']] + embedded
+    resolve_commands(result['files'], issue, uninspected=result['uninspected_commands'], incomplete_roots=result['incomplete_command_roots'])
     codex_paths = [(item, path) for item in result['files'] for path in item['loading_paths']
                    if path['provider'] == 'codex' and path['scope']['kind'] != 'on_demand']
     codex_paths.sort(key=lambda pair: (pair[1]['scope']['kind'] != 'global', len(Path(pair[1]['path']).parts)))

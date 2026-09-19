@@ -329,3 +329,17 @@ def test_amendment_supersedes_every_undecided_revision_and_preserves_decisions(e
         assert row['status']==(status if status in {'approved_user','applied'} else 'superseded'),(status,row['status'])
         assert row['diff_unified']=='original reviewed bytes'
     assert 'original reviewed bytes' not in store.query_one('SELECT diff_unified FROM proposals WHERE id=?',(result['result']['proposal_ids'][0],))['diff_unified']
+
+
+def test_selected_job_publishes_one_atomic_queue_processing_receipt(env):
+    cfg,store,incident,calls=env
+    command=submit_command(store,cfg,request(env))
+    result=job_worker.run_once(store,cfg)
+    assert result['state']=='completed'
+    receipt=store.query_one('SELECT * FROM queue_processing')
+    job=store.query_one('SELECT * FROM incident_jobs WHERE command_id=?',(command['id'],))
+    assert receipt['command_id']==command['id'] and receipt['run_id']==job['run_id']
+    call=store.query_one('SELECT * FROM llm_calls WHERE id=?',(receipt['call_id'],))
+    assert call['run_id']==receipt['run_id'] and call['prompt_sha']==receipt['prompt_sha']
+    assert job_worker.run_once(store,cfg) is None
+    assert len(store.query('SELECT * FROM queue_processing'))==1

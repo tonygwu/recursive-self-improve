@@ -48,6 +48,12 @@ def test_outcome_distinguishes_invalid_execution_and_rule_failure(env, monkeypat
     monkeypatch.setattr(LLMRunner, '_execute', run)
     _, data = execute(env)
     assert eval_data.outcome(data)['code'] == code
+    from self_improve.dashboard.quality_data import classes
+    shown=classes(env[1],env[0])['classes'][0]
+    assert shown['evaluations']['attempts']==1
+    assert shown['evaluations']['comparable']==int(code=='rule_failed')
+    assert shown['evaluations']['passed']==0
+    assert shown['applied_revisions']==shown['quality']['reviewed']==0
 
 
 def test_attempt_and_historical_pages_preserve_equal_times_and_unknown_sources(env):
@@ -119,6 +125,8 @@ def test_spa_renders_full_evidence_with_escaped_text_and_deep_links(env, tmp_pat
     data['source']['learning']['rule_text'] = '<img src=x onerror=bad()> Complete invented rule'
     static = Path(__file__).resolve().parents[1]/'src/self_improve/dashboard/static'
     module = tmp_path/'app.mjs'; module.write_bytes((static/'app.js').read_bytes())
+    from tests.spa_assets import copy_spa_dependencies
+    copy_spa_dependencies(tmp_path)
     payload = tmp_path/'payload.json'; payload.write_text(json.dumps(data))
     script = tmp_path/'check.mjs'
     script.write_text('''import fs from 'node:fs';
@@ -156,3 +164,14 @@ console.log('EVAL_RENDER_OK');
     result = subprocess.run([node,str(script),str(payload)],capture_output=True,text=True,timeout=60)
     assert result.returncode == 0,result.stdout+result.stderr
     assert result.stdout.strip() == 'EVAL_RENDER_OK'
+
+
+def test_class_evaluation_counts_use_frozen_class_not_current_proposal(env):
+    from self_improve.dashboard.quality_data import classes
+    cfg,store,p,_=env
+    execute(env)
+    store.update('proposals','id',p['id'],{'target_kind':'hook'});store.commit()
+    rows=classes(store,cfg)['classes']
+    assert rows[0]['evaluations']['comparable']==rows[0]['evaluations']['passed']==1
+    assert rows[3]['evaluations']['attempts']==0
+    assert rows[0]['applied_revisions']==rows[0]['quality']['reviewed']==0

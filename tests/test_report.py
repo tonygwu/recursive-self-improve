@@ -234,12 +234,10 @@ def render(tmp_path) -> str:
 def test_report_funnel_numbers(tmp_path):
     md = render(tmp_path)
 
-    # Session counts scoped to the run window: the 2026-08-13 session is
-    # excluded (ok would read 2 otherwise, lines 1149).
-    assert "| Sessions scanned (ok) | 1 |" in md
-    assert "| Sessions partial | 1 |" in md
-    assert "| Sessions failed | 1 |" in md
-    assert "| Sessions skipped | 7 |" in md
+    # Native scan passes stay distinct from mutable session-window rows.
+    assert "| File scan passes completed (this run) | 3 |" in md
+    assert "| File scan passes failed (this run) | 0 |" in md
+    assert "| Files skipped unchanged (this run) | 7 |" in md
     # Use this run's counters. The invented session lifetime totals (150/2)
     # deliberately differ from the run's scan totals (120/1).
     assert "| Lines scanned (this run) | 120 |" in md
@@ -264,11 +262,12 @@ def test_report_funnel_numbers(tmp_path):
     assert "| Mine calls succeeded | 4 |" in md
     assert "| Mine calls failed | 1 |" in md
 
-    assert "| Learnings (this run) | 2 |" in md
-    assert "| Proposals: applied | 1 |" in md
-    assert "| Proposals: held | 1 |" in md
-    assert "| Proposals: pending | 1 |" in md
-    assert "| Applied | 1 |" in md
+    assert "| Rules with retained mining observations (this run) | 0 |" in md
+    assert "zero retained observations does not establish zero historical mining work" in md
+    assert "| Current proposals: applied | 1 |" in md
+    assert "| Current proposals: held | 1 |" in md
+    assert "| Current proposals: pending | 1 |" in md
+    assert "| Automatic edits recorded (this run) | not recorded |" in md
 
 
 def test_report_per_stage_taxonomy_and_scan_errors(tmp_path):
@@ -287,12 +286,12 @@ def test_report_per_stage_taxonomy_and_scan_errors(tmp_path):
     assert md.index("| mine | ok | 3 |") < md.index("| propose | ok | 1 |")
 
     # Scan error section lists the failing session verbatim.
-    assert "- Sessions with status=error: 1" in md
+    assert "- Unlinked current session rows with status=error: 1" in md
     # Cumulative over the sessions in scope (2), with this run's own count
     # (1) beside it. The fixture makes them differ on purpose: they are
     # different quantities and a report that prints both must say which.
     assert (
-        "- Malformed lines, cumulative over this run's sessions "
+        "- Malformed lines, cumulative over unlinked current session rows "
         "(counted, skipped, surfaced): 2 (this run itself saw 1)"
     ) in md
     assert "  - `/fake/c.jsonl`: parse: ValueError: boom" in md
@@ -313,18 +312,18 @@ def test_report_reduction_ratio_and_caps(tmp_path):
     bytes_total = 5000 + 2500  # error session contributed 0; outside excluded
     # Keep the lifetime counter for the reduction ratio and label it separately
     # from this run's scan counter.
-    assert "- Lines scanned, cumulative over this run's sessions: 150" in md
+    assert "- Lines scanned, cumulative over unlinked current session rows: 150" in md
     assert "this run itself read 120" in md
-    assert f"- Bytes scanned: {bytes_total}" in md
+    assert f"- Bytes scanned, cumulative over unlinked current session rows: {bytes_total}" in md
     assert (
         f"- Chars sent toward mining (sum of incident window_json): "
         f"{window_chars} across 4 incidents"
     ) in md
     assert (
-        f"- Reduction ratio (window chars / bytes scanned): "
+        f"- Unlinked diagnostic ratio (window chars / current lifetime bytes): "
         f"{window_chars / bytes_total:.4%}"
     ) in md
-    assert f"- Window chars per line scanned: {window_chars / 150:.2f}" in md
+    assert f"- Unlinked diagnostic window chars per lifetime line: {window_chars / 150:.2f}" in md
 
     # Truncation markers inside windows (only W2 carries one) + recorded caps.
     assert "- `[truncated N chars]` markers inside incident windows: 1" in md
@@ -774,12 +773,15 @@ def test_learnings_are_counted_for_the_run_that_mined_them(tmp_path):
         "created_at": "2026-08-17T11:02:00.000000Z",
     })
     store.insert("incident_learnings", {"incident_id": inc_id, "learning_id": lid})
+    from self_improve import mining_history
+    mining_history.append(store,store.query_one('SELECT * FROM learnings WHERE id=?',(lid,)),
+                          before=None,kind='new',incidents=[],provenance={'run_id':mine_run})
     store.commit()
 
     out = tmp_path / "r.md"
     generate(store, Config(state_dir=str(tmp_path / "st")), mine_run, out)
     body = _body_without_appendix(out.read_text())
-    line = next(l for l in body.splitlines() if "Learnings (this run)" in l)
+    line = next(l for l in body.splitlines() if "Rules with retained mining observations (this run)" in l)
     assert "| 1 |" in line, f"the mining run must count its own learning: {line}"
     store.close()
 
@@ -1163,27 +1165,24 @@ def test_a_regenerated_report_says_its_rows_have_moved(tmp_path):
         {"scan": {"files_succeeded": 1000, "files_failed": 0}}, 990
     )
     text = " ".join(lines)
-    assert "10 of the 1000 sessions" in text, text
+    assert "Recorded file scan outcomes: 1000; unlinked current session rows: 990" in text, text
     assert "last_scanned_at" in text
-    assert "NOW" in text
+    assert "does not identify which files changed or why" in text
 
 
-def test_a_report_generated_at_run_time_carries_no_drift_note(tmp_path):
-    """Narrowness guard. The note must not appear on every report."""
+def test_matching_session_counts_never_establish_run_identity(tmp_path):
+    """Equal numbers and partial historical counters still lack membership."""
     from self_improve.report import _scan_drift_lines
 
-    assert _scan_drift_lines({"scan": {"files_succeeded": 990, "files_failed": 10}}, 1000) == []
-    assert _scan_drift_lines({"scan": {"files_succeeded": 0, "files_failed": 0}}, 0) == []
-    # A run with no scan stats at all is not accused of anything.
-    assert _scan_drift_lines({}, 42) == []
-    assert _scan_drift_lines({"scan": {"files_succeeded": "many"}}, 42) == []
-    # The discriminating case: half a triple. Reading the missing half as zero
-    # makes `expected` 1000 and emits "10 sessions have moved" — a specific
-    # claim built on a number nobody recorded. The real expected total is
-    # unknown, so the honest output is nothing at all.
-    assert _scan_drift_lines(
-        {"scan": {"files_succeeded": 1000, "files_failed": "unknown"}}, 990
-    ) == [], "a missing counter was read as zero and produced a made-up count"
+    for stats, count in [({'scan':{'files_succeeded':990,'files_failed':10}},1000),
+                         ({'scan':{'files_succeeded':0,'files_failed':0}},0),
+                         ({},42), ({'scan':{'files_succeeded':1000}},990)]:
+        text = ' '.join(_scan_drift_lines(stats,count))
+        assert 'matching counts do not establish run ownership' in text
+        assert 'Recorded file scan outcomes:' not in text
+    for stats in ({'scan':{'files_succeeded':'many'}},
+                  {'scan':{'files_succeeded':1000,'files_failed':'unknown'}}):
+        with pytest.raises(ReportError): _scan_drift_lines(stats,990)
 
 
 def test_the_drift_note_reaches_the_report(tmp_path):
@@ -1192,7 +1191,7 @@ def test_the_drift_note_reaches_the_report(tmp_path):
         tmp_path, {"scan": {"files_succeeded": 7, "files_failed": 0}}
     )
     # No sessions exist in the fixture, so 7 recorded vs 0 in scope.
-    assert "7 of the 7 sessions this run scanned have since been re-scanned" in text
+    assert "Recorded file scan outcomes: 7; unlinked current session rows: 0" in text
 
 
 def test_the_funnel_reports_this_runs_lines_not_the_sessions_lifetimes(tmp_path):
@@ -1213,7 +1212,7 @@ def test_the_funnel_reports_this_runs_lines_not_the_sessions_lifetimes(tmp_path)
     assert "| Lines scanned (this run) | 137 |" in funnel
     assert "| Malformed lines (this run) | 1 |" in funnel
     assert "| Lines scanned (this run) | 150 |" not in funnel
-    assert "Lines scanned, cumulative over this run's sessions: 150 " in text
+    assert "Lines scanned, cumulative over unlinked current session rows: 150 " in text
 
 
 def test_a_missing_scan_counter_is_stated_not_zeroed(tmp_path):
@@ -1285,7 +1284,7 @@ def test_the_two_malformed_numbers_say_which_is_which(tmp_path):
                   "lines_scanned": 120, "malformed_lines": 0}},
     )
     assert "| Malformed lines (this run) | 0 |" in text
-    assert "cumulative over this run's sessions (counted, skipped, surfaced)" in text
+    assert "cumulative over unlinked current session rows (counted, skipped, surfaced)" in text
     assert "this run itself saw 0" in text
 
 

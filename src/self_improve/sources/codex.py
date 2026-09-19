@@ -395,6 +395,7 @@ class CodexSource:
                 # Content-free outcome of this physical line. The finally clause
                 # records it after every branch, including each `continue`.
                 outcome = {"category": LINE_MALFORMED, "cause": "", "ts": ""}
+                context = None
                 events_before = stats.events_emitted
                 try:
                     if raw.strip() == b"":
@@ -443,7 +444,8 @@ class CodexSource:
                         # schema has only "id"; new schema has "session_id" (+ a
                         # duplicate "id").
                         sid = payload.get("session_id") or payload.get("id")
-                        if not sid:
+                        if not isinstance(sid, str) or not sid.strip():
+                            session_id, cwd, identity_known = "", "", False
                             stats.malformed_lines += 1
                             stats.malformed_taxonomy["session_meta_no_id"] += 1
                             outcome["cause"] = "session_meta_no_id"
@@ -451,14 +453,18 @@ class CodexSource:
                         session_id = str(sid)
                         identity_known = True
                         new_cwd = payload.get("cwd")
-                        if isinstance(new_cwd, str):
+                        if isinstance(new_cwd, str) and Path(new_cwd).is_absolute():
                             cwd = new_cwd
                         else:
+                            cwd = ""
                             stats.malformed_taxonomy["session_meta_no_cwd"] += 1
                         denylisted = any(s in cwd for s in denylist)
                         originator = payload.get("originator")
                         source_val = payload.get("source")
                         headless, is_subagent = _classify_headless(originator, source_val)
+                        if record_lines:
+                            from ..session_context import native_context
+                            context = native_context("creation", payload)
                         if not ts:
                             stats.missing_timestamp += 1
                         outcome["category"] = LINE_EVENT
@@ -474,6 +480,23 @@ class CodexSource:
                             },
                         )
                         continue
+
+                    if rtype == "turn_context":
+                        # A turn can run in a different copy than creation metadata.
+                        # Missing/invalid cwd cannot silently reuse the previous one.
+                        new_cwd = payload.get("cwd")
+                        cwd = new_cwd if isinstance(new_cwd, str) and Path(new_cwd).is_absolute() else ""
+                        denylisted = any(s in cwd for s in denylist) if cwd else False
+                        if record_lines:
+                            from ..session_context import native_context
+                            context = native_context("turn", payload)
+                        stats.skipped_by_type[rtype] += 1
+                        outcome.update(category=LINE_SKIPPED, cause=rtype)
+                        continue
+
+                    if rtype == "compacted" and record_lines:
+                        from ..session_context import native_context
+                        context = native_context("compaction", payload)
 
                     if rtype == "event_msg":
                         ptype = payload.get("type")
@@ -659,5 +682,6 @@ class CodexSource:
                                 headless=headless if identity_known else None,
                                 is_subagent=is_subagent if identity_known else None,
                                 denylisted=denylisted,
+                                session_context=context if not denylisted else None,
                             )
                         )

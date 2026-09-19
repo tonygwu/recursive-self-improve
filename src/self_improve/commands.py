@@ -51,8 +51,8 @@ def require_schema(store):
         raise CommandError('UpgradeRequired', 'Upgrade the state database before submitting dashboard commands.', 503)
 
 
-def review_snapshot(store, proposal_id: str, cfg) -> dict:
-    """Read a complete revision; callers wrap multi-query reads in a transaction."""
+def review_content(store, proposal_id: str) -> dict:
+    """Read retained content in the caller's transaction without resolving a target."""
     proposal = store.query_one('SELECT * FROM proposals WHERE id=?', (proposal_id,))
     if proposal is None:
         raise CommandError('NoSuchProposal', f'No proposal {proposal_id!r}.', 404)
@@ -66,9 +66,19 @@ def review_snapshot(store, proposal_id: str, cfg) -> dict:
         'WHERE il.learning_id=? ORDER BY i.ts, i.id', (proposal['learning_id'],),
     )
     evaluation = store.query_one('SELECT * FROM eval_results WHERE id=?', (proposal['eval_result_id'],)) if proposal['eval_result_id'] else None
-    snapshot = {'version': 2, 'proposal': proposal, 'learning': learning,
-                'destination': _destination(proposal, cfg),
-                'evidence': evidence, 'evaluation': evaluation}
+    return {'proposal': proposal, 'learning': learning, 'evidence': evidence, 'evaluation': evaluation}
+
+
+def review_content_revision(content: dict) -> str:
+    """Bind queue content only; this fingerprint cannot authorize a decision."""
+    return _hash({key: content[key] for key in ('proposal', 'learning', 'evidence', 'evaluation')})
+
+
+def review_snapshot(store, proposal_id: str, cfg) -> dict:
+    """Read a complete revision; callers wrap multi-query reads in a transaction."""
+    content = review_content(store, proposal_id)
+    proposal = content['proposal']
+    snapshot = {'version': 2, **content, 'destination': _destination(proposal, cfg)}
     from .resolutions import origin
     resolution=origin(store,proposal)
     if resolution:
@@ -83,7 +93,8 @@ def review_snapshot(store, proposal_id: str, cfg) -> dict:
         snapshot.update(version=5,recovery=recovery,destination=recovery['source']['destination'])
     from .rejections import target_identity
     snapshot['target_identity'] = target_identity(store, snapshot['destination'])
-    return {'proposal_id': proposal_id, 'revision': _hash(snapshot), 'snapshot': snapshot}
+    return {'proposal_id': proposal_id, 'revision': _hash(snapshot), 'snapshot': snapshot,
+            'content_revision': review_content_revision(content)}
 
 
 def _request(body: dict) -> dict:
@@ -186,6 +197,9 @@ def command_status(store, command_id: str) -> dict:
     row = store.query_one('SELECT * FROM commands WHERE id=?', (command_id,))
     if row is None:
         raise CommandError('NoSuchCommand', f'No command {command_id!r}.', 404)
+    from . import quality
+    if row['action'] in quality.ACTIONS:
+        return quality.command_status(store, row)
     from . import reapplications
     if row['action']==reapplications.ACTION:
         return reapplications.status(store,row)
@@ -283,6 +297,9 @@ def command_status(store, command_id: str) -> dict:
 
 def submit_command(store, cfg, body: dict, *, now: str | None = None) -> dict:
     """Persist one all-or-nothing authorization. Replays return the same command."""
+    from . import quality
+    if isinstance(body, dict) and isinstance(body.get('action'), str) and body['action'] in quality.ACTIONS:
+        return quality.submit(store, cfg, body, now=now)
     from . import reapplications
     if isinstance(body,dict) and body.get('action')==reapplications.ACTION:
         return reapplications.submit(store,cfg,body,now=now)
@@ -325,6 +342,8 @@ def submit_command(store, cfg, body: dict, *, now: str | None = None) -> dict:
             if member['proposal_id'] not in waiting:
                 raise CommandError('NotWaiting', f"Proposal {member['proposal_id']!r} is no longer waiting for a decision.", 409)
             proposal = current['snapshot']['proposal']
+            if proposal['status'] == 'approved_user' and 'preview_revision' not in request:
+                raise CommandError('FreshReviewRequired', 'Historical approval requires a fresh combined target preview. Inspect the current edit before approving.', 409)
             destination = current['snapshot']['destination']
             key = _hash(destination_identity(destination))
             if key in targets:
@@ -338,6 +357,8 @@ def submit_command(store, cfg, body: dict, *, now: str | None = None) -> dict:
         validate_selection([current for current, _ in reviewed])
         from .reapplications import validate_selection as validate_reapplications
         validate_reapplications([current for current, _ in reviewed])
+        if 'preview_revision' not in request:
+            raise CommandError('FreshReviewRequired', 'Approval requires the complete selected target preview. Reload and review the current edit before approving.', 409)
         if 'preview_revision' in request:
             from .review import prepare_targets, preview_revision
             members = [current for current, _ in reviewed]

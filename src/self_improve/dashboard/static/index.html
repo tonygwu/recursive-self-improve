@@ -30,6 +30,9 @@
       <span>trajectory miner</span>
     </div>
 
+    <button class="navigation-open" id="navigation-open" type="button" aria-haspopup="dialog" aria-controls="navigation-dialog" aria-keyshortcuts="Meta+K Control+K">
+      <span>Find or go to…</span><kbd>⌘ / Ctrl K</kbd>
+    </button>
     <div class="nav__group">
       <a class="nav-item" id="nav-overview" href="#/overview">
         <span class="nav-item__icon" aria-hidden="true"></span>
@@ -60,6 +63,10 @@
       <button class="btn btn--quiet" id="theme-toggle" type="button" aria-pressed="false">
         Dark theme
       </button>
+      <button class="btn btn--quiet" id="character-shortcuts-toggle" type="button" aria-pressed="false" aria-describedby="character-shortcuts-notice">
+        Character shortcuts: off
+      </button>
+      <p class="footnote" id="character-shortcuts-notice" role="status" hidden></p>
     </div>
   </nav>
 
@@ -69,88 +76,25 @@
       <!-- A fetch that fails is loud and names the request. It never leaves a
            stale view on screen pretending to be current. -->
       <div class="error-state" id="global-error" style="display:none" role="alert"></div>
+      <div id="navigation-breadcrumb"></div>
       <section class="view run-page" id="run-detail" style="display:none" aria-label="Run detail"></section>
 
       <!-- ============================ V1 · OVERVIEW ======================= -->
-      <div class="view" id="view-overview">
-        <header class="view__head">
-          <div class="view__heading">
-            <h1 class="view__title">Overview</h1>
-            <p class="view__desc">Is it healthy, does it need me?</p>
-          </div>
-          <div class="view__actions">
-            <button class="btn btn--quiet" id="ov-grid-numbers" type="button" aria-pressed="false">
-              Show numbers
-            </button>
-          </div>
-        </header>
-
-        <div class="banner" id="ov-banner" style="display:none"></div>
-
-        <p class="statusline" id="ov-statusline">Loading&hellip;</p>
-        <p class="statusline__sub" id="ov-statusline-sub"></p>
-
+      <div class="view overview-page" id="view-overview">
+        <header class="view__head"><div class="view__heading"><h1 class="view__title">Overview</h1><p class="view__desc">Is the loop healthy, and does it need you?</p></div><div class="view__actions"><span id="ov-policy"></span><button class="btn btn--quiet" id="ov-refresh" type="button">Refresh</button></div></header>
+        <p id="ov-read-state" class="caption" role="status" style="display:none"></p>
+        <section id="ov-loop" class="overview-loop" aria-label="Recorded improvement loop"><p class="caption">Loading recorded populations…</p></section>
+        <section class="overview-status" aria-label="Loop status"><p class="statusline" id="ov-statusline">Loading…</p><details><summary>Dates, population coverage and data freshness</summary><p class="statusline__sub" id="ov-statusline-sub"></p><div id="ov-loop-coverage"></div><div class="banner" id="ov-banner" style="display:none"></div></details></section>
         <div class="tiles" id="ov-tiles"></div>
-
-        <section class="panel">
-          <header class="panel__head">
-            <h2 class="panel__title">Run &times; stage</h2>
-            <span class="panel__meta" id="ov-grid-meta"></span>
-          </header>
-          <div class="panel__body">
-            <div class="scroll-x" id="ov-grid">
-              <div class="loading"><span class="loading__bar"></span><span class="loading__bar"></span><span class="loading__bar"></span></div>
-            </div>
-            <ul class="legend" id="ov-grid-legend"></ul>
-            <p class="footnote" id="ov-grid-foot"></p>
-          </div>
-        </section>
-
-        <div class="cols cols--2">
-          <section class="panel">
-            <header class="panel__head">
-              <h2 class="panel__title">Backlog against arrivals</h2>
-              <span class="panel__meta">a race, not a countdown</span>
-            </header>
-            <div class="panel__body">
-              <div id="ov-backlog"></div>
-              <p class="footnote" id="ov-backlog-foot" style="margin-top:var(--s-5)"></p>
-            </div>
-          </section>
-
-          <section class="panel">
-            <header class="panel__head">
-              <h2 class="panel__title">What failed, in English</h2>
-              <span class="panel__meta" id="ov-failures-meta"></span>
-            </header>
-            <div class="panel__body" id="ov-failures"></div>
-          </section>
-        </div>
-
-        <div class="cols cols--2">
-          <section class="panel">
-            <header class="panel__head">
-              <h2 class="panel__title">Gate health</h2>
-              <span class="panel__meta">counts, not a pass rate</span>
-            </header>
-            <div class="panel__body" id="ov-gate"></div>
-          </section>
-
-          <section class="panel">
-            <header class="panel__head">
-              <h2 class="panel__title">Proposals</h2>
-              <span class="panel__meta" id="ov-inbox-meta"></span>
-            </header>
-            <div class="panel__body" id="ov-inbox"></div>
-          </section>
-        </div>
-
-        <section class="panel">
-          <header class="panel__head">
-            <h2 class="panel__title">Has the loop earned trust yet?</h2>
-          </header>
-          <div class="panel__body" id="ov-confidence"></div>
-        </section>
+        <section class="panel"><header class="panel__head"><div><h2 class="panel__title">Every night, every stage</h2><p class="panel__meta" id="ov-grid-meta"></p></div><button class="btn btn--quiet" id="ov-grid-numbers" type="button" aria-pressed="false">Show numbers</button></header><div class="panel__body">
+          <div class="overview-run-columns"><div class="scroll-x" id="ov-grid" tabindex="0" role="region" aria-label="Run history, scroll for more nights"><div class="loading"><span class="loading__bar"></span></div></div><aside id="ov-latest" aria-label="Latest recorded run"></aside></div>
+          <div class="overview-grid-foot"><ul class="legend" id="ov-grid-legend"></ul><details class="overview-detail"><summary>Run states, missing stages and multiple runs</summary><div class="footnote" id="ov-grid-foot"></div></details></div>
+        </div></section>
+        <div class="overview-lower"><section class="panel overview-outcomes"><header class="panel__head"><h2 class="panel__title">Recent reviewed deliveries</h2></header><div class="panel__body" id="ov-deliveries"></div><header class="panel__head"><h2 class="panel__title">Recorded failures</h2><span class="panel__meta" id="ov-failures-meta"></span></header><div class="panel__body" id="ov-failures"></div></section>
+          <section class="panel"><header class="panel__head"><h2 class="panel__title">What's waiting on you</h2><span class="panel__meta" id="ov-inbox-meta"></span></header><div class="panel__body" id="ov-inbox"></div></section></div>
+        <section class="panel"><header class="panel__head"><h2 class="panel__title">Arrivals and mining throughput</h2><span class="panel__meta">Observed work and configured limits</span></header><div class="panel__body"><div id="ov-backlog"></div><details class="overview-detail"><summary>Sampling policy, measurement windows and coverage</summary><p class="footnote" id="ov-backlog-foot"></p></details></div></section>
+        <details class="overview-detail panel"><summary>Historical gate and delivery counts</summary><div class="panel__body"><p><a href="#/evals">Open Evals &amp; trends for complete evaluation evidence, recurrence, human quality and class policy.</a></p><div id="ov-gate"></div><div id="ov-confidence"></div></div></details>
+        <p class="overview-provenance caption">Overview reads the selected state database. Decisions happen in Review; instruction delivery runs separately. Transcript dates, run dates and missing coverage are identified in each section.</p>
       </div>
 
       <!-- ============================== V2 · RULES ======================== -->
@@ -162,57 +106,55 @@
           </div>
         </header>
 
-        <!-- Search is the entry point, not a filter chip: the journey starts
-             with the operator typing a rule or an error string. -->
-        <label class="search" id="rules-search">
-          <span class="search__glyph" aria-hidden="true">&#9906;</span>
-          <input class="search__input" id="rules-search-input" type="search"
-                 autocomplete="off" spellcheck="false"
-                 placeholder="Type a rule, an error string, a repo or a file path">
-          <span class="search__meta" id="rules-search-meta"></span>
-          <span class="kbd" aria-hidden="true">/</span>
-        </label>
-
-        <section class="panel">
-          <header class="panel__head">
-            <h2 class="panel__title">Machine-authored rules</h2>
-            <span class="panel__meta" id="rules-meta"></span>
-          </header>
-          <div class="panel__body panel__body--flush">
-            <div class="scroll-x scroll-x--tall" id="rules-table-wrap">
-              <table class="data data--zebra data--wrap">
-                <thead>
-                  <tr>
-                    <th scope="col">Rule</th>
-                    <th scope="col">State</th>
-                    <th scope="col">Target</th>
-                    <th scope="col" class="num">Evidence</th>
-                    <th scope="col" class="num">Repos</th>
-                    <th scope="col">Gate</th>
-                    <th scope="col">Miner gen.</th>
-                  </tr>
-                </thead>
+        <div class="rules-mode" role="group" aria-label="Search scope"><button class="rules-chip" data-evidence-mode="rules" aria-pressed="true">Rules</button><button class="rules-chip" data-evidence-mode="evidence" aria-pressed="false">All evidence</button></div>
+        <div class="rules-search-row">
+          <label class="search" id="rules-search">
+            <img src="icons/rules-search.svg" width="16" height="16" alt="">
+            <input class="search__input" id="rules-search-input" type="search" data-character-key="/" aria-label="Search rules and linked evidence"
+                   autocomplete="off" spellcheck="false" maxlength="1000"
+                   placeholder="Search rules, errors, repos or file paths">
+            <span class="search__meta" id="rules-search-meta"></span>
+            <span class="kbd" aria-hidden="true" data-character-hint hidden style="display:none">/</span>
+          </label>
+          <label class="rules-group-toggle" data-rule-only><input id="rules-group-toggle" type="checkbox" checked> Group similar rules</label>
+        </div>
+        <div class="rules-controls">
+          <div class="rules-targets" data-rule-only role="group" aria-label="Filter by target">
+            <button class="rules-chip" data-rule-target="all" aria-pressed="true">All</button>
+            <button class="rules-chip" data-rule-target="global" aria-pressed="false">Global instructions</button>
+            <button class="rules-chip" data-rule-target="project" aria-pressed="false">Project files</button>
+            <button class="rules-chip" data-rule-target="skill" aria-pressed="false">Skills</button>
+            <button class="rules-chip" data-rule-target="hook" aria-pressed="false">Hooks</button>
+            <button class="rules-chip" data-rule-target="none" aria-pressed="false">No target</button>
+          </div>
+          <label class="rules-sort" data-rule-only>Sort <select id="rules-sort"><option value="evidence">Most evidence</option><option value="recent">Recent</option><option value="title">Title</option><option value="state">State</option></select></label>
+          <div id="evidence-filters" class="evidence-filters" style="display:none"><label>Source <select id="evidence-kind" aria-label="Source"><option value="">All sources</option><option value="learning">Rules</option><option value="proposal">Proposals</option><option value="incident">Incidents</option><option value="session">Sessions</option><option value="instruction">Instruction files</option><option value="revision">Delivered revisions</option></select></label><label>Project <select id="evidence-project" aria-label="Project"><option value="">All projects</option></select></label></div>
+          <button class="btn btn--quiet" id="rules-refresh" data-rules-refresh="true">Refresh</button>
+        </div>
+        <p class="caption" id="rules-meta" role="status" tabindex="-1"></p>
+        <div class="rules-layout">
+          <section class="panel rules-panel" aria-label="Machine-authored rules">
+            <div id="rules-notice" role="status"></div>
+            <div id="evidence-results" style="display:none" aria-label="Retained evidence results"></div>
+            <div class="scroll-x" id="rules-table-wrap" tabindex="0" role="region" aria-label="Rules results, scroll for more columns">
+              <table class="data rules-table">
+                <thead><tr><th scope="col">State</th><th scope="col">Rule</th><th scope="col">Target</th><th scope="col">From</th></tr></thead>
                 <tbody id="rules-results"></tbody>
               </table>
             </div>
             <div id="rules-empty" style="display:none"></div>
-          </div>
-          <footer class="panel__foot" id="rules-foot"></footer>
-        </section>
-
-        <section class="panel">
-          <header class="panel__head">
-            <h2 class="panel__title">Duplicate families</h2>
-          </header>
-          <div class="panel__body" id="rules-grouping"></div>
-        </section>
+            <footer class="panel__foot" id="rules-foot"></footer>
+          </section>
+          <div id="rules-inspector-host"></div>
+        </div>
+        <details class="rules-coverage"><summary>Grouping and search coverage</summary><div id="rules-grouping"></div></details>
       </div>
 
       <!-- ============================ V4 · PROJECTS ======================= -->
       <section class="view project-page" id="project-detail" style="display:none" aria-label="Project detail">
         <div id="project-detail-body"></div>
       </section>
-      <div class="view" id="view-projects" style="display:none">
+      <div class="view projects-list" id="view-projects" style="display:none">
         <header class="view__head">
           <div class="view__heading">
             <h1 class="view__title">Projects</h1>
@@ -220,41 +162,46 @@
           </div>
         </header>
 
+        <p class="projects-notice" id="projects-collapse-note"><img src="icons/project-identity.svg" alt="" width="6" height="6"> Working copies share one canonical repository identity.</p>
         <section class="panel">
           <header class="panel__head">
             <h2 class="panel__title">Repositories</h2>
             <span class="panel__meta" id="projects-meta"></span>
           </header>
+          <form class="projects-controls" id="projects-search-form" role="search" aria-label="Find repositories">
+            <label for="projects-search">Find a repository</label>
+            <input type="search" id="projects-search" name="q" placeholder="Name, identity, alias or copy path" autocomplete="off">
+            <button class="btn" type="submit">Search</button>
+            <button class="btn btn--quiet" type="button" data-project-clear="true">Clear</button>
+            <button class="btn btn--quiet" type="button" id="projects-refresh" data-project-refresh="true">Refresh</button>
+          </form>
+          <p class="projects-read-state" id="projects-read-state" role="status"></p>
           <div class="panel__body panel__body--flush">
-            <div class="scroll-x scroll-x--tall">
-              <table class="data data--zebra data--wide">
+            <div class="scroll-x" id="projects-table-wrap" role="region" aria-label="Repository comparison" tabindex="0">
+              <table class="data projects-table">
+                <caption class="visually-hidden">Canonical repositories. Queue counts use all retained history; signal rates use timestamped physical lines from the last 30 days.</caption>
+                <colgroup><col class="project-col-repo"><col class="project-col-sessions"><col class="project-col-incidents"><col class="project-col-rate"><col class="project-col-signal"><col class="project-col-context"><col class="project-col-rules"><col class="project-col-benefit"></colgroup>
                 <thead>
                   <tr>
-                    <th scope="col">Repo</th>
-                    <th scope="col">Identity</th>
-                    <th scope="col" class="num">Indexed transcripts</th>
-                    <th scope="col" class="num">Clones</th>
-                    <th scope="col" class="num">Queue incidents</th>
-                    <th scope="col" class="num">Signals /100k lines · 30d</th>
-                    <th scope="col">Top signal</th>
-                    <th scope="col" class="num">Lessons contributed</th>
-                    <th scope="col">Observed instructions</th>
-                    <th scope="col" class="num">Benefit</th>
+                    <th scope="col" id="project-sort-repository"><button type="button" data-project-sort="repository">Repository</button></th>
+                    <th scope="col" class="num" id="project-sort-sessions"><button type="button" data-project-sort="sessions">Indexed<br>sessions</button></th>
+                    <th scope="col" class="num" id="project-sort-incidents"><button type="button" data-project-sort="incidents">Queue<br>incidents</button></th>
+                    <th scope="col" class="num" id="project-sort-rate"><button type="button" data-project-sort="rate">Signals /100k<br>lines · 30d</button></th>
+                    <th scope="col" id="project-sort-signal"><button type="button" data-project-sort="signal">Top queue<br>signal</button></th>
+                    <th scope="col" id="project-sort-context"><button type="button" data-project-sort="context">Observed<br>context</button></th>
+                    <th scope="col" class="num" id="project-sort-rules"><button type="button" data-project-sort="rules">Rules</button></th>
+                    <th scope="col">Benefit</th>
                   </tr>
                 </thead>
                 <tbody id="projects-tbody"></tbody>
               </table>
             </div>
           </div>
-          <footer class="panel__foot" id="projects-foot"></footer>
+          <footer class="projects-pagination"><span id="projects-page-status" tabindex="-1" role="status"></span><nav id="projects-pagination" aria-label="Repository pages"></nav></footer>
         </section>
-
-        <section class="panel">
-          <header class="panel__head">
-            <h2 class="panel__title">What this table could not measure</h2>
-          </header>
-          <div class="panel__body" id="projects-notes"></div>
-        </section>
+        <p class="projects-notice projects-notice--benefit" id="projects-benefit-note"></p>
+        <p class="footnote" id="projects-foot"></p>
+        <details class="projects-coverage"><summary>Coverage and exclusions <span id="projects-coverage-count"></span></summary><div id="projects-notes"></div></details>
       </div>
 
       <div class="view trends-page" id="view-evals" style="display:none">
@@ -264,9 +211,12 @@
             <p class="view__desc">What the recorded signals and evaluations can tell us about the loop.</p>
           </div>
         </header>
+        <div id="class-evidence"></div>
+        <div class="eval-tools"><div id="trend-controls"></div><section class="quality-history" id="quality-samples" aria-label="Human assessment history"></section></div>
         <div id="trends-body"></div>
       </div>
 
+      <section class="view quality-page" id="quality-detail" style="display:none" aria-label="Human quality assessment"></section>
       <section class="view evaluation-page" id="evaluation-detail" style="display:none" aria-label="Evaluation detail"></section>
 
       <!-- Review records commands and displays delivery and operation history. -->
@@ -289,6 +239,8 @@
         </section>
 
         <p class="footnote" id="review-note"></p>
+        <section class="panel panel__body" id="review-selected-proposal" tabindex="-1" style="display:none"></section>
+        <div id="review-execution" tabindex="-1" aria-live="polite"></div>
         <section class="panel" id="review-rollback" aria-labelledby="rollback-title" style="display:none">
           <header class="panel__head">
             <h2 class="panel__title" id="rollback-title" tabindex="-1">Review rollback</h2>
@@ -346,5 +298,26 @@
   </div>
 
 </div>
+<dialog class="navigation-dialog" id="navigation-dialog" aria-labelledby="navigation-title" aria-describedby="navigation-help">
+  <header class="navigation-head">
+    <h2 id="navigation-title">Find or go to</h2>
+    <button class="btn btn--quiet" id="navigation-close" type="button" aria-label="Close command palette">Esc</button>
+  </header>
+  <div class="navigation-search">
+    <label for="navigation-input">Search pages, projects and retained evidence</label>
+    <input id="navigation-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="navigation-results" autocomplete="off" maxlength="500" placeholder="A rule, an error, a session ID…" autofocus>
+  </div>
+  <p class="caption" id="navigation-status" role="status" aria-live="polite"></p>
+  <button class="btn" id="navigation-retry" type="button" hidden>Retry evidence search</button>
+  <div id="navigation-results" class="navigation-results" role="listbox" aria-label="Destinations"></div>
+  <footer class="navigation-footer">
+    <div class="navigation-actions">
+      <button class="btn btn--quiet" id="navigation-favorite" type="button" aria-pressed="false">Save selected</button>
+      <button class="btn btn--quiet" id="navigation-save-current" type="button">Save current page</button>
+    </div>
+    <p class="caption" id="navigation-help">↑ ↓ to move · Enter to open · Esc to close. Exact IDs: run:, command:, operation:. Up to 10 favorites and 10 recent items are saved in this browser; the oldest drops when full.</p>
+    <p class="caption" id="navigation-saved-status" role="status"></p>
+  </footer>
+</dialog>
 </body>
 </html>

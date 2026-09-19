@@ -65,12 +65,32 @@ def make_env(tmp_path: Path, **overrides) -> Env:
     claude.mkdir()
     codex.mkdir()
     repo = make_repo(tmp_path / "work" / "alpha")
+    # Without these, Config falls back to the developer's real provider paths,
+    # so a pipeline test would pass or fail according to what happens to be
+    # installed on the machine. Same synthetic executables as e2e_corpus: they
+    # answer the startup version probe and refuse every model invocation.
+    providers = tmp_path / "providers"
+    providers.mkdir()
+    for name in ("claude", "codex"):
+        executable = providers / name
+        executable.write_text(
+            '#!/bin/sh\n'
+            'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n'
+            '  printf "synthetic provider 1.0\\n"\n'
+            'else\n'
+            '  printf "fixture permits only a version probe\\n" >&2\n'
+            '  exit 64\n'
+            'fi\n'
+        )
+        executable.chmod(0o700)
     settings = {
         "claude_projects_dir": str(claude),
         "codex_sessions_dir": str(codex),
         "codex_archived_dir": str(tmp_path / "codex-archived"),
         "state_dir": str(tmp_path / "state"),
         "project_identity_use_gh": False,
+        "claude_path": str(providers / "claude"),
+        "codex_path": str(providers / "codex"),
         # pytest's tmp_path sits under /var/folders on macOS, which the default
         # denylist excludes. Denial is tested explicitly with its own marker.
         "denylist_substrings": ("denied-tree",),
@@ -452,7 +472,8 @@ def test_missing_schema_is_a_named_error_not_empty_history(tmp_path):
         exposure(env.store)
     with pytest.raises(so.ScanObservationError, match="scan_observation_occurrences is unreadable"):
         so.scan_history(env.store, session_file=str(path))
-    env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (so.MIGRATION,))
+    for migration in (so.MIGRATION, '0026_scan_incident_links', '0027_scan_run_index', '0030_session_context'):
+        env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (migration,))
     env.store.commit()
     with pytest.raises(so.ScanObservationError, match="require migration 0022_scan_observations"):
         exposure(env.store)
@@ -522,10 +543,12 @@ def test_rebuild_deletes_nothing_when_the_backup_cannot_be_written(tmp_path, mon
 def test_older_schema_dry_run_reads_without_migrating(tmp_path):
     env = make_env(tmp_path)
     _live_and_deleted(env)
-    for table in ("scan_incident_links", "scan_observation_occurrences", "scan_occurrences",
+    for table in ("session_context_records", "session_context_batches",
+                  "scan_incident_links", "scan_observation_occurrences", "scan_occurrences",
                   "scan_lines", "scan_observations", "scan_manifests", "scan_working_copies"):
         env.store.conn.execute(f"DROP TABLE {table}")
-    env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (so.MIGRATION,))
+    for migration in (so.MIGRATION, '0026_scan_incident_links', '0027_scan_run_index', '0030_session_context'):
+        env.store.conn.execute("DELETE FROM schema_migrations WHERE name = ?", (migration,))
     env.store.commit()
     db = Path(env.store.db_path)
     env.store.conn.close()

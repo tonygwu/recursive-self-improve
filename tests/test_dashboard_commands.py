@@ -20,6 +20,7 @@ def env(tmp_path):
         target = tmp_path / 'rules.md'
         target.write_text(OLD)
         one = insert_proposal(store, target=target, diff=make_diff(OLD, NEW), status='ungated')
+        (tmp_path / 'other.md').write_text(OLD)
         two = insert_proposal(store, target=tmp_path / 'other.md', diff=make_diff(OLD, NEW), status='pending')
         store.update('proposals', 'id', two['id'], {'learning_id': one['learning_id']})
         store.commit()
@@ -32,7 +33,10 @@ def request(client, ids, key='test-request-001'):
         response = client.get(f'/api/proposals/{pid}/review')
         assert response.status_code == 200, response.text
         members.append({'proposal_id': pid, 'revision': response.json()['revision']})
-    return {'request_key': key, 'action': 'approve', 'members': members, 'note': 'Reviewed all selected changes.'}
+    response = client.get('/api/review-preview', params={'proposal_ids': ','.join(ids)})
+    assert response.status_code == 200, response.text
+    return {'request_key': key, 'action': 'approve', 'members': members,
+            'preview_revision': response.json()['revision'], 'note': 'Reviewed all selected changes.'}
 
 
 def test_atomic_approval_freezes_every_selected_revision_and_survives_restart(env):
@@ -258,7 +262,8 @@ def test_compatibility_approval_is_an_idempotent_command_adapter(env):
     cfg, store, one, _ = env
     with TestClient(create_app(cfg)) as client:
         reviewed = request(client, [one['id']])
-        body = {'decision': 'approve', 'request_key': reviewed['request_key'], 'revision': reviewed['members'][0]['revision']}
+        body = {'decision': 'approve', 'request_key': reviewed['request_key'],
+                'revision': reviewed['members'][0]['revision'], 'preview_revision': reviewed['preview_revision']}
         first = client.post(f"/api/proposals/{one['id']}/decision", json=body)
         second = client.post(f"/api/proposals/{one['id']}/decision", json=body)
     assert first.status_code == second.status_code == 200

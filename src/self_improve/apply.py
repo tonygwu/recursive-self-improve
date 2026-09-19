@@ -946,14 +946,16 @@ def _prepare_command_delivery(store, cfg, command_id, target):
             _cancel_rejected_target(store, command_id, target, checkpoint, rejection)
             return None
         _authorized_members(store, cfg, command_id, target['id'])
-        base = read_destination(destination)
         preview = checkpoint.get('review_preview')
-        if preview and (base['content_hash'] != preview['before_hash'] or base['exists'] != preview['before_exists']):
+        if not preview:
+            raise DeliveryBlocked('FreshReviewRequired', 'This historical approval has no reviewed target base. Cancel its unwritten work and approve a fresh complete preview.')
+        base = read_destination(destination)
+        if base['content_hash'] != preview['before_hash'] or base['exists'] != preview['before_exists']:
             raise DeliveryBlocked('TargetChanged', 'The target content changed after approval. Review a new preview before delivery.')
         prepared = _prepare_write_checkpoint(cfg, destination, base, target['diff_unified'],
                    f"self-improve: approved command {command_id} target {target['id']}")
         delivery = prepared['delivery']
-        if preview and delivery['after_hash'] != preview['after_hash']:
+        if delivery['after_hash'] != preview['after_hash']:
             raise DeliveryBlocked('PreviewChanged', 'The prepared edit differs from the approved preview.')
         checkpoint.update(prepared)
         store.update('command_targets', 'id', target['id'], {'state': 'running', 'checkpoint_json': _json(checkpoint)})
@@ -1011,6 +1013,8 @@ def _deliver_command_target(store, cfg, command_id, target):
                 return
         members = _authorized_members(store, cfg, command_id, target['id'], delivered=delivered)
         if not delivered:
+            if not checkpoint.get('review_preview'):
+                raise DeliveryBlocked('FreshReviewRequired', 'This historical approval has no reviewed target base. Cancel its unwritten work and approve a fresh complete preview.')
             _publish_prepared_write(destination, delivery, target['id'], _delivery_checkpoint)
         after_sha = snapshot(cfg, path, 'after', content=delivery['after_content'].encode('utf-8'))
         checkpoint['result'] = {'snapshot_after': after_sha, 'branch_commit': delivery['branch_commit'],

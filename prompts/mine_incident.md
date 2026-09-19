@@ -33,6 +33,40 @@ Redacted conversation window (strict JSON, chronological order):
 - Generalize past incidental specifics (file names, one-off typos) but never
   past the incident's actual mechanism.
 
+## Summary style guide
+
+Write `incident_summary` for an operator scanning the dashboard, using one or
+two short sentences. Use plain language and active verbs.
+
+- Start with the agent's action and its observed consequence. Name the concrete
+  mistake, not a broad category such as "verification failure".
+- Add a cause only when the retained evidence supports it. If the cause is unknown,
+  say what the available window does not show. Do not infer intent or invent a cause.
+- Distinguish a reported result from a verified result. A successful exit code,
+  a proposed edit or a model's assertion alone does not prove success.
+- Include a tool name, error or identifier only when it explains the mechanism.
+  Omit incidental paths, session IDs and chronology that do not change the lesson.
+  Preserve redaction markers. Do not reconstruct omitted private details.
+- Keep the factual incident summary separate from `generalized_rule`. Use `why`
+  for the concrete failure the rule can prevent, not a claim of measured benefit.
+- For a negative verdict, describe the observed event and why it supports no
+  durable lesson. Do not force a failure narrative onto a successful recovery.
+- Apply this guide to the summary you produce now. Do not amend an existing rule only to change its wording.
+  Follow the duplicate-check instructions below.
+
+Invented examples; use the incident's own evidence rather than copying them:
+
+- If the output explicitly reports three failed tests, but the agent reports a
+  pass after checking only the exit code: "The agent reported that tests passed
+  because the command exited successfully, although its output listed three
+  failing tests. It did not inspect that output."
+- If the window records a lost setting but omits the reason for replacing its
+  file: "The agent replaced the configuration file and removed an existing
+  setting. The retained window does not show why it chose that replacement."
+- If a timeout resolves on the first retry without a correction or repeated
+  mistake: "The tool completed after one timeout and retry. The retained events
+  show no correction or repeated mistake that requires a new rule."
+
 ## Duplicate check
 
 Read the in-force instructions above carefully. If the lesson of this incident

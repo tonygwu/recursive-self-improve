@@ -103,7 +103,7 @@ def _file_inventory(item, revisions, working_copy_path):
     return {**public, 'lines': len(lines), 'ownership': counts, 'units': units}
 
 
-def build_inventory(*, surface, project_key, working_copy_path, revisions, observed_at, run_id=''):
+def build_inventory(*, surface, project_key, working_copy_path, revisions, observed_at, run_id='', measurements=None):
     """Pure classification; all input file reads have already finished."""
     at = timestamp(observed_at, 'inventory observation')
     selected = [validate_revision(r) for r in revisions if r['project_key'] in {'',project_key} and r['applied_at'] <= at]
@@ -126,8 +126,24 @@ def build_inventory(*, surface, project_key, working_copy_path, revisions, obser
               'files': files, 'totals': totals, 'scopes': [dict(provider=k[0],scope=k[1],**v) for k,v in sorted(scopes.items())],
               **{k:v for k,v in surface.items() if k not in {'files'}},
               'meaning': 'Unmarked text is human-managed, not verified human authorship. Machine units exactly match retained delivered revisions. Files and scopes do not prove session loading.'}
-    if record['profile'] == 'instruction-surfaces/2':
+    if record['profile'] in {'instruction-surfaces/2', 'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
         record['context'] = summarize(files)
+    if record['profile'] in {'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} and not files and any(
+            issue['cause'] == 'working_copy_identity_changed' for issue in record['issues']):
+        # Identity refusal bypasses filesystem discovery entirely. It retains
+        # an explicit failed observation, never an observed empty catalog.
+        record.setdefault('uninspected_commands', [])
+        record.setdefault('incomplete_command_roots', [])
+        if record['profile'] in {'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
+            record.setdefault('managed_discovery', {'root': '', 'memory_status': 'not_checked', 'skills_status': 'not_checked'})
+    if record['profile'] in {'instruction-surfaces/5', 'instruction-surfaces/6'} and 'policy_discovery' not in record:
+        from .instruction_policy import unchecked
+        record['policy_discovery'] = unchecked()
+    if record['profile'] == 'instruction-surfaces/6' and 'plugin_discovery' not in record:
+        from .instruction_plugins import unchecked
+        record['plugin_discovery'] = unchecked()
+    if measurements is not None:
+        record['measurements'] = measurements
     record['id'] = digest(record)
     return record
 
@@ -135,6 +151,8 @@ def build_inventory(*, surface, project_key, working_copy_path, revisions, obser
 def _validate(record, revisions):
     owner = 'inventory.'+str(record.get('id','?')) if isinstance(record,dict) else 'inventory'
     try:
+        if record['profile'] not in {'instruction-surfaces/1', 'instruction-surfaces/2', 'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
+            raise ValueError('unsupported instruction source profile')
         if (record['version'] != 1 or record['id'] != digest({k:v for k,v in record.items() if k!='id'})
                 or record['status'] not in {'recorded','partial'} or record['runtime_loading_verified'] is not False
                 or not record['project_key'] or not isinstance(record['files'],list)
@@ -156,9 +174,13 @@ def _validate(record, revisions):
                 prefix = path['eligible_prefix_bytes']
                 if type(prefix) is not int or not 0 <= prefix <= file['bytes'] or path['runtime_loading_verified'] is not False:
                     raise ValueError('invalid source eligibility')
-                if record['profile'] == 'instruction-surfaces/2' and (
-                        path['origin'] not in {'global', 'project'} or path['provider'] not in {'claude', 'codex'}
-                        or path['source'] not in {'memory', 'rule', 'skill', 'import'}
+                sources = {'memory', 'rule', 'skill', 'import'} | ({'command'} if record['profile'] in {'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} else set())
+                if record['profile'] in {'instruction-surfaces/5', 'instruction-surfaces/6'}: sources.add('embedded_memory')
+                if record['profile'] == 'instruction-surfaces/6': sources.update({'plugin_skill','plugin_command'})
+                if record['profile'] in {'instruction-surfaces/2', 'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} and (
+                        path['origin'] not in ({'global', 'project', 'managed'} if record['profile'] in {'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} else {'global', 'project'}) or path['provider'] not in {'claude', 'codex'}
+                        or path['source'] not in sources
+                        or (path['source'] == 'command' and path['provider'] != 'claude')
                         or path['scope']['kind'] not in {'global', 'project_always_loaded', 'path_scoped', 'on_demand'}
                         or not isinstance(path['conditions'], list) or not isinstance(path['eligibility_reason'], str)):
                     raise ValueError('invalid source-profile loading path')
@@ -206,8 +228,23 @@ def _validate(record, revisions):
             if file['ownership']['machine'] != {'lines':machine_lines,'bytes':machine_bytes}:
                 raise ValueError('machine allocation differs from exact units')
         if totals != record['totals']: raise ValueError('file totals do not reconcile')
-        if record['profile'] == 'instruction-surfaces/2' and record['context'] != summarize(record['files']):
+        if 'measurements' in record:
+            from .instruction_metrics import validate
+            validate(record['measurements'], record)
+        if record['profile'] in {'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
+            from .instruction_commands import validate_commands
+            validate_commands(record['files'], uninspected=record['uninspected_commands'], incomplete_roots=record['incomplete_command_roots'])
+        if record['profile'] in {'instruction-surfaces/2', 'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} and record['context'] != summarize(record['files']):
             raise ValueError('context totals do not reconcile')
+        if record['profile'] in {'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
+            from .instruction_managed import validate_managed
+            validate_managed(record)
+        if record['profile'] in {'instruction-surfaces/5', 'instruction-surfaces/6'}:
+            from .instruction_policy import validate_policy
+            validate_policy(record)
+        if record['profile'] == 'instruction-surfaces/6':
+            from .instruction_plugins import validate_plugins
+            validate_plugins(record)
         if record['scopes'] != [dict(provider=k[0],scope=k[1],**v) for k,v in sorted(scopes.items())]:
             raise ValueError('source scope totals do not reconcile')
     except (KeyError,TypeError,ValueError) as exc:
@@ -239,16 +276,19 @@ def _read(row, revisions):
         raise InventoryError(str(exc)) from exc
 
 
-def project_inventory(store, *, project_key, limit=20, cursor=None):
+def project_inventory(store, *, project_key, limit=20, cursor=None, working_copy_id=None):
     """Latest checks per copy. No filesystem reads, migrations, or writes."""
-    return _project_inventory(store, project_key=project_key, limit=limit, cursor=cursor)
+    return _project_inventory(store, project_key=project_key, limit=limit, cursor=cursor, working_copy_id=working_copy_id)
 
 
-def _project_inventory(store, *, project_key, limit=20, cursor=None, revisions=None):
+def _project_inventory(store, *, project_key, limit=20, cursor=None, revisions=None, working_copy_id=None):
     """Share already validated revisions within one multi-project read transaction."""
     if not isinstance(project_key,str) or not project_key or type(limit) is not int or not 1 <= limit <= 100:
         raise InventoryError('Invalid inventory project or page limit')
-    selector = digest(['project-inventory/1',project_key])
+    if working_copy_id is not None and (not isinstance(working_copy_id,str) or len(working_copy_id)!=64
+            or any(c not in '0123456789abcdef' for c in working_copy_id)):
+        raise InventoryError('Invalid inventory working copy')
+    selector = digest(['project-inventory/1',project_key] + ([working_copy_id] if working_copy_id is not None else []))
     position = ''
     if cursor is not None:
         try:
@@ -258,12 +298,15 @@ def _project_inventory(store, *, project_key, limit=20, cursor=None, revisions=N
         except (ValueError,KeyError,TypeError,UnicodeError) as exc:
             raise InventoryError('Invalid inventory cursor or different project') from exc
     response = {'project_key':project_key,'records':[],'count':None,'next_cursor':None,'computable':False,'reason':'schema_unavailable'}
+    if working_copy_id is not None: response['working_copy_id'] = working_copy_id
     if not store.query_one('SELECT name FROM schema_migrations WHERE name=?',(MIGRATION,)): return response
     require_schema(store)
+    clause = 'project_key=?' + (' AND working_copy_id=?' if working_copy_id is not None else '')
+    values = (project_key,working_copy_id) if working_copy_id is not None else (project_key,)
     copies = store.query(f'SELECT working_copy_id,MAX(observed_at) AS observed_at FROM {TABLE} '
-                         'WHERE project_key=? AND working_copy_id>? GROUP BY working_copy_id ORDER BY working_copy_id LIMIT ?',
-                         (project_key,position,limit+1))
-    count = store.query_one(f'SELECT COUNT(DISTINCT working_copy_id) n FROM {TABLE} WHERE project_key=?',(project_key,))['n']
+                         f'WHERE {clause} AND working_copy_id>? GROUP BY working_copy_id ORDER BY working_copy_id LIMIT ?',
+                         (*values,position,limit+1))
+    count = store.query_one(f'SELECT COUNT(DISTINCT working_copy_id) n FROM {TABLE} WHERE {clause}',values)['n']
     if revisions is None:
         revisions = {r['id']:r for r in retained_revisions(store)}
     records = []
@@ -271,7 +314,7 @@ def _project_inventory(store, *, project_key, limit=20, cursor=None, revisions=N
         same = [_read(row,revisions) for row in store.query(
             f'SELECT * FROM {TABLE} WHERE project_key=? AND working_copy_id=? AND observed_at=? ORDER BY id',
             (project_key,copy['working_copy_id'],copy['observed_at']))]
-        signatures = {digest({k:r[k] for k in ('files','issues','profile','scopes')}) for r in same}
+        signatures = {digest({k:v for k,v in r.items() if k not in {'id','run_id'}}) for r in same}
         if len(signatures)>1:
             records.append({'working_copy_id':copy['working_copy_id'],'working_copy':same[0]['working_copy'],
                             'observed_at':copy['observed_at'],'status':'conflicting','observations':same})
@@ -279,4 +322,58 @@ def _project_inventory(store, *, project_key, limit=20, cursor=None, revisions=N
     response.update(records=records,count=count,computable=bool(count),reason='' if count else 'no_inventory_observations')
     if len(copies)>limit:
         response['next_cursor']=base64.urlsafe_b64encode(encoded({'selector':selector,'position':copies[limit-1]['working_copy_id']}).encode()).decode()
+    return response
+
+
+def context_history(store, *, project_key, working_copy_id, limit=20, cursor=None):
+    """Complete timestamp groups for one copy with adjacent measurement changes.
+
+    The caller owns the read transaction. Cursors bind the retained-history
+    revision so inserts cannot silently skip or duplicate historical groups.
+    """
+    from .instruction_metrics import compare
+    if (not isinstance(project_key,str) or not project_key or not isinstance(working_copy_id,str)
+            or len(working_copy_id) != 64 or any(c not in '0123456789abcdef' for c in working_copy_id)
+            or type(limit) is not int or not 1 <= limit <= 100):
+        raise InventoryError('Invalid inventory history selection or page limit')
+    response = {'project_key':project_key, 'working_copy_id':working_copy_id, 'records':[],
+                'count':None, 'count_unit':'observation times', 'next_cursor':None,
+                'computable':False, 'reason':'schema_unavailable'}
+    if not store.query_one('SELECT name FROM schema_migrations WHERE name=?',(MIGRATION,)):
+        return response
+    require_schema(store)
+    metadata = store.query(f'SELECT id,record_hash,observed_at FROM {TABLE} WHERE project_key=? AND working_copy_id=? ORDER BY observed_at DESC,id', (project_key,working_copy_id))
+    revision = digest(metadata)
+    selector = digest(['context-history/1', project_key, working_copy_id, revision])
+    position = None
+    if cursor is not None:
+        try:
+            token = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+            position = token['position']
+            if token['selector'] != selector or position != timestamp(position,'cursor'):
+                raise ValueError('selection or history changed')
+        except (ValueError, KeyError, TypeError, AttributeError, UnicodeError, AvailabilityError) as exc:
+            raise InventoryError('Invalid inventory history cursor: selection or retained history changed; refresh history') from exc
+    times = sorted({r['observed_at'] for r in metadata}, reverse=True)
+    if position is not None:
+        times = [at for at in times if at < position]
+    revisions = {r['id']:r for r in retained_revisions(store)}
+    groups = []
+    for at in times[:limit+1]:
+        same = [_read(row,revisions) for row in store.query(f'SELECT * FROM {TABLE} WHERE project_key=? AND working_copy_id=? AND observed_at=? ORDER BY id', (project_key,working_copy_id,at))]
+        signatures = {digest({k:v for k,v in r.items() if k not in {'id','run_id'}}) for r in same}
+        if len(signatures)>1:
+            record = {'working_copy_id':working_copy_id,'working_copy':same[0]['working_copy'],
+                      'observed_at':at,'status':'conflicting','observations':same}
+        else:
+            record = {**same[0], 'observations':same}
+        groups.append(record)
+    for i,record in enumerate(groups[:limit]):
+        previous = groups[i+1] if i+1<len(groups) else None
+        record['comparison'] = compare(record,previous)
+        record['previous_observed_at'] = previous['observed_at'] if previous else None
+    count = len({r['observed_at'] for r in metadata})
+    response.update(records=groups[:limit],count=count,revision=revision,computable=bool(count),reason='' if count else 'no_inventory_observations')
+    if len(groups)>limit:
+        response['next_cursor'] = base64.urlsafe_b64encode(encoded({'selector':selector,'position':groups[limit-1]['observed_at']}).encode()).decode()
     return response

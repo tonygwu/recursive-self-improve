@@ -25,6 +25,13 @@
 # rewriting those checks.
 set -u -o pipefail
 
+# Normal runs use persisted, default-off class policy. An explicit review-only
+# request vetoes automatic writes. Reject misspelled flags before any side effect.
+if [[ $# -gt 1 || ( $# -eq 1 && ${1-} != --review-only ) ]]; then
+    echo "usage: ${0##*/} [--review-only]" >&2
+    exit 2
+fi
+
 # Absolute defaults are what launchd needs; the ${VAR:-default} form exists so
 # the test suite can point them at fakes and exercise this script for real
 # instead of asserting on its source text. launchd sets none of these, so the
@@ -175,10 +182,8 @@ case "${VERDICT}" in
 esac
 
 # --- 3. the run itself -------------------------------------------------------
-# --review-only until the miner self-eval clears the plan's bar
-# (>=4/5 labeled incidents rediscovered, precision >=0.7): proposals are
-# mined, gated, and reported nightly but nothing auto-applies. Remove the
-# flag only after explicitly enabling the intended automatic target classes.
+# Forward only the validated optional --review-only veto. Normal runs rely on
+# the pipeline and final writer's shared class-policy checks.
 # Hold the machine awake only on AC power. Sleep can extend wall time while
 # the run still holds its lock, causing the next scheduled invocation to skip.
 # On battery, permit sleep to avoid keeping the machine awake for a long run.
@@ -205,7 +210,7 @@ else
     echo "       and the mine stage's wall-clock deadline is what bounds it"
 fi
 
-${CAFFEINATE[@]+"${CAFFEINATE[@]}"} "${UV}" run --project "${PROJECT}" selfimprove run --review-only 2>&1
+${CAFFEINATE[@]+"${CAFFEINATE[@]}"} "${UV}" run --project "${PROJECT}" selfimprove run "$@" 2>&1
 RUN_RC=$?
 
 # --- 4. propagate the pipeline's exit code -----------------------------------

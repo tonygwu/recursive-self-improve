@@ -863,3 +863,24 @@ def test_an_empty_stored_stamp_does_not_win_the_comparison(env):
     )
     assert refreshed["first_seen"] == incident["ts"]
     assert refreshed["last_seen"] == incident["ts"]
+
+
+@pytest.mark.parametrize('outcome',['negative','new','duplicate','amend','duplicate_of_rejected'])
+def test_shared_persistence_receipt_binds_actual_queue_exit(env,outcome):
+    from self_improve.miner import _persist_mine_payload
+    store,cfg,incident,tmp_path=env
+    payload=agentic_payload()
+    if outcome=='negative':payload['is_real_learning']=False
+    elif outcome in ('duplicate','amend','duplicate_of_rejected'):
+        target=seed_learning(store,status='rejected' if outcome=='duplicate_of_rejected' else 'proposed')
+        payload.update(dedup_decision='amend' if outcome=='amend' else 'duplicate',dedup_target_id=target['id'])
+        if outcome=='amend':payload.update(amended_rule_text='Use the complete retained response.',amended_why='Prevent a partial reading.')
+    # The caller owns commit=False; rollback removes content/status/receipt together.
+    _persist_mine_payload(store,incident,payload,agentic=True,commit=False,provenance={'run_id':'processing-not-scan'})
+    receipt=store.query_one('SELECT * FROM queue_processing')
+    assert receipt['outcome']==outcome and receipt['run_id']=='processing-not-scan'
+    event=store.query_one('SELECT * FROM queue_events WHERE id=?',(receipt['event_id'],))
+    assert event['incident_id']==incident['id'] and event['old_status']=='new' and event['queue_delta']==-1
+    store.conn.rollback()
+    assert store.query('SELECT * FROM queue_processing')==[]
+    assert store.query_one('SELECT status FROM incidents WHERE id=?',(incident['id'],))['status']=='new'

@@ -255,14 +255,13 @@ def _all_strings(payload):
 
 #: Invented stats retain a legacy budget-refusal entry for compatibility.
 _FULL_STATS = {
-    "run_id": "r",
     "review_only": True,
     "scan": {"files_attempted": 10, "files_succeeded": 10, "files_failed": 0},
     "mine": {"attempted": 7, "succeeded": 6, "failed": 1,
              "taxonomy": {"MineParseFailure": 1, "budget_exhausted": 13}},
     "cluster": {"candidates": 3, "mode": "agentic_passthrough"},
     "gate": {"attempted": 3, "gated_pass": 0, "gated_fail": 0, "ungated": 3,
-             "inconclusive": 0, "failed": 0},
+             "inconclusive": 0, "failed": 0, "refused": 0},
     "apply": {"attempted": 3, "applied": 0, "held": 3, "failed": 0, "taxonomy": {}},
 }
 
@@ -582,8 +581,8 @@ def test_run_grid_an_unknown_stage_shape_is_unreadable_never_ok(tmp_path):
     ]
 
 
-def test_run_grid_gate_with_no_verdicts_is_refused_not_failed(tmp_path):
-    """AGENTS.md: a run with no eval verdicts is not a gate that failed."""
+def test_run_grid_missing_outcomes_and_excess_holds_are_not_repaired(tmp_path):
+    """Incomplete outcomes establish neither a trial failure nor a budget refusal."""
     store, path = _writable(tmp_path)
     _run(store, run_id="budget", started="2026-08-15T00:00:00Z",
          finished="2026-08-15T01:00:00Z", status="ok",
@@ -593,17 +592,18 @@ def test_run_grid_gate_with_no_verdicts_is_refused_not_failed(tmp_path):
     store.close()
 
     cells = q.run_stage_grid(_read_only(path), now_utc=NOW)["columns"][0]["cells"]
-    assert cells["gate"]["state"] == "refused"
-    # held is the correct outcome under --review-only, so apply did not fail.
-    assert cells["apply"]["state"] == "ok"
-    assert cells["apply"]["per_run"][0]["attempted_adjusted"]["used"] == 32
+    assert cells["gate"]["state"] == "unreadable"
+    assert cells["apply"]["state"] == "unaccounted"
+    assert cells["apply"]["per_run"][0]["attempted"] == 0
+    assert cells["apply"]["per_run"][0]["unaccounted"] == -32
 
 
 def test_run_grid_some_verdicts_and_budget_refusals_are_not_failures(tmp_path):
     store, path = _writable(tmp_path)
     _run(store, run_id="mixed-budget", started="2026-08-15T00:00:00Z",
          finished="2026-08-15T01:00:00Z", status="ok",
-         stats={"gate": {"attempted": 3, "gated_pass": 1, "failed": 0, "refused": 2}})
+         stats={"gate": {"attempted": 3, "gated_pass": 1, "gated_fail":0,
+                         "ungated":0, "inconclusive":0, "failed": 0, "refused": 2}})
     store.close()
     cell = q.run_stage_grid(_read_only(path), now_utc=NOW)["columns"][0]["cells"]["gate"]
     assert cell["state"] == "budget_exhausted"
@@ -742,8 +742,8 @@ def test_backlog_emits_two_rates_and_never_a_countdown(tmp_path):
     assert plan["queued"] == 2800
     assert plan["mine_capacity_per_run"] == 80
     assert plan["arrivals"]["per_day"] == pytest.approx(200.0)
-    assert plan["net_per_day"] == pytest.approx(120.0)
-    assert plan["net_per_day"] > 0, "the queue grows; a non-positive net hides that"
+    assert plan["net_per_day"] is None, "call slots cannot be subtracted from incident arrivals"
+    assert plan["capacity_unit"] == "model_calls_per_run"
 
     # No key anywhere in the payload may be countdown-shaped, and no string
     # value may carry a countdown number. PRD 7/V1: the queue grows, so any
@@ -790,7 +790,7 @@ def test_failure_panel_splits_fixed_from_open_and_never_counts_the_cap_as_failur
     _run(store, run_id="before", started="2026-08-15T06:00:00Z",
          finished="2026-08-15T06:20:00Z", status="ok",
          stats={"mine": {"attempted": 12, "succeeded": 5, "failed": 7,
-                         "taxonomy": {"MineParseFailure": 3, "IntegrityError": 2,
+                         "taxonomy": {"MineParseFailure": 3, "IntegrityError:unique:incident_learnings": 2,
                                       "MineContractViolation": 2,
                                       "budget_exhausted": 23}}})
     _run(store, run_id="after", started="2026-08-19T08:00:00Z",
@@ -801,9 +801,9 @@ def test_failure_panel_splits_fixed_from_open_and_never_counts_the_cap_as_failur
 
     panel = q.failure_panel(_read_only(path))
     fixed = {row["class"]: row for row in panel["fixed"]}
-    assert "IntegrityError" in fixed
-    assert fixed["IntegrityError"]["status"] == "fixed"
-    assert fixed["IntegrityError"]["fixed_at"] == "2026-08-16T10:56:04Z"
+    assert "IntegrityError:unique:incident_learnings" in fixed
+    assert fixed["IntegrityError:unique:incident_learnings"]["status"] == "fixed"
+    assert fixed["IntegrityError:unique:incident_learnings"]["fixed_at"] == "2026-08-16T10:56:04Z"
     assert panel["regressed"] == []
 
     open_classes = {row["class"]: row for row in panel["open"]}
@@ -828,12 +828,12 @@ def test_failure_panel_reports_a_regression_after_the_fix(tmp_path):
     _run(store, run_id="later", started="2026-08-20T00:00:00Z",
          finished="2026-08-20T01:00:00Z", status="ok",
          stats={"mine": {"attempted": 2, "succeeded": 1, "failed": 1,
-                         "taxonomy": {"IntegrityError": 1}}})
+                         "taxonomy": {"IntegrityError:unique:incident_learnings": 1}}})
     store.close()
 
     panel = q.failure_panel(_read_only(path))
     assert panel["fixed"] == []
-    assert [row["class"] for row in panel["regressed"]] == ["IntegrityError"]
+    assert [row["class"] for row in panel["regressed"]] == ["IntegrityError:unique:incident_learnings"]
     assert panel["regressed"][0]["occurrences_after_fix"][0]["run_id"] == "later"
 
 
@@ -878,8 +878,8 @@ def test_the_prose_label_is_not_used_for_a_call_that_produced_no_answer(tmp_path
     spawn = q.failure_copy("call_failed:spawn_error")
     assert "prose" not in spawn["explanation"]
     assert "prose" not in q.FAILURE_COPY["MineParseFailure"]["explanation"]
-    # ...and the parse class still says an answer arrived, because it did.
-    assert "answered" in q.FAILURE_COPY["MineParseFailure"]["explanation"]
+    assert "mining output could not be parsed" in q.FAILURE_COPY["MineParseFailure"]["explanation"]
+    assert "failed to launch" in spawn["explanation"]
 
 
 def test_failure_panel_counts_parse_recovered_as_success(tmp_path):
@@ -1188,7 +1188,7 @@ def test_rules_flag_the_enforcement_gap_only_when_a_rule_was_violated(tmp_path):
 
     rows = {row["id"]: row["enforcement_gap"] for row in q.rules(_read_only(path))["rows"]}
     assert rows["clean"]["flagged"] is False
-    assert rows["clean"]["label"] == "No prior rule violation was recorded"
+    assert rows["clean"]["label"] == "No violation report was retained. Prior rule receipt and violation are unknown."
     assert rows["gap"]["flagged"] is True
     assert rows["gap"]["violated_existing_rule"] == "Always read the file first"
 
@@ -1311,7 +1311,8 @@ def test_project_benefit_is_an_em_dash_when_no_proposal_has_been_applied(tmp_pat
     assert benefit["value"] == "—"
     assert benefit["value"] is not None
     assert benefit["value"] != 0 and benefit["value"] != "0" and benefit["value"] != ""
-    assert "project_stats" in benefit["reason"]
+    assert benefit['reason'] == 'No retained recurrence measurements for this project'
+    assert benefit['computable'] is False and benefit['measurement_ids'] == []
 
 
 def test_project_legacy_session_totals_cannot_establish_physical_exposure(tmp_path):
@@ -1478,7 +1479,7 @@ def test_legacy_session_and_queue_totals_never_become_observed_trends(tmp_path):
     _monthly_fixture(store)
     store.close()
     trend = q.incident_rate(_read_only(path), now_utc=_NOW_DT)
-    assert trend["contract_version"] == 2
+    assert trend["contract_version"] == 3
     assert trend["primary_series"] == "signal_occurrences_per_100k_physical_lines"
     assert trend["series"] == [] and trend["dropped_months"] == []
     assert trend["reason"] == "missing_observations"
@@ -1548,7 +1549,7 @@ def test_overview_is_json_serializable_and_carries_every_panel(tmp_path):
 
     payload = q.overview(_read_only(path), Config(), now_utc=NOW)
     assert sorted(payload) == [
-        "backlog", "confidence", "failures", "freshness", "gate", "grid", "inbox", "status_line",
+        "audit", "backlog", "confidence", "failures", "freshness", "gate", "grid", "inbox", "status_line",
     ]
     json.dumps(payload)  # must survive the wire
     assert payload["freshness"]["days_stale"] == 4
@@ -1718,20 +1719,13 @@ def _cluster_cell(payload):
 
 
 def test_a_cluster_cell_that_merged_nothing_agrees_with_its_own_tooltip():
-    """Keep the cluster count and tooltip consistent when no merge was attempted.
-
-    Passthrough candidates must not borrow zero attempted/succeeded values from
-    the unused merge counters.
-    """
+    """Candidate count and merge-call outcomes retain different units."""
     cell = _cluster_cell(
         {"candidates": 9, "merge_attempted": 0, "merge_succeeded": 0, "merge_failed": 0}
     )
     assert cell["number"] == 9
-    assert cell["attempted"] == 9, (
-        f"cell shows {cell['number']} above a tooltip built from "
-        f"attempted={cell['attempted']}"
-    )
-    assert cell["succeeded"] == 9
+    assert cell["attempted"] == 0 and cell['unit'] == 'model merge calls'
+    assert cell["succeeded"] == 0
     assert cell["failed"] == 0
 
 
@@ -1997,12 +1991,11 @@ def test_the_bare_integrity_key_does_not_promise_a_suffix_it_lacks(tmp_path):
     store.close()
 
     panel = q.failure_panel(_read_only(path))
-    row = next(r for r in panel["fixed"] if r["class"] == "IntegrityError")
+    row = next(r for r in panel["open"] if r["class"] == "IntegrityError")
     text = row["explanation"]
-    assert "A row with NO suffix is older than that split" in text, text
-    assert "cannot say which constraint it was" in text
-
-
+    assert "Without a suffix" in text, text
+    assert "constraint and its cause are unknown" in text
+    assert "fix_commit" not in row
 
 
 # ---------------------------------------------------------------------------
@@ -2161,11 +2154,11 @@ def test_the_status_vocabulary_is_not_empty():
     assert "approved_user" in PROPOSAL_STATUSES
 
 
-def test_a_decided_carve_out_leaves_the_queue(tmp_path):
+def test_a_decided_carve_out_leaves_the_queue_except_unbound_approval(tmp_path):
     """Exclude decided carve-outs from the review queue.
 
-    A proposal's action stays the same after a decision. Action-based queue
-    membership must therefore also exclude terminal statuses.
+    A proposal's action stays the same after a decision. Terminal proposals
+    stay excluded; historical approvals without commands need fresh review.
     """
     store, path = _writable(tmp_path)
     _run(store, started="2026-08-22T02:30:00Z", stats={"review_only": True})
@@ -2180,13 +2173,11 @@ def test_a_decided_carve_out_leaves_the_queue(tmp_path):
 
     ro = _read_only(path)
     waiting = set(q.waiting_proposal_ids(ro, _Cfg()))
-    assert waiting == {open_hook}, (
-        f"a decided carve-out is still waiting: {sorted(waiting - {open_hook})}"
-    )
-    assert q.review_queue(ro, _Cfg())["count"] == 1
+    assert waiting == {open_hook, "done-approved_user"}
+    assert q.review_queue(ro, _Cfg())["count"] == 2
 
 
-def test_a_decided_proposal_of_any_shape_leaves_the_queue(tmp_path):
+def test_decided_proposals_leave_queue_except_unbound_approval(tmp_path):
     """The general form, over every status the schema declares."""
     from self_improve.store import PROPOSAL_STATUSES
 
@@ -2199,7 +2190,7 @@ def test_a_decided_proposal_of_any_shape_leaves_the_queue(tmp_path):
 
     ro = _read_only(path)
     waiting = {i.split("-", 1)[1] for i in q.waiting_proposal_ids(ro, _Cfg())}
-    assert waiting == set(q.QUEUEING_STATUSES) | {"gated_pass"}, sorted(waiting)
+    assert waiting == set(q.QUEUEING_STATUSES) | {"gated_pass", "approved_user"}, sorted(waiting)
 
 
 def test_the_actor_of_an_event_is_decided_by_the_event_not_the_caller():

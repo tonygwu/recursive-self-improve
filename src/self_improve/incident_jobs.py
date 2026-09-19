@@ -32,6 +32,9 @@ def snapshot(store,cfg,incident_id):
     session=store.query_one('SELECT * FROM sessions WHERE file_path=?',(incident['session_file'],))
     if not session:raise CommandError('IncidentDataError','The incident has no source session.',500)
     if cfg.mine_mode not in {'agentic','fast'}:raise CommandError('InvalidMineMode','Mining mode must be agentic or fast.',500)
+    from .incident_evidence import parse_window, IncidentEvidenceError
+    try:window=parse_window(incident['window_json'], owner='incident.'+incident_id)
+    except IncidentEvidenceError as exc:raise CommandError('IncidentDataError',str(exc),500) from exc
     files={};coverage={'kind':'retained_window'}
     if cfg.mine_mode=='agentic':
         try:
@@ -49,8 +52,6 @@ def snapshot(store,cfg,incident_id):
             'explore_budget':str(max(1,cfg.mine_agent_max_turns-miner.TURN_RESERVE))}
         prompt,template_sha=miner.render_prompt_revision(bundled_path('prompts','mine_incident_agentic.md'),mapping)
     else:
-        try:window=json.loads(incident['window_json'])
-        except (TypeError,ValueError) as exc:raise CommandError('IncidentDataError','The retained window is not JSON.',500) from exc
         if not isinstance(window,list) or not window:raise CommandError('IncidentDataError','The retained window has no evidence.',409)
         prompt,template_sha=miner.render_prompt_revision(bundled_path('prompts','mine_incident.md'),{
             'signal_type':incident['signal_type'],'project':incident['project_path'] or '(unknown)',
@@ -118,6 +119,9 @@ def _unchanged(store,source):
 def generate(store,cfg,saved,llm,journal,run_dir):
     from . import miner
     source=saved['source']['snapshot']
+    from .incident_evidence import parse_window, IncidentEvidenceError
+    try:parse_window(source['incident']['window_json'], owner='incident.'+source['incident']['id'])
+    except IncidentEvidenceError as exc:raise CommandError('IncidentDataError',str(exc),500) from exc
     def ask():
         _unchanged(store,source)
         sandbox=run_dir/'mine'/source['incident']['id'];sandbox.mkdir(parents=True,exist_ok=True)
@@ -215,6 +219,10 @@ def _build_proposal(store,cfg,learning,source):
 
 def view(store,cfg,incident_id,*,full=False):
     """Small previews keep full retained inputs available on explicit inspection."""
+    from .incident_evidence import present, IncidentEvidenceError
+    def presentation(incident):
+        try:return present(incident,max_chars=4000)
+        except IncidentEvidenceError as exc:raise CommandError('IncidentDataError',str(exc),500) from exc
     try:shown=preview(store,cfg,incident_id)
     except CommandError as exc:
         if exc.code!='IncidentAlreadyHandled':raise
@@ -231,9 +239,9 @@ def view(store,cfg,incident_id,*,full=False):
             incident=store.query_one('SELECT * FROM incidents WHERE id=?',(incident_id,))
             return {'incident_id':incident_id,'ready':False,'max_model_calls':0,'latest_job':None,
                 'revision':_hash(incident),'plan':{'stages':[]},'meaning':str(exc),
-                'source_summary':{'incident':incident,'coverage':{},'files':[],'learning_count':0,'instruction_count':0}}
+                'source_summary':{'incident':incident,'presentation':presentation(incident),'coverage':{},'files':[],'learning_count':0,'instruction_count':0}}
     source=shown['source']['snapshot']
-    summary={'incident':source['incident'],'coverage':source['coverage'],
+    summary={'incident':source['incident'],'presentation':presentation(source['incident']),'coverage':source['coverage'],
         'files':[{'name':k,'bytes':len(v.encode())} for k,v in source['files'].items()],
         'learning_count':len(source['corpus']['learnings']),'instruction_count':len(source['corpus']['rules'])}
     return shown | {'source_summary':summary} if full else {k:v for k,v in shown.items() if k not in {'source','plan'}} | {

@@ -256,6 +256,8 @@ def serve(cfg,*,once=False):
     from contextlib import closing
     from .store import Store
     import time
+    from .worker_services import check_runtime
+    check_runtime(cfg)
     with closing(Store(cfg.state_path('state.db'),migrate=False)) as store:
         while True:
             try:result=run_once(store,cfg)

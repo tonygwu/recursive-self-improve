@@ -15,6 +15,10 @@ MIGRATION = '0015_rejection_scopes'
 ACTIONS = frozenset({'reject_target', 'reject_lesson'})
 
 
+class TargetInspectionRequired(ValueError):
+    """Retained evidence cannot resolve a current target-scoped rejection."""
+
+
 def available(store):
     return store.query_one('SELECT name FROM schema_migrations WHERE name=?', (MIGRATION,)) is not None
 
@@ -147,7 +151,7 @@ def _text(value):
     return ' '.join(value.split()).casefold()
 
 
-def rejection_reason(store, cfg, proposal, *, ctx=None, learning=None, destination=None):
+def rejection_reason(store, cfg, proposal, *, ctx=None, learning=None, destination=None, retained_only=False):
     if proposal.get('action')=='resolve_rollback':
         from .resolutions import origin
         origin(store,proposal)  # Only a retained explicit inverse job qualifies.
@@ -167,6 +171,8 @@ def rejection_reason(store, cfg, proposal, *, ctx=None, learning=None, destinati
     if not candidates:
         return None
     from .destinations import resolve_destination
+    if retained_only:
+        raise TargetInspectionRequired('Current target identity requires explicit working-copy inspection.')
     identity = target_identity(store, destination or resolve_destination(cfg, proposal['target_path'], proposal['target_kind']))
     for d in candidates:
         if same_target(identity,d['target_identity']):

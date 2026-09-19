@@ -56,3 +56,9 @@ def test_the_marker_lets_a_test_opt_out():
     if p.is_dir():
         list(p.iterdir())  # a real read under a forbidden root
     assert True
+
+
+def test_system_policy_guard_covers_windows_native_separators():
+    for value in (r'C:\Program Files\ClaudeCode\CLAUDE.md', 'C:/Program Files/ClaudeCode/CLAUDE.md',
+                  '/etc/claude-code/CLAUDE.md', '/Library/Application Support/ClaudeCode/CLAUDE.md'):
+        assert guard._forbidden_prefix(value)

@@ -51,7 +51,10 @@ def test_upgrade_preserves_old_rows_and_verified_preupgrade_backup(old_database)
     result = run_guide(config, backup)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'PREVIEW_UPGRADE_OK' in result.stdout
-    required = {'0024_rule_availability', '0028_instruction_inventory', '0023_eval_attempts'}
+    required = {'0023_eval_attempts', '0024_rule_availability', '0025_project_measurements',
+                '0028_instruction_inventory', '0029_quality_evidence', '0030_session_context',
+                '0031_native_load_reports', '0032_rule_families', '0033_instruction_text',
+                '0034_queue_history'}
     assert required <= {r['name'] for r in db.query('SELECT name FROM schema_migrations')}
     assert db.query('SELECT * FROM upgrade_fixture') == [{'value': 'Invented retained evidence'}]
     with closing(storage.Store(backup, read_only=True)) as saved:

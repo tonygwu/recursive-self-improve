@@ -18,6 +18,8 @@ def serve(cfg, *, once=False, poll_seconds=1.0, operation_id=None):
     from .store import Store
     if poll_seconds <= 0:
         raise ValueError('poll_seconds must be positive')
+    from .worker_services import check_runtime
+    check_runtime(cfg)
     with closing(Store(cfg.state_path('state.db'), migrate=False)) as store:
         if operation_id is not None:
             from .apply import resume_write_operation

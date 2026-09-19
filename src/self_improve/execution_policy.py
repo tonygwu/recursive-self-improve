@@ -10,6 +10,7 @@ This module imports no web framework, model client, or file writer.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from datetime import datetime
 
 from .store import AUTO_APPLY_STATUSES, DECIDED_STATUSES, PROPOSAL_ACTIONS, PROPOSAL_STATUSES, new_id, utc_now_iso
@@ -38,6 +39,7 @@ REASON_COPY = {
     "prior_rollback": "this lesson was rolled back before. Reapplying it requires a human decision.",
     "target_rejected": "this lesson is rejected at this canonical target; other targets remain available.",
     "lesson_rejected": "this lesson is permanently rejected everywhere.",
+    "fresh_approval_required": "this historical approval has no delivery command. Inspect the current combined edit and give fresh approval before anything can be written.",
 }
 
 
@@ -75,24 +77,33 @@ def policy_snapshot(store) -> dict:
     return {"available": True, "classes": classes}
 
 
-def set_class_policy(store, target_class: str, enabled: bool, *, now: str | None = None) -> dict:
+def set_class_policy(store, target_class: str, enabled: bool, *, now: str | None = None,
+                     expected_revision: int | None = None, commit: bool = True) -> dict:
     """Record an explicit user policy change, with optimistic concurrency."""
     if target_class not in TARGET_CLASSES or type(enabled) is not bool:
         raise PolicyError("policy requires a known target class and a boolean enabled value")
     if target_class == "hook" and enabled:
         raise PolicyError("hooks always require human approval")
-    snapshot = policy_snapshot(store)
-    if not snapshot["available"]:
-        raise PolicyError("upgrade the state database before changing execution policy")
-    before = snapshot["classes"][target_class]
-    if before["enabled"] == enabled:
-        return before
+    if not policy_snapshot(store)['available']:
+        raise PolicyError('upgrade the state database before changing execution policy')
+    if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+        raise PolicyError('expected_revision must be a nonnegative integer')
+    if not commit and (store.read_only or not store.conn.in_transaction):
+        raise PolicyError('policy persistence requires the caller\'s active write transaction')
     ts = now if now is not None else utc_now_iso()
     if _instant(ts) is None:
         raise PolicyError("policy time must be an ISO timestamp with a timezone")
-    after = {"enabled": enabled, "enabled_at": ts if enabled else "", "updated_at": ts,
-             "revision": before["revision"] + 1}
-    with store.conn:
+    with store.transaction(write=True) if commit else nullcontext():
+        snapshot = policy_snapshot(store)
+        if not snapshot["available"]:
+            raise PolicyError("upgrade the state database before changing execution policy")
+        before = snapshot["classes"][target_class]
+        if expected_revision is not None and before['revision'] != expected_revision:
+            raise PolicyError('the policy changed in another request; reload it before retrying')
+        if before["enabled"] == enabled:
+            return before
+        after = {"enabled": enabled, "enabled_at": ts if enabled else "", "updated_at": ts,
+                 "revision": before["revision"] + 1}
         changed = store.conn.execute(
             "UPDATE execution_policies SET enabled=?, enabled_at=?, updated_at=?, revision=? "
             "WHERE target_class=? AND revision=?",
@@ -169,18 +180,46 @@ def automatic_permission(store, cfg, proposal: dict, *, review_only: bool = Fals
     )
 
 
-def proposal_dispositions(store, cfg, *, run_id: str | None = None) -> list[dict]:
-    """Give every known undecided proposal one next step, from the same policy."""
+def historical_approval_ids(store) -> set[str]:
+    """Find old decisions that can return to Review, never grant permission.
+
+    Any retained execution record keeps its existing recovery owner. Missing
+    records do not prove that a write never happened: fresh approval must also
+    bind a strict preview against the current target. Reads never migrate.
+    """
+    migrations = {r['name'] for r in store.query('SELECT name FROM schema_migrations')}
+    exclusions = []
+    for migration, table in (('0010_dashboard_commands', 'command_members'),
+                             ('0012_instruction_operations', 'instruction_operations')):
+        if migration in migrations:
+            exclusions.append(f'NOT EXISTS (SELECT 1 FROM {table} e WHERE e.proposal_id=p.id)')
+    sql = """SELECT p.id FROM proposals p WHERE p.status='approved_user'
+        AND p.applied_at='' AND p.snapshot_commit_before='' AND p.snapshot_commit_after=''
+        AND NOT EXISTS (SELECT 1 FROM proposal_events e WHERE e.proposal_id=p.id
+                        AND e.event IN ('applied','rolled_back','rejected_user'))"""
+    return {r['id'] for r in store.query(sql + ''.join(' AND ' + clause for clause in exclusions))}
+
+
+def proposal_dispositions(store, cfg, *, run_id: str | None = None, retained_only: bool = False) -> list[dict]:
+    """Give undecided proposals and historical approvals one shared next step.
+
+    Evidence readers can request retained-only facts. Applicable target rejections
+    then remain unknown until current target inspection; this never grants a write.
+    Default Review and delivery callers retain current target resolution.
+    """
+    if type(retained_only) is not bool:
+        raise PolicyError('retained_only must be a boolean')
     policy = policy_snapshot(store)
-    from .rejections import context, rejection_reason
+    from .rejections import context, rejection_reason, TargetInspectionRequired
     rejections = context(store)
     sql = "SELECT p.*, r.stats_json AS run_stats FROM proposals p LEFT JOIN runs r ON r.id=p.run_id"
     rows = store.query(sql + (" WHERE p.run_id=?" if run_id is not None else "") + " ORDER BY p.created_at, p.id",
                        (run_id,) if run_id is not None else ())
     result = []
+    historical = historical_approval_ids(store)
     rolled_back = {p["learning_id"]: p["id"] for p in store.query("SELECT id, learning_id FROM proposals WHERE status='rolled_back'")}
     for row in rows:
-        if row["status"] in DECIDED_STATUSES or row["status"] not in PROPOSAL_STATUSES:
+        if (row["status"] in DECIDED_STATUSES and row['id'] not in historical) or row["status"] not in PROPOSAL_STATUSES:
             continue
         try:
             stats = json.loads(row.pop("run_stats") or "{}")
@@ -191,7 +230,15 @@ def proposal_dispositions(store, cfg, *, run_id: str | None = None) -> list[dict
         decision = automatic_eligibility(row, policy, review_only=stats.get("review_only", False),
                                          review_queue_actions=cfg.review_queue_actions,
                                          prior_rollback=rolled_back.get(row["learning_id"], ""))
-        rejection = rejection_reason(store,cfg,row,ctx=rejections)
+        if row['id'] in historical:
+            decision.update(allowed=False, reason='fresh_approval_required',
+                            detail=REASON_COPY['fresh_approval_required'])
+        try:
+            rejection = rejection_reason(store,cfg,row,ctx=rejections,retained_only=retained_only)
+        except TargetInspectionRequired as exc:
+            decision.update(allowed=False, reason='target_identity_unobserved', detail=str(exc))
+            result.append({**row, 'execution':decision, 'next_step':'unknown'})
+            continue
         if rejection:
             decision.update(allowed=False,reason=rejection['reason'],detail=rejection['detail'])
         result.append({**row, "execution": decision, "next_step": 'suppressed' if rejection else "automatic_delivery" if decision["allowed"] else "review"})

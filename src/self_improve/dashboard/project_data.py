@@ -160,6 +160,9 @@ def records(store, cfg, *, project_key, kind, learning_id=None, limit=20, cursor
     ordered = sorted(rows, key=lambda r: r['id'])
     remaining = [r for r in ordered if r['id'] > position]
     page = remaining[:limit]
+    if kind == 'evidence':
+        from .queries import normalize_incident
+        page = [{**r, 'presentation': normalize_incident(r)} for r in page]
     next_cursor = None
     if len(remaining) > limit:
         next_cursor = base64.urlsafe_b64encode(json.dumps({'selector': selector, 'position': page[-1]['id']}).encode()).decode()

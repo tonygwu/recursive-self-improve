@@ -124,6 +124,7 @@ _DETECTOR_MODULES = (
 _MEASUREMENT_MODULES = (
     "self_improve.scan",
     "self_improve.scan_observations",
+    "self_improve.session_context",
     "self_improve.project_identity",
     "self_improve.sources.base",
 )

@@ -100,3 +100,19 @@ regexTarget = "secret"
 paths = ["(^|/)tests/test_redact\\.py$"]
 regexes = ["^[x]oxb\\-2444333222111\\-1234567890123\\-AbCdEfGhIjKlMnOpQrStUvWx$"]
 
+
+[[allowlists]]
+description = "Browser localStorage namespace for navigation favorites/recents, exact value only"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)(src/)?self_improve/dashboard/static/navigation\\.js$"]
+regexes = ["^[s]elf\\-improve\\.navigation\\.v1$"]
+
+[[allowlists]]
+description = "Invented idempotency request key in a test, exact value only"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ["(^|/)tests/test_historical_approvals\\.py$"]
+regexes = ["^[f]resh\\-approval\\-001$"]

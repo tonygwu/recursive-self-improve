@@ -348,13 +348,14 @@ def test_mutated_call_or_spec_cannot_relabel_retained_history(env):
         history.detail(store,shown['source']['id'])
 
 
-def test_rebuild_refuses_to_strip_attempts_before_any_export_or_deletion(env,tmp_path):
+def test_rebuild_preserves_attempt_and_current_source(env,tmp_path):
     from self_improve.rebuild import rebuild_state
     cfg,store,p,_=env
     learning=store.query_one('SELECT * FROM learnings WHERE id=?',(p['learning_id'],))
     attempt=history.begin(store,cfg,learning,p)
     before=history.detail(store,attempt.id)
     backup=tmp_path/'rebuild-backup'
-    with pytest.raises(ValueError,match='eval_attempts'):
-        rebuild_state(store,export_path=backup)
-    assert history.detail(store,attempt.id)==before and not backup.exists()
+    rebuild_state(store,export_path=backup)
+    assert history.detail(store,attempt.id)==before and backup.exists()
+    assert store.query_one('SELECT id FROM proposals WHERE id=?',(p['id'],))
+    assert json.loads((backup/'preserved.json').read_text())['execution_history']['eval_attempts']
