@@ -45,11 +45,12 @@ from self_improve.config import Config
 from self_improve.store import AUTO_APPLY_STATUSES, Store, new_id, utc_now_iso
 
 try:
-    from self_improve.propose import PatchConflict, apply_unified_diff
+    from self_improve.propose import PatchConflict, UnsupportedLineEndings, apply_unified_diff
 except ImportError as exc:  # fail loud: apply is unusable without propose
     raise ImportError(
         "self_improve.apply requires self_improve.propose to export "
-        "apply_unified_diff(content: str, diff: str) -> str and PatchConflict; "
+        "apply_unified_diff(content: str, diff: str) -> str, PatchConflict and "
+        "UnsupportedLineEndings; "
         f"import failed: {exc}"
     ) from exc
 
@@ -559,7 +560,10 @@ def apply_proposal(store: Store, cfg: Config, proposal: dict) -> dict:
                 apply_unified_diff(base['content'], current['diff_unified'])
             except PatchConflict as exc:
                 before = snapshot(cfg, target, 'before', content=base['content'].encode('utf-8') if base['exists'] else None)
-                return _hold(store, current, 'patch_conflict', str(exc), snapshot_before=before)
+                # Name the line-ending refusal as Review and the worker do
+                # (UnsupportedLineEndings): the file must change, not the edit.
+                reason = 'unsupported_line_endings' if isinstance(exc, UnsupportedLineEndings) else 'patch_conflict'
+                return _hold(store, current, reason, str(exc), snapshot_before=before)
             oid = new_id()
             checkpoint = _prepare_write_checkpoint(cfg, destination, base, current['diff_unified'],
                          f"self-improve: automatic proposal {current['id']} operation {oid}")
@@ -590,12 +594,12 @@ def resume_write_operation(store, cfg, operation_id):
 
 
 def _resume_write_operation(store, cfg, operation_id):
-    from .commands import _json
+    from .commands import FINISHED_STATES, _json
     from .operations import operation_status, SOURCE_FIELDS
     from .execution_policy import automatic_permission, policy_snapshot
     from .destinations import DestinationError
     operation = operation_status(store, operation_id)
-    if operation['state'] in {'completed', 'cancelled'}:
+    if operation['state'] in FINISHED_STATES:
         return operation
     if operation['kind'] == 'rollback':
         return _resume_rollback_operation(store, cfg, operation)
@@ -631,6 +635,7 @@ def _resume_write_operation(store, cfg, operation_id):
                     store.update('instruction_operations', 'id', operation_id, {'state': 'cancelled', 'checkpoint_json': _json(checkpoint),
                                  'result_json': _json(result), 'error_code': '', 'error_detail': '', 'updated_at': utc_now_iso()})
                     return operation_status(store, operation_id)
+                _refuse_rewritten_forward_record(delivery)
                 _publish_prepared_write(destination, delivery, operation_id, _operation_checkpoint)
             after = snapshot(cfg, Path(destination['target_path']), 'after', content=delivery['after_content'].encode('utf-8'))
             stamp = utc_now_iso()
@@ -1015,6 +1020,7 @@ def _deliver_command_target(store, cfg, command_id, target):
         if not delivered:
             if not checkpoint.get('review_preview'):
                 raise DeliveryBlocked('FreshReviewRequired', 'This historical approval has no reviewed target base. Cancel its unwritten work and approve a fresh complete preview.')
+            _refuse_rewritten_forward_record(delivery)
             _publish_prepared_write(destination, delivery, target['id'], _delivery_checkpoint)
         after_sha = snapshot(cfg, path, 'after', content=delivery['after_content'].encode('utf-8'))
         checkpoint['result'] = {'snapshot_after': after_sha, 'branch_commit': delivery['branch_commit'],
@@ -1118,7 +1124,13 @@ def _prepare_write_checkpoint(cfg, destination, base, diff, message, *, after_co
 
 
 def _observe_prepared_write(destination, delivery):
-    """True means published; False means the exact before-state still exists."""
+    """True means the prepared write is observed; False means it is not.
+
+    True also covers an absent branch whose HEAD holds the prepared
+    after-state. False requires the exact before-state, or, for a branch
+    absent at preparation and now, a HEAD that lacks the prepared
+    after-state. Anything else raises TargetChanged.
+    """
     from .destinations import read_destination
     if destination['mode'] == 'file':
         current = read_destination(destination)
@@ -1130,9 +1142,115 @@ def _observe_prepared_write(destination, delivery):
         candidate = delivery['branch_commit']
         delivered = _run_git(['merge-base', '--is-ancestor', candidate, tip], root, ok_returncodes=(0, 1)).returncode == 0
         untouched = tip == delivery['base_ref'] and exists == delivery['branch_exists']
+        if not delivered and not exists:
+            # The branch is absent now. That alone does not prove that
+            # nothing was published. The worker can publish the branch and
+            # die before its completion commit; the operator can then merge
+            # it by squash, cherry-pick or rebase and delete it. HEAD then
+            # holds the edit but not the prepared commit. This holds whether
+            # this delivery created the branch or added to one that an
+            # earlier delivery created. If HEAD holds the prepared
+            # after-state, acknowledge that write.
+            if _tree_holds_after_state(root, tip, destination['relative_path'], delivery):
+                delivered = True
+            elif not delivery['branch_exists']:
+                # The branch was absent at preparation too. Treat the
+                # delivery as unpublished: cancellation proceeds, and
+                # publication on a moved HEAD needs the check in
+                # _refuse_changed_moved_base.
+                #
+                # Known gap: any target content at HEAD that is not exactly
+                # the after-state reads as unpublished here, even when the
+                # edit was published and merged. That covers an operator
+                # edit to the target on main before the squash, a resolved
+                # merge conflict in it, and a later edit at HEAD. Cancel then
+                # returns a live edit to Review. Retry blocks in
+                # _refuse_changed_moved_base unless HEAD again holds the
+                # before-state. Only a durable "publishing" marker recorded
+                # before update-ref could tell published from unpublished;
+                # it is not implemented and is tracked in BACKLOG.md.
+                #
+                # When the branch existed at preparation and is gone now,
+                # the operator deleted it, with or without this edit merged.
+                # Neither state is proven, so the target stays TargetChanged.
+                untouched = True
     if not delivered and not untouched:
         raise DeliveryBlocked('TargetChanged', 'The target matches neither the prepared before nor after state. No content or ref was overwritten.')
     return delivered
+
+
+def _tree_holds_after_state(root, commit, relpath, delivery):
+    """Whether <commit>:<relpath> is exactly the prepared after-state.
+
+    Compares raw bytes. The after-state is UTF-8 text in a regular file, or
+    an absent file, so content that does not decode, or a path that is not a
+    regular file, is simply not that state. It must not stop a cancellation.
+    """
+    import hashlib
+    listing = _run_git(['ls-tree', '-z', commit, '--', ':(literal)' + relpath], root).stdout
+    entries = [e for e in listing.split(b'\0') if e]
+    if not entries:
+        return not delivery.get('after_exists', True)
+    meta, _, name = entries[0].partition(b'\t')
+    if len(entries) != 1 or name != relpath.encode('utf-8'):
+        raise GitError(f'git ls-tree {commit} -- {relpath} listed unexpected entries: {listing!r}')
+    mode, kind, oid = meta.decode('ascii').split()
+    if kind != 'blob' or mode not in {'100644', '100755'} or not delivery.get('after_exists', True):
+        return False
+    data = _run_git(['cat-file', 'blob', oid], root).stdout
+    return hashlib.sha256(data).hexdigest() == delivery['after_hash']
+
+
+def _refuse_changed_moved_base(destination, delivery):
+    """Before a branch is created on a moved HEAD, HEAD must still hold the
+    approved before-state of the target file.
+
+    The prepared commit keeps the HEAD recorded at preparation as its parent.
+    Publishing it after HEAD moved is the reviewed edit of the reviewed bytes
+    only if the operator's later commits left the target file unchanged.
+    Otherwise the approval reviewed content that HEAD no longer has, the
+    same TargetChanged that preparation reports without a crash.
+    """
+    from .destinations import read_destination
+    if delivery['branch_exists']:
+        return
+    tip, exists = _branch_base(Path(destination['repo_root']), destination['branch_name'])
+    if exists or tip == delivery['base_ref']:
+        return
+    current = read_destination(destination)  # the branch is absent, so this reads HEAD
+    if current['content_hash'] != delivery['before_hash'] or current['exists'] != delivery['before_exists']:
+        raise DeliveryBlocked('TargetChanged', 'HEAD moved after this edit was prepared, and the target file at the new HEAD '
+                              'differs from the approved before-state. No ref was written. Cancel this delivery and review a new preview.')
+
+
+def _refuse_rewritten_forward_record(delivery):
+    """Before a forward edit is published, its retained before-state must
+    pass the line-ending refusal (BL-60).
+
+    Preparation refuses such targets, so only code from before that refusal
+    can have prepared this record. Validation of a retained record opts out
+    of the refusal so that old deliveries stay readable and reversible, and
+    without this check a record that older code prepared and never published
+    would publish its LF-rewritten bytes after the upgrade. Callers run it
+    after observation, so a write that already happened is still
+    acknowledged, and after the cancellation check, so cancel still works.
+    Rollback records are not forward edits; they restore retained bytes.
+
+    The detail gives the steps in the order that works: cancel, then fix
+    the file, then review a new preview. It omits the "fix the file first"
+    advice of the plain refusal. In file mode, a file fixed before the
+    cancel matches neither recorded state, so the cancel blocks as
+    TargetChanged.
+    """
+    from . import propose
+    try:
+        propose._refuse_rewritten_boundaries(delivery['before_content'])
+    except propose.UnsupportedLineEndings as exc:
+        raise DeliveryBlocked('UnsupportedLineEndings', f'{exc.problem}. This edit was prepared before that refusal '
+                              'existed, and publishing it would rewrite bytes outside the reviewed lines. No file or '
+                              f'ref was written. Cancel this delivery first. Then fix the file: {exc.fix}. Then '
+                              'review a new preview. If the file is fixed before the cancel, the cancel can block '
+                              'as TargetChanged, because the file then matches neither recorded state.') from exc
 
 
 def _publish_prepared_write(destination, delivery, record_id, checkpoint_hook):
@@ -1148,6 +1266,7 @@ def _publish_prepared_write(destination, delivery, record_id, checkpoint_hook):
     else:
         root = Path(destination['repo_root'])
         _refuse_checked_out_branch(root, destination['branch_name'])
+        _refuse_changed_moved_base(destination, delivery)
         before = _capture_worktree(root, path)
         _run_git(['update-ref', 'refs/heads/' + destination['branch_name'], delivery['branch_commit'],
                   delivery['base_ref'] if delivery['branch_exists'] else ''], root)

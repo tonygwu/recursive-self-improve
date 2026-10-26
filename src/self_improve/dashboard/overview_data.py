@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 import json
 
 from ..execution_policy import policy_snapshot, waiting_proposals
+from ..stage_accounting import numbers
 from . import queries, run_data
 
 
@@ -77,10 +78,10 @@ def review_preview(store, cfg):
     ordered=sorted(groups.values(),key=lambda row:(-row['size'],row['learning_id']))
     shown=ordered[:3]
     for row in shown:
-        learning=store.query_one('SELECT title FROM learnings WHERE id=?',(row['learning_id'],))
+        learning=store.query_one('SELECT title,rule_text FROM learnings WHERE id=?',(row['learning_id'],))
         if learning is None:
             raise OverviewDataError('proposal '+row['proposal_id']+': missing learning '+row['learning_id'])
-        title=learning['title']
+        title=(learning['title'] or '').strip() or (learning['rule_text'] or '').strip() or 'Instruction text unavailable'
         row['title']=title[:160];row['title_cut']=len(title)>160
     box=queries.inbox(store,cfg)
     return {'auto_apply_pending':box['auto_apply_pending'],'unknown_statuses':box['unknown_statuses'],'count':len(waiting),'family_count':len(groups),'families':shown,'omitted_families':max(0,len(groups)-len(shown)),
@@ -100,7 +101,20 @@ def latest_run(store):
         numeric=[] if payload is None else [(k,v) for k,v in payload.items() if type(v) in (int,float)]
         summary=None if payload is None else dict(numeric[:4])
         cell=queries._stage_cell(row,name,stats)
-        stages.append({'name':name,'recorded':name in stats,'payload':summary,
+        accounting=numbers(name,payload) if payload is not None else None
+        outcomes={}
+        if accounting is not None and name=='mine':
+            outcomes={'processed':accounting['succeeded'],
+                      'processing errors':accounting['failed']-accounting['refused_in_failed'],
+                      'stopped at call limit':accounting['refused_in_failed']}
+            if 'budget_exhausted' in accounting['not_attempted']:
+                outcomes['not attempted (call limit)']=accounting['not_attempted']['budget_exhausted']
+        elif accounting is not None and name=='gate':
+            outcomes={label:payload[key] for key,label in (
+                ('gated_pass','passed evaluation'),('gated_fail','failed evaluation'),
+                ('ungated','benefit not established'),('inconclusive','inconclusive'),
+                ('failed','processing errors'),('refused','waiting on budget'))}
+        stages.append({'name':name,'recorded':name in stats,'payload':summary,'outcomes':outcomes,
                        'omitted_numeric_fields':max(0,len(numeric)-4),
                        'cell':{'state':cell['state']}})
     return {'run':{k:v for k,v in row.items() if k!='stats_json'},'stages':stages,

@@ -109,6 +109,50 @@ def test_unverified_or_failed_arms_cannot_be_reported_as_valid_comparisons(env,m
             assert scenario['arms']['with']['skipped']['reason']=='without_arm_uninformative'
 
 
+def _with_arm_served_by(monkeypatch, model):
+    original=LLMRunner._execute
+    def changed(self,*args,**kwargs):
+        result=original(self,*args,**kwargs)
+        if args[1]=='grade' and (Path(kwargs['sandbox_dir'])/'CLAUDE.md').exists():
+            return replace(result,model_reported=model)
+        return result
+    monkeypatch.setattr(LLMRunner,'_execute',changed)
+
+
+def test_arms_served_by_different_models_give_a_non_voting_error(env,monkeypatch):
+    """BL-07: the gate compared pass counts across arms that different models
+    served. Only the dashboard reader refused that comparison."""
+    _with_arm_served_by(monkeypatch,'fixture-other-model')
+    result,shown=execute(env)
+    assert result['state']=='completed',result
+    for scenario in shown['scenarios']:
+        evaluation=scenario['evaluation']
+        assert evaluation['verdict']=='error',evaluation['verdict']
+        served=json.loads(evaluation['metrics_json'])['served_models']
+        assert sorted(m['model'] for m in served)==sorted({'fixture-other-model',
+            scenario['arms']['without']['served_models'][0]['model']})
+    assert result['result']['verdict']!='gated_pass',result['result']
+
+
+def test_a_replayed_gate_reaches_the_same_served_model_verdict(env,monkeypatch):
+    """The check reads retained call results, so a replay from checkpoints,
+    which makes no calls, reaches the verdict the live run reached."""
+    cfg,store,p,calls=env;queued=submit_command(store,cfg,request(env))
+    _with_arm_served_by(monkeypatch,'fixture-other-model')
+    def die(event):
+        if event=='gate_finished':raise KeyboardInterrupt()
+    monkeypatch.setattr(job_worker,'_checkpoint',die)
+    with pytest.raises(KeyboardInterrupt):job_worker.run_once(store,cfg)
+    attempt=history.page(store,command_id=queued['id'])['records'][0]
+    before=history.detail(store,attempt['id'])
+    monkeypatch.setattr(job_worker,'_checkpoint',lambda _:None)
+    with closing(Store(store.db_path,migrate=False)) as fresh:result=job_worker.run_once(fresh,cfg)
+    assert result['state']=='completed',result
+    assert history.detail(store,attempt['id'])==before
+    assert [s['evaluation']['verdict'] for s in before['scenarios']]==['error']*3
+    assert len(calls)==21
+
+
 def test_manual_budget_refusal_retains_attempt_and_actual_run_without_calls(env):
     cfg,store,p,calls=env
     stats=gate_existing_proposal(replace(cfg,max_gate_calls_per_run=0),store,p['id'])

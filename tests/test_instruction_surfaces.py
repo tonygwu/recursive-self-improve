@@ -98,9 +98,10 @@ def test_context_partition_and_aliases_reach_retained_api_without_rereading(cfg,
     before = store.query_one('SELECT COUNT(*) n FROM instruction_inventories')['n']
     def forbidden(*args, **kwargs): raise AssertionError('Reader attempted collection')
     monkeypatch.setattr(availability, 'inspect_surfaces', forbidden)
-    from self_improve.dashboard import app as dashboard_app
-    monkeypatch.setattr(dashboard_app, '_context_weigher', forbidden)
-    with TestClient(create_app(cfg)) as client:
+    from tests.walk_guard import forbid_live_walks
+    app = create_app(cfg)
+    forbid_live_walks(monkeypatch)
+    with TestClient(app) as client:
         rows = client.get('/api/projects?other_md=1').json()['rows']
         weight = next(row for row in rows if row['project_key'] == key)['context_weight']
         assert weight['computable'] and weight['total_bytes'] == record['totals']['bytes']
@@ -199,3 +200,187 @@ def test_failed_empty_inspection_is_unknown_but_observed_empty_is_zero(cfg, stor
     availability.collect_availability(store, cfg, observed_at='2030-01-02T00:00:00Z')
     failed = project_summary(store, project_key=key)
     assert failed['computable'] is False and failed['reason'] == 'incomplete_inventory_observation'
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize('spec', ['@~no-such-user-for-bl30/notes.md', '@./a\x00b.md'])
+def test_a_bad_import_path_is_an_issue_not_a_collection_crash(cfg, tmp_path, spec):
+    """BL-30: expanduser() and resolve() ran without error handling, so one
+    unknown ~user or a NUL in an import aborted collection for every copy."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'CLAUDE.md', f'See {spec} for details.\n')
+    result = inspect_surfaces(cfg, repo)
+    causes = [i['cause'] for i in result['issues']]
+    assert any(c.startswith('import_path_invalid') or c.startswith('file_unreadable') for c in causes), causes
+    assert str(repo/'CLAUDE.md') in {f['path'] for f in result['files']}
+
+
+def test_a_plugin_registry_path_with_a_nul_is_an_issue_not_a_crash(cfg, tmp_path):
+    """BL-30: an installPath with an embedded NUL raised ValueError out of the
+    collector and failed the nightly before mining."""
+    import json as _json
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    # An empty claude_plugins_dir derives plugins/ beside the global CLAUDE.md.
+    plugins = Path(cfg.claude_plugins_dir) if cfg.claude_plugins_dir else Path(cfg.global_claude_md).parent/'plugins'
+    assert plugins.is_absolute()
+    write(plugins/'installed_plugins.json', _json.dumps({'version': 2, 'plugins': {
+        'p@mk': [{'scope': 'user', 'installPath': str(tmp_path/'pl') + '\u0000x', 'version': '1'}]}}))
+    result = inspect_surfaces(cfg, repo)
+    assert result['issues'], result['issues']
+
+
+def test_a_dangling_codex_home_is_a_named_failure_not_an_empty_home(cfg, tmp_path):
+    """BL-33: os.path.lexists returned False for a dangling or unreadable Codex
+    home, so the inventory recorded no Codex files and no issue at all."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    home = tmp_path/'codex-home'
+    home.symlink_to(tmp_path/'missing-codex-home')
+    result = inspect_surfaces(replace(cfg, codex_global_agents_md=str(home/'AGENTS.md')), repo)
+    causes = [(i['cause'], i['path']) for i in result['issues']]
+    assert any(c.startswith('source_unreadable') and p.startswith(str(home)) for c, p in causes), causes
+
+
+def test_a_project_codex_config_that_changes_discovery_needs_runtime_trust(cfg, tmp_path):
+    """BL-52: the project .codex/config.toml trust branch had no test. Codex
+    applies a project config only to trusted projects, which the collector
+    cannot observe, so discovery settings there make Codex coverage unknown."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'AGENTS.md', 'Project rule.\n')
+    write(repo/'.codex'/'config.toml', 'project_doc_max_bytes = 10\n')
+    result = inspect_surfaces(cfg, repo)
+    causes = [i['cause'] for i in result['issues']]
+    assert 'codex_project_configuration_requires_runtime_trust' in causes, causes
+    assert result['codex_discovery']['configuration_valid'] is False
+    agents = next(f for f in result['files'] if f['path'] == str(repo/'AGENTS.md'))
+    codex_paths = [p for p in agents['loading_paths'] if p['provider'] == 'codex']
+    assert codex_paths and all(p['eligible_prefix_bytes'] == 0 for p in codex_paths), codex_paths
+
+
+def test_project_codex_files_that_exactly_fill_the_budget_are_fully_eligible(cfg, tmp_path):
+    """BL-32: the collector charged 2 bytes per separator. Codex charges each
+    project document's own bytes to project_doc_max_bytes and adds the
+    separator only when it renders the text, so two project files that sum
+    to exactly the allowance load in full. One more byte is omitted."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(Path(cfg.codex_global_agents_md).parent/'config.toml', 'project_doc_max_bytes = 100\n')
+    root_doc = write(repo/'AGENTS.md', 'r' * 59 + '\n')
+    nested_doc = write(repo/'sub/AGENTS.md', 'n' * 39 + '\n')
+
+    def codex_prefixes():
+        result = inspect_surfaces(cfg, repo/'sub')
+        files = {f['path']: f for f in result['files']}
+        prefixes = [p['eligible_prefix_bytes'] for doc in (root_doc, nested_doc)
+                    for p in files[str(doc.resolve())]['loading_paths'] if p['provider'] == 'codex']
+        limits = [(Path(i['path']).parent.name, i['omitted_bytes']) for i in result['issues']
+                  if i['cause'] == 'codex_instruction_coverage_limit']
+        return prefixes, limits
+
+    assert codex_prefixes() == ([60, 40], [])
+    nested_doc.write_text('n' * 40 + '\n')
+    assert codex_prefixes() == ([60, 40], [('sub', 1)])
+
+
+def test_a_project_codex_skills_table_needs_runtime_trust(cfg, tmp_path):
+    """BL-52: the second trust cause had no test. A [skills] table in a
+    project .codex/config.toml applies only in a trusted project, so the
+    collector cannot resolve skill settings. It names the cause, leaves the
+    project skill unresolved, and keeps document discovery valid."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'AGENTS.md', 'Project rule.\n')
+    write(repo/'.codex'/'config.toml', '[skills]\nconfig = []\n')
+    skill = write(repo/'.agents/skills/example/SKILL.md', '---\nname: example\ndescription: An invented skill.\n---\nBody.\n')
+    result = inspect_surfaces(cfg, repo)
+    causes = [(i['cause'], i['path']) for i in result['issues']]
+    assert causes == [('codex_project_skill_configuration_requires_runtime_trust', str(repo.resolve()/'.codex/config.toml'))], causes
+    assert result['codex_discovery']['skill_configuration_valid'] is False
+    assert result['codex_discovery']['configuration_valid'] is True
+    files = {f['path']: f for f in result['files']}
+    [skill_path] = files[str(skill.resolve())]['loading_paths']
+    assert (skill_path['eligibility_reason'], skill_path['eligible_prefix_bytes']) == ('codex_skill_configuration_unresolved', 0)
+    [agents_path] = files[str(repo.resolve()/'AGENTS.md')]['loading_paths']
+    assert agents_path['eligible_prefix_bytes'] == len('Project rule.\n')
+
+
+def test_an_import_chain_past_the_depth_cap_is_named_with_its_omissions(cfg, tmp_path):
+    """BL-52: no test reached import_depth_limit; raising the cap passed.
+
+    The chain is literal, not built from MAX_IMPORT_DEPTH, so a changed cap
+    or one extra loaded hop fails here. Claude Code follows imports for five
+    hops: CLAUDE.md -> h1 ... h5 load, and h5's import of h6 is omitted."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'CLAUDE.md', '@h1.md\n')
+    for level in range(1, 6):
+        write(repo/f'h{level}.md', f'level {level}\n@h{level + 1}.md\n')
+    write(repo/'h6.md', 'level 6\n')
+    result = inspect_surfaces(cfg, repo)
+    limits = [i for i in result['issues'] if i['cause'] == 'import_depth_limit']
+    assert limits == [{'cause': 'import_depth_limit', 'path': str(repo.resolve()/'h5.md'), 'omitted_imports': 1}], result['issues']
+    loaded = {Path(f['path']).name for f in result['files']}
+    assert {'CLAUDE.md', 'h1.md', 'h2.md', 'h3.md', 'h4.md', 'h5.md'} <= loaded, loaded
+    assert 'h6.md' not in loaded, loaded
+
+
+def test_the_surface_file_count_cap_is_named(cfg, tmp_path, monkeypatch):
+    from self_improve import instruction_surfaces as surfaces
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'CLAUDE.md', '@a.md\n@b.md\n@c.md\n')
+    for name in 'abc':
+        write(repo/f'{name}.md', f'{name}\n')
+    monkeypatch.setattr(surfaces, 'MAX_FILES', 2)
+    result = inspect_surfaces(cfg, repo)
+    assert any(i['cause'] == 'file_count_limit' for i in result['issues']), result['issues']
+
+
+def test_the_surface_file_count_cap_holds_exactly_2000_files_and_names_the_next(cfg, tmp_path):
+    """Review of BL-52: changing the read cap's `>=` to `>` passed every
+    instruction test, because the cap test above omits two files at a
+    patched cap of 2. The counts here are literal. One rule directory stays
+    inside its own discovery cap of 2,000, and CLAUDE.md adds one more file.
+
+    At exactly 2,000 read files nothing is omitted. At 2,001 exactly one is,
+    with the cap and the omission named, and every other file still loads.
+    CLAUDE.md is read before the rule directory, whose names are sorted, so
+    the last rule name is the one omitted."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    write(repo/'CLAUDE.md', 'Project rule.\n')
+    rules = repo/'.claude/rules'
+    for index in range(1999):
+        write(rules/f'r{index:04}.md', f'Invented rule {index}.\n')
+    exact = inspect_surfaces(cfg, repo)
+    assert not [i for i in exact['issues'] if i['cause'] in {'file_count_limit', 'discovery_file_limit'}], exact['issues'][:3]
+    assert len(exact['files']) == 2000
+
+    write(rules/'r1999.md', 'Invented rule 1999.\n')
+    over = inspect_surfaces(cfg, repo)
+    assert not [i for i in over['issues'] if i['cause'] == 'discovery_file_limit'], over['issues'][:3]
+    limits = [i for i in over['issues'] if i['cause'] == 'file_count_limit']
+    assert limits == [{'cause': 'file_count_limit', 'path': str(repo.resolve()/'.claude/rules/r1999.md'),
+                       'limit': 2000, 'omitted_at_least': 1}], limits
+    loaded = {Path(f['path']).name for f in over['files']}
+    assert len(loaded) == 2000 and {'CLAUDE.md', 'r1998.md'} <= loaded and 'r1999.md' not in loaded, sorted(loaded)[-3:]
+
+
+def test_a_rule_directory_past_the_discovery_file_cap_is_named_with_its_omissions(cfg, tmp_path):
+    """BL-52: nothing reached discovery_file_limit; replacing its check with
+    `if False:` passed every instruction test. The 2,001 files are literal,
+    so a raised MAX_FILES fails here as well as a removed check. Discovery
+    sorts one directory by name, so the last name is the one omitted."""
+    repo = init_git_repo(tmp_path/'project', 'README.md', '# Fixture\n')
+    rules = repo/'.claude/rules'
+    for index in range(2001):
+        write(rules/f'r{index:04}.md', f'Invented rule {index}.\n')
+    result = inspect_surfaces(cfg, repo)
+    limits = [i for i in result['issues'] if i['cause'] == 'discovery_file_limit']
+    assert limits == [{'cause': 'discovery_file_limit', 'path': str(repo.resolve()/'.claude/rules'),
+                       'omitted_at_least': 1, 'limit': 2000}], limits
+    loaded = {Path(f['path']).name for f in result['files']}
+    assert len(loaded) == 2000 and 'r1999.md' in loaded and 'r2000.md' not in loaded, sorted(loaded)[-3:]
+    # The omission is discovery's, not the separate read cap's.
+    assert not [i for i in result['issues'] if i['cause'] == 'file_count_limit'], result['issues'][:3]
+    # At exactly the cap nothing is omitted.
+    (rules/'r2000.md').unlink()
+    exact = inspect_surfaces(cfg, repo)
+    assert not [i for i in exact['issues'] if i['cause'] == 'discovery_file_limit'], exact['issues'][:3]
+    assert len(exact['files']) == 2000

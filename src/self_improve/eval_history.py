@@ -290,6 +290,26 @@ def detail(store, attempt_id):
             'reason':'' if completed else 'No complete verdict was recorded; inspect stops, calls and the triggering run or job.'}
 
 
+def served_identities(store, attempt_id, scenario):
+    """Distinct known (provider, model) pairs that served one scenario's trials.
+
+    The pairs come from retained call results, so a replay from checkpoints,
+    which makes no calls, reaches the same answer as the live run. A call
+    without provider or model telemetry adds nothing.
+    """
+    rows = store.query("SELECT * FROM eval_attempt_events WHERE attempt_id=? AND kind='call_result' "
+                       "AND scenario_index=? AND arm IN ('without','with') ORDER BY created_at,id",
+                       (attempt_id, scenario))
+    served = set()
+    for row in rows:
+        call = _read(row, 'eval_attempt_events')['data'].get('call')
+        if not isinstance(call, dict):
+            raise EvalHistoryError('eval_attempt_events.'+row['id']+': invalid call result')
+        if call.get('provider') and call.get('model_reported'):
+            served.add((call['provider'], call['model_reported']))
+    return sorted(served)
+
+
 def _scenarios(store, source, events):
     """Describe observed outcomes; incomplete or confounded arms have no rate delta."""
     from .evals.harness import spec_from_dict, SpecError

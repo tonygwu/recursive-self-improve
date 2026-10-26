@@ -54,6 +54,10 @@ with sync_playwright() as p:
 
     def decide(key, expected):
         before = selected()
+        # A queue refresh reloads the selected preview, and r, like its button,
+        # is ignored until that preview is loaded again (BACKLOG BL-18).
+        if key == 'r':
+            page.locator('[data-decision="reject"]:not([disabled])').wait_for()
         page.keyboard.press(key)
         if expected:
             expect(card).to_have_attribute('data-learning-id', expected)

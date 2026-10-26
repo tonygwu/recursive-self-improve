@@ -129,7 +129,8 @@ def build_inventory(*, surface, project_key, working_copy_path, revisions, obser
     if record['profile'] in {'instruction-surfaces/2', 'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'}:
         record['context'] = summarize(files)
     if record['profile'] in {'instruction-surfaces/3', 'instruction-surfaces/4', 'instruction-surfaces/5', 'instruction-surfaces/6'} and not files and any(
-            issue['cause'] == 'working_copy_identity_changed' for issue in record['issues']):
+            issue['cause'] in ('working_copy_identity_changed', 'source_changed_during_observation')
+            for issue in record['issues']):
         # Identity refusal bypasses filesystem discovery entirely. It retains
         # an explicit failed observation, never an observed empty catalog.
         record.setdefault('uninspected_commands', [])

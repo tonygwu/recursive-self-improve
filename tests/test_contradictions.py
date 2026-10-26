@@ -208,6 +208,7 @@ def test_contradicts_row_lands_with_status_new(tmp_path):
         "judge_failed": 0,
         "deferred": 0,
         "skipped_already_judged": 0,
+        "budget_deferred": 0,
     }
     (row,) = _rows(store)
     assert row["verdict"] == "contradicts"
@@ -424,3 +425,458 @@ def test_distinct_rules_in_different_files_are_still_paired(tmp_path):
     cands = find_candidates(cfg, [str(p1), str(p2)], Embedder(cfg, store))
     assert cands, "a cross-file candidate pair was lost"
     assert cands[0]["file_a"] != cands[0]["file_b"]
+
+
+def test_a_failed_judge_call_keeps_its_cause_in_the_stage_taxonomy():
+    """BL-19: a judge call that never ran was counted judge_failed with no cause."""
+    from self_improve.pipeline import MineCallFailed, _judge_with_causes
+
+    causes = {}
+    judge = _judge_with_causes(lambda prompt: (_ for _ in ()).throw(MineCallFailed("timeout", "slow")), causes)
+    assert judge("prompt") is None
+    assert causes == {"call_failed:timeout": 1}
+
+
+def test_a_budget_refusal_mid_sweep_keeps_the_judged_work_and_its_counts(tmp_path):
+    """BL-37: the pipeline replaced the stats with {'skipped': 'budget_exhausted'}
+    although judged rows were stored, so the report said detection did not run."""
+    from self_improve.contradictions import JudgeRefused
+
+    store = Store(tmp_path / "s.db")
+    calls = []
+
+    def judge(prompt):
+        calls.append(prompt)
+        if len(calls) > 2:
+            raise JudgeRefused("cheap pool spent")
+        return COMPAT
+
+    stats = judge_pairs(store, Config(), [_cand(i) for i in range(5)], judge, PROMPTS_DIR, "r1")
+    assert stats["judged"] == 2 and stats["budget_deferred"] == 3 and stats["deferred"] == 3, stats
+    assert "skipped" not in stats
+    assert len(_rows(store)) == 2
+
+
+def test_a_pair_judged_in_an_earlier_run_is_not_counted_as_budget_deferred(tmp_path):
+    """BL-37 review: after a refusal every later candidate was counted as
+    budget_deferred, including a pair an earlier run had already judged."""
+    from self_improve.contradictions import JudgeRefused
+
+    store = Store(tmp_path / "s.db")
+    first = judge_pairs(store, Config(), [_cand(0)], lambda prompt: COMPAT, PROMPTS_DIR, "r1")
+    assert first["judged"] == 1, first
+
+    def refuse(prompt):
+        raise JudgeRefused("cheap pool spent")
+
+    stats = judge_pairs(
+        store, Config(), [_cand(1), _cand(0), _cand(2)], refuse, PROMPTS_DIR, "r2"
+    )
+    assert stats["skipped_already_judged"] == 1, stats
+    assert stats["budget_deferred"] == 2 and stats["deferred"] == 2, stats
+    assert stats["judged"] == 0, stats
+
+
+def _store_run_with(store: Store, entry, *, raw: str | None = None) -> str:
+    """Insert one run whose stats hold ``entry``, or exactly ``raw``."""
+    import json
+
+    run_id = new_id()
+    store.insert("runs", {
+        "id": run_id, "started": utc_now_iso(), "finished": utc_now_iso(),
+        "status": "ok", "report_path": "",
+        "stats_json": raw if raw is not None else json.dumps({"contradictions": entry}),
+    })
+    store.commit()
+    return run_id
+
+
+def _refused_sweep(store: Store, *, judge_first: int, fail_first: int = 0) -> dict:
+    """Stats from the real refusal path, with the pipeline's wrappers in its
+    order. The first `fail_first` calls fail to launch, the next
+    `judge_first` return a verdict, and _refusable turns the budget refusal
+    of the call after them into JudgeRefused."""
+    from self_improve.contradictions import JudgeRefused
+    from self_improve.pipeline import (
+        BudgetExhaustedSignal, MineCallFailed, _judge_with_causes, _refusable)
+
+    calls = []
+
+    def llm_json(prompt):
+        calls.append(prompt)
+        if len(calls) <= fail_first:
+            raise MineCallFailed("spawn_error", "invented launch failure")
+        if len(calls) > fail_first + judge_first:
+            raise BudgetExhaustedSignal("cheap pool spent")
+        return COMPAT
+
+    causes: dict = {}
+    stats = judge_pairs(
+        store, Config(), [_cand(i) for i in range(4)],
+        _judge_with_causes(_refusable(llm_json, JudgeRefused), causes), PROMPTS_DIR, "r1",
+    )
+    if causes:
+        stats["taxonomy"] = dict(causes)
+    return stats
+
+
+def test_a_sweep_the_budget_refused_entirely_is_not_a_completed_check(tmp_path):
+    """BL-37 review: a sweep that judged nothing still looked completed, so
+    `selfimprove contradictions` printed 'No open contradictions.'"""
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    stats = _refused_sweep(store, judge_first=0)
+    assert stats["judged"] == 0 and stats["budget_deferred"] == 4, stats
+    _store_run_with(store, stats)
+    assert ever_completed(store) == (False, "call budget refused every judgment x1")
+
+
+def test_a_sweep_that_judged_some_pairs_before_the_refusal_is_completed(tmp_path):
+    """The partial case counts, as a sweep that reached its judgment cap does:
+    its verdicts are stored and its deferred pairs are offered again."""
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    stats = _refused_sweep(store, judge_first=1)
+    assert stats["judged"] == 1 and stats["budget_deferred"] == 3, stats
+    _store_run_with(store, stats)
+    assert ever_completed(store) == (True, "")
+
+
+def test_judgment_calls_that_failed_before_the_refusal_are_named(tmp_path):
+    """Review fix (BL-37): two judgment calls failed, each spending a call
+    from the pool, and then the budget refused the third. The CLI said "call
+    budget refused every judgment" and the report said the mining pool "was
+    already spent". Both were false: two calls ran."""
+    from self_improve import report
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    stats = _refused_sweep(store, judge_first=0, fail_first=2)
+    assert (stats["judged"], stats["judge_failed"], stats["budget_deferred"]) == (0, 2, 2), stats
+    assert stats["taxonomy"] == {"call_failed:spawn_error": 2}, stats
+    _store_run_with(store, stats)
+    assert ever_completed(store) == (
+        False, "no pair judged: 2 judgment call(s) failed, then the call budget refused the next x1")
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": stats}, store, run_id="r1") if l]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith(
+        "- **Contradiction detection judged no pair: its judgment calls failed, then the "
+        "mining pool ran out.** The call budget left 2 pair(s) unjudged; 0 judged. Those "
+        "pairs are offered again next run. 2 judgment call(s) failed before the refusal, "
+        "and those pairs are offered again too."), lines
+    assert "already spent" not in lines[0]
+
+
+def test_a_partial_sweep_names_its_failed_calls_too(tmp_path):
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    stats = _refused_sweep(store, judge_first=1, fail_first=1)
+    assert (stats["judged"], stats["judge_failed"], stats["budget_deferred"]) == (1, 1, 2), stats
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": stats}, store, run_id="r1") if l]
+    assert lines[0].startswith(
+        "- **Contradiction detection stopped early: the mining pool ran out.** The call "
+        "budget left 2 pair(s) unjudged; 1 judged. Those pairs are offered again next run. "
+        "1 judgment call(s) failed before the refusal"), lines
+
+
+def test_a_refusal_before_any_call_still_says_the_pool_was_already_spent(tmp_path):
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    stats = _refused_sweep(store, judge_first=0)
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": stats}, store, run_id="r1") if l]
+    assert lines[0].startswith(
+        "- **Contradiction detection judged no pair: the mining pool was already spent.** "
+        "The call budget left 4 pair(s) unjudged; 0 judged. Those pairs are offered again "
+        "next run. It bills to"), lines
+
+
+def _capped_sweep(store: Store, *, fail_first: int) -> dict:
+    """Five candidates under a judgment cap of 3. The first ``fail_first``
+    calls fail to launch and the rest return a verdict, through the same
+    wrappers the pipeline uses. A failed call counts toward the cap."""
+    from self_improve.contradictions import JudgeRefused
+    from self_improve.pipeline import MineCallFailed, _judge_with_causes, _refusable
+
+    calls = []
+
+    def llm_json(prompt):
+        calls.append(prompt)
+        if len(calls) <= fail_first:
+            raise MineCallFailed("spawn_error", "invented launch failure")
+        return COMPAT
+
+    causes: dict = {}
+    stats = judge_pairs(
+        store, Config(contradiction_max_judgments_per_run=3), [_cand(i) for i in range(5)],
+        _judge_with_causes(_refusable(llm_json, JudgeRefused), causes), PROMPTS_DIR, "r1",
+    )
+    assert len(calls) == 3, calls
+    return stats
+
+
+_CAP_TAIL = ("Deferred pairs are not lost. They are skipped this run and offered again "
+             "next run")
+
+
+@pytest.mark.parametrize("fail_first,judged", [(3, 0), (2, 1)])
+def test_the_judgment_cap_line_names_failed_judgment_calls(tmp_path, fail_first, judged):
+    """Review fix (BL-37): with a cap of 3, three judgment calls failed and two
+    pairs were deferred. The report blamed the cap "rather than that anything
+    failed", so an operator could raise the cap instead of fixing the judge.
+    Each failed call counted toward the cap, so the line must name them."""
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    stats = _capped_sweep(store, fail_first=fail_first)
+    assert {k: stats[k] for k in ("judged", "judge_failed", "deferred", "budget_deferred")} == {
+        "judged": judged, "judge_failed": fail_first, "deferred": 2, "budget_deferred": 0}, stats
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": stats}, store, run_id="r1") if l]
+    assert lines == [
+        "- **Contradiction detection reached its judgment cap: 2 pair(s) deferred**, "
+        f"{judged} judged. {fail_first} judgment call(s) failed, and those pairs are offered "
+        "again too. Each failed call counted toward the cap. " + _CAP_TAIL + ". A standing "
+        "backlog here can mean that the cap (`contradiction_max_judgments_per_run`) is "
+        "below the candidate rate, or that judgment calls keep failing. Find out why the "
+        "calls failed before you raise the cap."], lines
+    assert "rather than that anything failed" not in lines[0]
+    assert "—" not in lines[0]
+
+
+def test_the_judgment_cap_line_without_failures_still_blames_only_the_cap(tmp_path):
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    stats = _capped_sweep(store, fail_first=0)
+    assert (stats["judged"], stats["judge_failed"], stats["deferred"]) == (3, 0, 2), stats
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": stats}, store, run_id="r1") if l]
+    assert lines == [
+        "- **Contradiction detection reached its judgment cap: 2 pair(s) deferred**, "
+        "3 judged. " + _CAP_TAIL + ", so a standing backlog here means the cap "
+        "(`contradiction_max_judgments_per_run`) is below the candidate rate rather than "
+        "that anything failed."], lines
+    assert "—" not in lines[0]
+
+
+@pytest.mark.parametrize("entry,reason", [
+    ({"judged": 0, "judge_failed": 0, "deferred": 4, "budget_deferred": "4"},
+     "unreadable budget_deferred counter"),
+    ({"judged": None, "judge_failed": 0, "deferred": 4, "budget_deferred": 4},
+     "unreadable judged counter"),
+])
+def test_unreadable_refusal_counters_never_count_as_a_completed_check(tmp_path, entry, reason):
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, entry)
+    assert ever_completed(store) == (False, f"{reason} in run {run_id} x1")
+
+
+# Each shape is one the stage cannot have written. Review of BL-37 found
+# ever_completed, the report line and the pool history each judged them by
+# its own rule: a float counted, a negative count was "left -1 pair(s)
+# unjudged", and a string `judged` was a completed check.
+_BAD_COUNTERS = [
+    ({"judged": 0, "judge_failed": 0, "deferred": 4, "budget_deferred": -1},
+     "unreadable budget_deferred counter", "are unreadable"),
+    ({"judged": 0, "judge_failed": 0, "deferred": 4, "budget_deferred": 4.0},
+     "unreadable budget_deferred counter", "are unreadable"),
+    ({"judged": 0.0, "judge_failed": 0, "deferred": 4, "budget_deferred": 4},
+     "unreadable judged counter", "are unreadable"),
+    ({"judged": 0, "judge_failed": 0, "deferred": 4, "budget_deferred": True},
+     "unreadable budget_deferred counter", "are unreadable"),
+    ({"judged": -3, "judge_failed": 0, "deferred": 0, "budget_deferred": 0},
+     "unreadable judged counter", "are unreadable"),
+    ({"judged": "x", "judge_failed": 0, "deferred": 0},
+     "unreadable judged counter", "are unreadable"),
+    ({"judged": 4, "deferred": 0},
+     "missing judge_failed counter", "are unreadable"),
+    ({"judged": 0, "judge_failed": 0, "deferred": 2, "budget_deferred": 5},
+     "budget_deferred counter above deferred", "disagree"),
+    ({"judged": 3, "judge_failed": 0, "deferred": 2, "budget_deferred": 5},
+     "budget_deferred counter above deferred", "disagree"),
+]
+
+
+@pytest.mark.parametrize("entry,reason,line", _BAD_COUNTERS)
+def test_every_reader_refuses_the_same_unreadable_counters(tmp_path, entry, reason, line):
+    """Review fix (BL-37): one counter check serves ever_completed, the
+    report's refusal line and the pool history, so none of them infers a
+    cause from a record the others call unreadable."""
+    from self_improve import report
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, entry)
+    assert ever_completed(store) == (False, f"{reason} in run {run_id} x1")
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": entry}, store, run_id=run_id) if l]
+    assert len(lines) == 1 and lines[0].startswith(f"- Contradiction stage counters {line}:"), lines
+    assert "mining pool" not in lines[0] and "judgment cap" not in lines[0], lines
+    # The pool history speaks only beside a refusal, so store one.
+    _store_run_with(store, _REFUSED)
+    history = report._contradiction_pool_history(store)
+    assert "1 had contradiction judgments refused by this pool, and 0 ran" in history, history
+    assert f"1 more had a record this count could not read, so it may miss refusals there: `{run_id}`." in history
+
+
+_REFUSED = {"candidates": 4, "judged": 0, "contradicts": 0, "compatible": 0, "judge_failed": 0,
+            "deferred": 4, "budget_deferred": 4, "skipped_already_judged": 0}
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '"x"', '{"contradictions": []}', "{oops"])
+def test_a_run_record_that_is_not_an_object_is_named_not_raised(tmp_path, raw):
+    """Review fix (BL-37): a stats_json of [] raised AttributeError, without
+    the run id, from ever_completed and the pool history. The pool history
+    also skipped unreadable rows while it claimed to count every run."""
+    from self_improve import report
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, None, raw=raw)
+    completed, why = ever_completed(store)
+    assert completed is False and why.endswith(f" in run {run_id} x1"), why
+    _store_run_with(store, _REFUSED)
+    history = report._contradiction_pool_history(store)
+    assert f"could not read, so it may miss refusals there: `{run_id}`." in history, history
+
+
+def test_the_pool_history_does_not_count_another_skip_as_a_run(tmp_path):
+    """A stage skipped for another reason did not run the sweep, so it is not
+    a run that "ran the stage without a refusal"."""
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    _store_run_with(store, {"skipped": "invented_reason"})
+    _store_run_with(store, _REFUSED)
+    history = report._contradiction_pool_history(store)
+    assert "1 had contradiction judgments refused by this pool, and 0 ran" in history, history
+    assert "could not read" not in history, history
+
+
+def test_the_report_names_a_stage_entry_that_is_not_an_object(tmp_path):
+    """ever_completed and the pool history call this entry unreadable, so the
+    run's own report must say so too rather than print nothing."""
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    lines = [l for l in report._contradiction_starved_lines({"contradictions": []}, store, run_id="r1") if l]
+    assert lines == ["- The contradiction stage recorded [], not an object. "
+                     "Nothing is inferred from it here."], lines
+
+
+def test_an_entry_from_before_the_refusal_counter_still_counts(tmp_path):
+    """Before BL-37 a refusal replaced the whole entry, so a counters entry
+    without budget_deferred had no refusal."""
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    _store_run_with(store, {"candidates": 4, "judged": 4, "deferred": 0, "judge_failed": 0})
+    assert ever_completed(store) == (True, "")
+
+
+# Before BL-37 the pipeline replaced the whole entry with this when the budget
+# refused a judgment, even after the sweep had stored verdicts. Today's
+# pipeline cannot write it, so these tests type the stored record as it is.
+_OLD_REFUSAL = {"skipped": "budget_exhausted"}
+# ever_completed's reason for such a run with no verdict in the database.
+_OLD_NO_VERDICT = ("skipped: budget_exhausted, and this database holds no verdict from "
+                   "that run; a state rebuild removes stored verdicts x1")
+
+
+def test_an_older_refusal_after_stored_verdicts_is_a_completed_check(tmp_path):
+    """Review fix (BL-37): a refusal stored before BL-37 has the older shape.
+    A run that stored verdicts before it read "No contradiction has ever
+    been computed" in the CLI, though its rows were in the table."""
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, _OLD_REFUSAL)
+    assert ever_completed(store) == (False, _OLD_NO_VERDICT)
+    for i in range(2):
+        _insert_row(store, run_id=run_id, unit_a=f"unit a {i}", verdict="compatible")
+    store.commit()
+    assert ever_completed(store) == (True, "")
+
+
+def test_verdicts_stored_by_another_run_do_not_complete_an_older_refusal(tmp_path):
+    from self_improve.contradictions import ever_completed
+
+    store = Store(tmp_path / "s.db")
+    _store_run_with(store, _OLD_REFUSAL)
+    _insert_row(store, run_id="invented-other-run", verdict="compatible")
+    store.commit()
+    assert ever_completed(store) == (False, _OLD_NO_VERDICT)
+
+
+def test_the_report_counts_the_verdicts_an_older_refusal_left_stored(tmp_path):
+    """Review fix (BL-37): a regenerated report for such a run said
+    "Contradiction detection did not run"."""
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, _OLD_REFUSAL)
+    for i in range(2):
+        _insert_row(store, run_id=run_id, unit_a=f"unit a {i}", verdict="compatible")
+    _insert_row(store, run_id="invented-other-run", unit_a="unit a 9", verdict="compatible")
+    store.commit()
+    lines = [l for l in report._contradiction_starved_lines(
+        {"contradictions": _OLD_REFUSAL}, store, run_id=run_id) if l]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith(
+        "- **Contradiction detection stopped early: the mining pool ran out.** It judged "
+        "at least 2 pair(s) before the refusal, and their verdicts are stored. This run "
+        "recorded the refusal in the older shape, without counters, so the number of "
+        "pairs left unjudged is unknown. It bills to `max_cheap_calls_per_run`"), lines
+    assert "did not run" not in lines[0]
+
+
+def test_an_older_refusal_with_no_stored_verdict_claims_nothing_it_cannot_know(tmp_path):
+    """The older shape lost judge_failed too, so the report cannot say the
+    pool was already spent: judgment calls may have failed first."""
+    from self_improve import report
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, _OLD_REFUSAL)
+    _insert_row(store, run_id="invented-other-run", verdict="compatible")
+    store.commit()
+    lines = [l for l in report._contradiction_starved_lines(
+        {"contradictions": _OLD_REFUSAL}, store, run_id=run_id) if l]
+    assert lines[0].startswith(
+        "- **Contradiction detection was refused by the call budget, and this database "
+        "holds no verdict from this run.** This run recorded the refusal in the older "
+        "shape, without counters, so it cannot say whether judgment calls failed before "
+        "the refusal or how many pairs were left unjudged. A state rebuild removes every "
+        "stored verdict, so this run may have judged pairs whose verdicts are gone. It "
+        "bills to"), lines
+    assert "did not run" not in lines[0] and "already spent" not in lines[0]
+
+
+def test_a_state_rebuild_removes_the_verdicts_an_older_refusal_stored(tmp_path):
+    """Review fix (BL-37): rebuild_state deletes every contradictions row. A
+    regenerated report for an older-shape refusal then said the run "stored
+    no verdict", though it had stored two. The run is no longer a completed
+    check, because this database holds none of its verdicts, and both
+    readers say that a rebuild removes verdicts."""
+    from self_improve import report
+    from self_improve.contradictions import ever_completed
+    from self_improve.rebuild import rebuild_state
+
+    store = Store(tmp_path / "s.db")
+    run_id = _store_run_with(store, _OLD_REFUSAL)
+    for i in range(2):
+        _insert_row(store, run_id=run_id, unit_a=f"unit a {i}", verdict="compatible")
+    store.commit()
+    assert ever_completed(store) == (True, "")
+    rebuild_state(store, export_path=tmp_path / "rebuild-backup")
+    assert store.query("SELECT id FROM contradictions") == []
+    assert ever_completed(store) == (False, _OLD_NO_VERDICT)
+    lines = [l for l in report._contradiction_starved_lines(
+        {"contradictions": _OLD_REFUSAL}, store, run_id=run_id) if l]
+    assert lines[0].startswith(
+        "- **Contradiction detection was refused by the call budget, and this database "
+        "holds no verdict from this run.**"), lines
+    assert "A state rebuild removes every stored verdict" in lines[0], lines
+    assert "stored no verdict" not in lines[0], lines

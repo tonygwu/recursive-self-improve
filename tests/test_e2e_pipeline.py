@@ -1611,3 +1611,177 @@ def test_queue_capture_failure_does_not_publish_a_phantom_running_run(corpus):
     assert corpus.store.query('SELECT * FROM runs')==[]
     corpus.store.commit()
     assert corpus.store.query('SELECT * FROM queue_snapshots')==[]
+
+
+def test_a_failed_fast_mode_call_keeps_its_cause(corpus):
+    """BL-19: in fast mode `_llm_json` returned None for every failed call,
+    so a CLI that never started was filed as an unparseable answer."""
+    from tests.e2e_corpus import _Result
+
+    class FastFailingLLM(ScriptedLLM):
+        def call(self, stage, model_class, prompt, expect_json=True, **kw):
+            if stage == "mine":
+                self.calls.append({"stage": stage, "kind": "call", "prompt": prompt})
+                self._spend(stage)
+                self._record(stage, "spawn_error", "exit 127: env: node: No such file or directory")
+                return _Result(ok=False, parsed=None, outcome="spawn_error",
+                               error="exit 127: env: node: No such file or directory")
+            return super().call(stage, model_class, prompt, expect_json, **kw)
+
+    cfg = dataclasses.replace(corpus.cfg, mine_mode="fast")
+    llm = FastFailingLLM()
+    stats = run_pipeline(cfg, corpus.store, review_only=True, _llm_factory=llm.factory())
+    taxonomy = stats["mine"]["taxonomy"]
+    assert stats["mine"]["failed"] == stats["mine"]["attempted"] > 0
+    assert taxonomy.get("call_failed:spawn_error") == stats["mine"]["failed"], taxonomy
+    assert "MineParseFailure" not in taxonomy, taxonomy
+
+
+# ----------------------------------------------------------------------
+# Post-mine stage wiring through the real runner and its budgets
+# ----------------------------------------------------------------------
+#
+# The BL-19 and BL-37 helpers (_judge_with_causes, _refusable) had unit tests
+# only. Removing their call sites in pipeline.py left every stage test green.
+# These tests run the real pipeline with the real LLMRunner, so the budget
+# that refuses a call is the production one. Only provider execution is
+# scripted.
+
+_INVENTED_RULES = (
+    "# Invented rules\n\n"
+    "- Run the complete test suite before every commit.\n"
+    "- Store every timestamp in UTC rather than local time.\n"
+    "- Quote shell variables that may contain spaces.\n"
+    "- Redact credentials before writing any log line.\n"
+)
+_LAUNCH_FAILURE = "Invented process launch failure"
+
+
+def _ok(stage_payload, model):
+    from self_improve.llm import _ExecResult
+
+    return _ExecResult(ok=True, text=json.dumps(stage_payload), parsed=stage_payload,
+                       outcome="ok", provider="claude", model_reported=model)
+
+
+def _launch_failed():
+    from self_improve.llm import _ExecResult
+
+    return _ExecResult.fail("spawn_error", error=_LAUNCH_FAILURE, provider="claude")
+
+
+def _runner_run(corpus, monkeypatch, execute, *, rules=False, **overrides):
+    """Run the pipeline with the real LLMRunner; `execute` scripts providers.
+
+    With `rules`, the global CLAUDE.md holds invented rules and the candidate
+    floor of -1.0 makes every pair of them a candidate of the real
+    find_candidates, so the contradiction judge has work to do.
+    """
+    from self_improve.llm import LLMRunner
+
+    if rules:
+        target = Path(corpus.cfg.global_claude_md)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_INVENTED_RULES, encoding="utf-8")
+        overrides["contradiction_candidate_cosine"] = -1.0
+    monkeypatch.setattr(LLMRunner, "_execute", execute)
+    cfg = dataclasses.replace(corpus.cfg, **overrides)
+    return run_pipeline(cfg, corpus.store, review_only=True)
+
+
+def _non_learning():
+    return mine_payload("Invented non-learning", is_real_learning=False)
+
+
+def test_a_spent_cheap_pool_keeps_the_contradiction_counters(corpus, monkeypatch):
+    """BL-37 review: no test reached the pipeline's `_refusable` wiring.
+
+    Mining spends the shared cheap pool, so the budget refuses the first
+    judgment. The stage must keep its counters, record every candidate as
+    budget-deferred, and never claim a completed check.
+    Sabotage: drop `_refusable(...)` around the judge in pipeline.py.
+    """
+    from self_improve import contradictions
+
+    executed = []
+
+    def execute(self, call_id, stage, *args, **kwargs):
+        executed.append(stage)
+        if stage == "mine_agentic":
+            return _ok(_non_learning(), "claude-sonnet-4-6")
+        raise AssertionError(f"{stage} executed after the cheap pool was spent")
+
+    stats = _runner_run(corpus, monkeypatch, execute, rules=True, max_cheap_calls_per_run=1)
+    con = stats["contradictions"]
+    assert executed == ["mine_agentic"], executed
+    assert "skipped" not in con, con
+    assert con["candidates"] > 0 and con["judged"] == con["judge_failed"] == 0, con
+    assert con["budget_deferred"] == con["deferred"] == con["candidates"], con
+    assert contradictions.ever_completed(corpus.store) == (
+        False, "call budget refused every judgment x1")
+    report = Path(stats["report_path"]).read_text(encoding="utf-8").split("## Appendix")[0]
+    assert "judged no pair: the mining pool was already spent" in report
+
+
+def test_a_failed_contradiction_judgment_keeps_its_cause(corpus, monkeypatch):
+    """BL-19 review: the contradiction taxonomy wiring had no pipeline test.
+    Sabotage: drop the `stats["contradictions"]["taxonomy"]` assignment."""
+
+    def execute(self, call_id, stage, *args, **kwargs):
+        if stage == "mine_agentic":
+            return _ok(_non_learning(), "claude-sonnet-4-6")
+        if stage == "contradiction":
+            return _launch_failed()
+        raise AssertionError(f"unexpected stage {stage}")
+
+    stats = _runner_run(corpus, monkeypatch, execute, rules=True)
+    con = stats["contradictions"]
+    assert con["judge_failed"] > 0 and con["judged"] == 0, con
+    assert con["taxonomy"] == {"call_failed:spawn_error": con["judge_failed"]}, con
+
+
+def test_a_failed_cluster_merge_keeps_its_cause(corpus, monkeypatch):
+    """BL-19 review: the cluster taxonomy wiring had no pipeline test.
+    Sabotage: drop the `merge_stats["taxonomy"]` assignment."""
+    from self_improve import miner
+
+    payload = {k: v for k, v in mine_payload("Invented rule").items()
+               if k not in miner.MINE_AGENTIC_EXTRA_KEYS}
+
+    def execute(self, call_id, stage, *args, **kwargs):
+        if stage == "mine":
+            return _ok(payload, "claude-sonnet-4-6")
+        if stage == "cluster":
+            return _launch_failed()
+        from self_improve.llm import _ExecResult
+        return _ExecResult.fail("parse_error")
+
+    monkeypatch.setattr("self_improve.pipeline._ensure_sandbox", lambda *a, **kw: None)
+    stats = _runner_run(corpus, monkeypatch, execute, mine_mode="fast", cluster_group_cosine=-1.0)
+    cl = stats["cluster"]
+    assert cl["merge_failed"] > 0 and cl["merge_succeeded"] == 0, cl
+    assert cl["taxonomy"] == {"call_failed:spawn_error": cl["merge_failed"]}, cl
+
+
+def test_a_failed_eval_generation_call_keeps_its_cause(corpus, monkeypatch):
+    """BL-19 review: the gate taxonomy wiring had no pipeline test. The gate
+    records its causes in the apply stage's taxonomy.
+    Sabotage: file every gate exception as `gate_<class>` again."""
+    import itertools
+
+    rules = itertools.count()
+
+    def execute(self, call_id, stage, *args, **kwargs):
+        if stage == "mine_agentic":
+            return _ok(mine_payload(f"**Invented rule {next(rules)}**"), "claude-sonnet-4-6")
+        if stage == "eval_gen":
+            return _launch_failed()
+        from self_improve.llm import _ExecResult
+        return _ExecResult.fail("parse_error")
+
+    monkeypatch.setattr("self_improve.pipeline._ensure_sandbox", lambda *a, **kw: None)
+    stats = _runner_run(corpus, monkeypatch, execute)
+    gate, taxonomy = stats["gate"], stats["apply"]["taxonomy"]
+    assert gate["failed"] > 0 and gate["failed"] == gate["attempted"], gate
+    assert taxonomy.get("gate_call_failed:spawn_error") == gate["failed"], taxonomy
+    assert "gate_MineCallFailed" not in taxonomy, taxonomy

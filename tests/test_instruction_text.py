@@ -267,3 +267,137 @@ def test_collector_requires_explicit_text_upgrade_without_mutating_old_schema(cf
         collect(upgraded,cfg)
         assert len(archives(upgraded)) == 1
     finally: upgraded.close()
+
+
+# BACKLOG BL-35: each archive is validated against the redaction rules version
+# it records. Invented Figma-shaped URL path: the current rules redact its
+# 22-character mixed-case ID as high entropy; the pre-versioning rules kept
+# every token with two or more slashes.
+FIGMA_SHAPED = 'Open https://www.figma.com/design/Qx7Lm2Rt9Vb4Kp8Wn3Zd5H/MyDesignSystem first.\n'
+_UNVERSIONED = object()
+
+
+def _rewritten(record, raw, redact_with, version):
+    """The archive that a writer with other redaction rules would have stored."""
+    from copy import deepcopy
+    changed = {k: deepcopy(v) for k, v in record.items() if k not in {'id', text_archive.RULES_FIELD}}
+    if version is not _UNVERSIONED: changed[text_archive.RULES_FIELD] = version
+    for file in changed['files']:
+        text = redact_with(raw)
+        file.update(text=text, redacted_hash=text_hash(text), redacted_bytes=len(text.encode()),
+                    redacted_lines=len(text.splitlines()))
+    changed['id'] = digest(changed)
+    return changed
+
+
+def _store_directly(store, record):
+    """Replace the stored row byte-for-byte, as an earlier writer left it."""
+    store.conn.execute('DELETE FROM instruction_text_archives WHERE inventory_id=?', (record['inventory_id'],))
+    store.insert(text_archive.TABLE, {**{k: record[k] for k in text_archive.COLUMNS},
+                                      'record_json': encoded(record), 'record_hash': digest(record)})
+    store.commit()
+
+
+def _one_file_archive(cfg, store, tmp_path, body):
+    repo = init_git_repo(tmp_path/'project', 'AGENTS.md', body)
+    known_copy(store, repo); collect(store, cfg)
+    saved = archives(store)
+    assert len(saved) == 1 and len(saved[0]['files']) == 1
+    return saved[0]
+
+
+def test_an_unversioned_archive_validates_with_the_frozen_pre_versioning_rules(cfg, store, tmp_path):
+    from self_improve import redact, redact_legacy
+    # Premise: the current rules change this text and the frozen rules keep it.
+    assert redact.redact_text(FIGMA_SHAPED) != FIGMA_SHAPED
+    assert redact_legacy.redact_text(FIGMA_SHAPED) == FIGMA_SHAPED
+    current = _one_file_archive(cfg, store, tmp_path, FIGMA_SHAPED)
+    legacy = _rewritten(current, FIGMA_SHAPED, redact_legacy.redact_text, _UNVERSIONED)
+    assert text_archive.RULES_FIELD not in legacy and legacy['files'][0]['text'] == FIGMA_SHAPED
+    _store_directly(store, legacy)
+    assert text_archive.read_archive(store, legacy['id']) == legacy
+    assert text_archive.current_archives(store)['records'][0]['archive'] == legacy
+    # An exact replay of the retained row stays a no-op.
+    with store.transaction(write=True): text_archive.record_archives(store, [legacy])
+    assert archives(store) == [legacy]
+
+
+def test_a_new_archive_records_the_current_rules_version(cfg, store, tmp_path):
+    from self_improve import redact
+    record = _one_file_archive(cfg, store, tmp_path, FIGMA_SHAPED)
+    assert record[text_archive.RULES_FIELD] == redact.RULES_VERSION
+    assert record['files'][0]['text'] == redact.redact_text(FIGMA_SHAPED) != FIGMA_SHAPED
+    stored = json.loads(store.query_one('SELECT record_json FROM instruction_text_archives')['record_json'])
+    assert stored[text_archive.RULES_FIELD] == redact.RULES_VERSION
+    assert text_archive.current_archives(store)['records'][0]['archive'] == record
+
+
+@pytest.mark.parametrize('version', ['redaction-rules/999', '', None, 2])
+def test_an_unknown_rules_version_is_refused_by_archive_name(cfg, store, tmp_path, version):
+    from self_improve import redact
+    current = _one_file_archive(cfg, store, tmp_path, 'Retained text.\n')
+    unknown = _rewritten(current, 'Retained text.\n', redact.redact_text, version)
+    _store_directly(store, unknown)
+    expected = 'instruction_text_archives.' + unknown['id'] + '.*unknown redaction rules version'
+    with pytest.raises(text_archive.TextArchiveError, match=expected):
+        text_archive.read_archive(store, unknown['id'])
+    with pytest.raises(text_archive.TextArchiveError, match=expected):
+        text_archive.current_archives(store)
+
+
+@pytest.mark.parametrize('rules', ['unversioned', 'current'])
+def test_text_that_fails_its_own_rules_version_is_still_refused(cfg, store, tmp_path, rules):
+    from self_improve import redact
+    raw = 'token = ghp_' + 'Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2' + '\n'
+    current = _one_file_archive(cfg, store, tmp_path, raw)
+    version = _UNVERSIONED if rules == 'unversioned' else redact.RULES_VERSION
+    # Both rule sets redact this token, so storing it raw must fail either way.
+    unredacted = _rewritten(current, raw, lambda text: text, version)
+    _store_directly(store, unredacted)
+    with pytest.raises(text_archive.TextArchiveError, match=unredacted['id'] + '.*invalid redacted text'):
+        text_archive.read_archive(store, unredacted['id'])
+
+
+def test_a_versioned_archive_holding_text_only_the_legacy_rules_keep_is_refused(cfg, store, tmp_path):
+    """A versioned archive is validated with the rules of its version, never
+    with the legacy rules. The ghp_ token above cannot show this, because both
+    rule sets redact it. FIGMA_SHAPED tells them apart."""
+    from self_improve import redact, redact_legacy
+    assert redact_legacy.redact_text(FIGMA_SHAPED) == FIGMA_SHAPED
+    assert redact.redact_text(FIGMA_SHAPED) != FIGMA_SHAPED
+    current = _one_file_archive(cfg, store, tmp_path, FIGMA_SHAPED)
+    forged = _rewritten(current, FIGMA_SHAPED, redact_legacy.redact_text, redact.RULES_VERSION)
+    assert forged[text_archive.RULES_FIELD] == redact.RULES_VERSION
+    assert forged['files'][0]['text'] == FIGMA_SHAPED
+    _store_directly(store, forged)
+    expected = 'instruction_text_archives.' + forged['id'] + '.*invalid redacted text'
+    with pytest.raises(text_archive.TextArchiveError, match=expected):
+        text_archive.read_archive(store, forged['id'])
+    with pytest.raises(text_archive.TextArchiveError, match=expected):
+        text_archive.current_archives(store)
+
+
+def test_a_new_archive_without_the_current_rules_version_is_not_written(cfg, store, tmp_path):
+    from self_improve import redact_legacy
+    from self_improve.instruction_surfaces import inspect_surfaces
+    from self_improve.rule_revisions import retained_revisions
+    repo = init_git_repo(tmp_path/'project', 'AGENTS.md', FIGMA_SHAPED)
+    key = known_copy(store, repo)
+    surface = inspect_surfaces(cfg, str(repo))
+    inv = inventory.build_inventory(surface=surface, project_key=key, working_copy_path=str(repo),
+        revisions=retained_revisions(store), observed_at=AT)
+    legacy = _rewritten(text_archive.build_archive(surface, inv), FIGMA_SHAPED,
+                        redact_legacy.redact_text, _UNVERSIONED)
+    with pytest.raises(text_archive.TextArchiveError, match='must record the current redaction rules'):
+        with store.transaction(write=True):
+            inventory.record_inventories(store, records=[inv])
+            text_archive.record_archives(store, [legacy])
+    assert store.query('SELECT id FROM instruction_text_archives') == []
+
+
+def test_glued_google_keys_no_longer_abort_collection(cfg, store, tmp_path):
+    """BL-35: one redaction pass left the second of two glued keys in place,
+    so the archive failed its own validation and the collection aborted."""
+    key = 'AIza' + 'A' * 35  # invented
+    record = _one_file_archive(cfg, store, tmp_path, 'keys ' + key + key + '\n')
+    assert record['files'][0]['text'] == 'keys [REDACTED:google_api_key][REDACTED:google_api_key]\n'

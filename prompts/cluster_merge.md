@@ -69,6 +69,8 @@ Field constraints (violations make the whole response unusable):
 
 - `decision`: exactly `"merge"` or `"keep_separate"`.
 - With `"merge"`: `generalized_rule`, `why`, `title`, `category` are non-empty
-  strings; `scope_guess` is exactly one of "global", "project", "skill",
-  "hook", "codex_global".
+  strings; `scope_guess` is exactly one of "global", "personal", "project",
+  "skill", "hook", "codex_global". If any input rule's `scope` is
+  "personal", the merged rule stays "personal": it is private to one person
+  or machine and must not move to the shared global file.
 - With `"keep_separate"`: `reason` is a non-empty string.

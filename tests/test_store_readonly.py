@@ -178,3 +178,29 @@ def test_read_only_and_migrate_true_is_a_contradiction_and_raises(tmp_path):
     Store(db)
     with pytest.raises(ValueError, match="read_only"):
         Store(db, read_only=True, migrate=True)
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("name", ["a#b", "c?d", "e%41f"])
+def test_a_read_only_store_escapes_its_path_in_the_sqlite_uri(tmp_path, name):
+    """BL-48: f"file:{path}?mode=ro" let # or ? cut the path and drop mode=ro,
+    and SQLite then created an empty database file elsewhere."""
+    from self_improve.store import Store
+
+    directory = tmp_path / name
+    directory.mkdir()
+    store = Store(directory / "state.db")
+    store.insert("runs", {"id": "r1", "started": "2026-10-12T00:00:00Z"})
+    store.commit()
+    store.close()
+    before = sorted(p.name for p in tmp_path.iterdir())
+    reader = Store(directory / "state.db", read_only=True)
+    try:
+        assert reader.query_one("SELECT id FROM runs")["id"] == "r1"
+    finally:
+        reader.close()
+    # Nothing outside the database's own directory, where WAL sidecars belong.
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert {p.name for p in directory.iterdir()} <= {"state.db", "state.db-wal", "state.db-shm"}

@@ -1,0 +1,185 @@
+# Scope decision-boundary cases. Every case is invented; no name, address,
+# path or account here belongs to a real person.
+#
+# Each case is one lesson a miner might extract, with the incident context it
+# came from, and the scope the shared guidance in prompts/mine_incident*.md
+# should choose. `boundary` names the two scopes the case sits between, so a
+# report can show which border the guidance draws badly.
+#
+# Scopes measured: global (shared public instructions), personal (private,
+# machine- or person-specific file), project (one repository's AGENTS.md or
+# CLAUDE.md), skill (an existing or new skill). Hook, rule_path and
+# codex_global are outside this set.
+version: 1
+cases:
+  # ---- global vs personal ----
+  - id: gp-01
+    boundary: global/personal
+    expected: global
+    lesson: "Before saying a change works, run the command that proves it and quote its output."
+    context: "The agent said \"tests pass\" without running them; the user found two failures."
+  - id: gp-02
+    boundary: global/personal
+    expected: personal
+    lesson: "The second Claude account lives in ~/.claude-work; set CLAUDE_CONFIG_DIR to that directory for headless runs that should use it."
+    context: "The agent launched a batch on the default account, which was out of quota, instead of the work account."
+  - id: gp-03
+    boundary: global/personal
+    expected: personal
+    lesson: "Address the user as Sam and reply in Spanish unless Sam writes in English first."
+    context: "Sam asked twice for replies in Spanish after the agent answered in English."
+  - id: gp-04
+    boundary: global/personal
+    expected: global
+    lesson: "When you choose a cap, fallback or tie-break while implementing, say so in the summary."
+    context: "The agent silently truncated a list to 50 rows; the user discovered it a week later."
+  - id: gp-05
+    boundary: global/personal
+    expected: personal
+    lesson: "On this laptop the backup drive is mounted at /Volumes/Archive only while docked; scheduled jobs that write there must check the mount first."
+    context: "A nightly job wrote into an empty /Volumes/Archive folder while the laptop was undocked."
+  - id: gp-06
+    boundary: global/personal
+    expected: global
+    lesson: "Read timestamps from the data, not from file modification times or the local clock."
+    context: "A report used file mtimes as event times and showed events on the wrong day."
+  - id: gp-07
+    boundary: global/personal
+    expected: personal
+    lesson: "Use the alias gw for the work Gmail account (sam@example.org) and never send from the personal address for work threads."
+    context: "The agent drafted a work reply from the personal mailbox."
+  - id: gp-08
+    boundary: global/skill
+    expected: skill
+    lesson: "When an OAuth provider rotates refresh tokens, store the new refresh token from every refresh response before the next request."
+    context: "A sync service kept reusing its first refresh token and was logged out an hour later."
+  - id: gp-09
+    boundary: global/personal
+    expected: personal
+    lesson: "This machine's office printer only accepts A4 paper; choose A4 before printing any report."
+    context: "A printed report came out scaled and cropped because the job used Letter size."
+  - id: gp-10
+    boundary: global/personal
+    expected: personal
+    lesson: "Sam lives in Lisbon; convert every proposed meeting time from UTC to Lisbon time before offering it."
+    context: "A draft offered meeting times in UTC that fell in the middle of Sam's night."
+
+  # ---- global vs project ----
+  - id: gj-01
+    boundary: global/project
+    expected: project
+    lesson: "In this repository, run `make check` before committing; plain pytest skips the schema migration tests."
+    context: "A commit broke a migration that pytest alone never exercised."
+  - id: gj-02
+    boundary: global/project
+    expected: global
+    lesson: "Write a failing test before fixing a bug, and show it pass after the fix."
+    context: "A \"fix\" never reproduced the bug; the failure returned the next day."
+  - id: gj-03
+    boundary: global/project
+    expected: project
+    lesson: "All database access goes through store.py; never open the SQLite file directly from another module."
+    context: "A new module opened the database itself and bypassed the read-only guard."
+  - id: gj-04
+    boundary: global/project
+    expected: project
+    lesson: "The production checkout repo-prod must never be edited by hand; deploy only through the gated deploy script."
+    context: "An agent edited a file in the production checkout and the next deploy refused to fast-forward."
+  - id: gj-05
+    boundary: global/project
+    expected: global
+    lesson: "Stage files by name in a shared clone; never sweep untracked files into a commit with git add -A."
+    context: "An agent committed another agent's work-in-progress files."
+  - id: gj-06
+    boundary: global/project
+    expected: project
+    lesson: "Dashboard tests need the optional extra; run them with `uv run --extra dashboard pytest`, or the API module skips silently."
+    context: "The agent reported the dashboard suite green when every test had skipped."
+
+  # ---- global vs skill ----
+  - id: gs-01
+    boundary: global/skill
+    expected: skill
+    lesson: "When building a slide deck, render every slide to an image and look at it before exporting."
+    context: "An exported deck had overlapping text on four slides that nobody had looked at."
+  - id: gs-02
+    boundary: global/skill
+    expected: global
+    lesson: "Report attempted, succeeded and failed counts with failure causes, never a bare completion count."
+    context: "A batch reported \"done: 40\" while 38 of the 40 had failed."
+  - id: gs-03
+    boundary: global/skill
+    expected: skill
+    lesson: "In Playwright tests, wait for the network to go idle before reading the DOM of a client-rendered page."
+    context: "A browser check read an empty page and passed vacuously."
+  - id: gs-04
+    boundary: global/skill
+    expected: skill
+    lesson: "When writing a database migration, give it a down step and run that step against a copy of production-shaped data."
+    context: "A migration's down step dropped a column that the up step never created."
+  - id: gs-05
+    boundary: global/skill
+    expected: global
+    lesson: "If two readings of a request differ materially, ask which one is meant before building either."
+    context: "The agent built the wrong feature from an ambiguous request and spent an hour on it."
+  - id: gs-06
+    boundary: global/skill
+    expected: skill
+    lesson: "In a multi-arm model comparison, exclude failed runs symmetrically across arms and report exclusions per arm."
+    context: "One arm's timeouts were dropped and the other arm's kept, inflating the first arm's score."
+
+  # ---- project vs skill ----
+  - id: js-01
+    boundary: project/skill
+    expected: skill
+    lesson: "To debug a flaky test, first reproduce it in a loop and record the failure rate before changing code."
+    context: "The agent changed three things at once on a flaky test and could not tell which one mattered."
+  - id: js-02
+    boundary: project/skill
+    expected: project
+    lesson: "The browser fixtures in tests/browser all use port 8876; check it is free before starting one."
+    context: "Two fixture servers collided on 8876 and the verifier read the wrong one."
+  - id: js-03
+    boundary: project/skill
+    expected: skill
+    lesson: "When writing a Cloudflare Worker, keep secrets in bindings, never in wrangler.toml."
+    context: "A secret was committed in wrangler.toml in a new Worker project."
+  - id: js-04
+    boundary: project/skill
+    expected: project
+    lesson: "New migrations in this repo are numbered files under migrations/; never edit an applied migration, add the next number."
+    context: "An agent edited migration 0031 in place and the production upgrade refused."
+
+  # ---- project vs personal ----
+  - id: jp-01
+    boundary: project/personal
+    expected: personal
+    lesson: "Sam keeps a private config at ~/.tool/config.toml that overrides repository defaults; read it before assuming default paths."
+    context: "The agent debugged default paths for an hour while the user's private config pointed elsewhere."
+  - id: jp-02
+    boundary: project/personal
+    expected: project
+    lesson: "This repository reads its configuration from a TOML file whose keys are defined in config.py; unknown keys raise."
+    context: "The agent added a misspelled key and assumed it was ignored."
+  - id: jp-03
+    boundary: project/personal
+    expected: personal
+    lesson: "On Sam's laptop the local Postgres listens on port 5433 because another service holds 5432; use 5433 in local connection strings."
+    context: "Local integration tests could not connect to the database on the default port."
+
+  # ---- skill vs personal ----
+  - id: sp-01
+    boundary: skill/personal
+    expected: skill
+    lesson: "When a Docker build is slow, check whether the build context includes large untracked folders and list them in .dockerignore."
+    context: "Every build uploaded several gigabytes of local logs to the Docker daemon."
+  - id: sp-02
+    boundary: skill/personal
+    expected: personal
+    lesson: "This laptop's Homebrew lives under /usr/local because the machine was migrated from an Intel Mac; call /usr/local/bin/brew, not /opt/homebrew."
+    context: "A setup script assumed /opt/homebrew and failed to find any installed formula."
+  - id: sp-03
+    boundary: skill/personal
+    expected: skill
+    lesson: "When an import works in the terminal but fails in the editor, check which Python interpreter the editor selected before changing any code."
+    context: "The agent rewrote an import path while the editor was running a different virtual environment."

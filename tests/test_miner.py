@@ -135,6 +135,45 @@ def test_gather_truncates_with_exact_marker(tmp_path):
     assert "x" * (IN_FORCE_TRUNCATE_CHARS + 1) not in result
 
 
+STRADDLING_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"  # invented; matches the aws_key pattern
+
+
+def straddling_instruction_text(kept: int = 9) -> str:
+    """Instruction text whose secret starts `kept` characters before the cut."""
+    filler = "x" * (IN_FORCE_TRUNCATE_CHARS - kept - 1)
+    return filler + " " + STRADDLING_KEY + " is the deploy key\n"
+
+
+def key_prefixes_present(text: str, shortest: int = 6) -> list[str]:
+    return [STRADDLING_KEY[:n] for n in range(shortest, len(STRADDLING_KEY) + 1)
+            if STRADDLING_KEY[:n] in text]
+
+
+def test_gather_redacts_before_the_cut_so_no_key_prefix_survives(tmp_path):
+    """Leak of the BL-04 shape: the frozen job input cut the file at
+    IN_FORCE_TRUNCATE_CHARS and redacted afterwards, so a key straddling the
+    cut kept a prefix too short for any pattern (a scratch run kept
+    'AKIAABCDE'). With redact=True the file is redacted first."""
+    text = straddling_instruction_text()
+    assert text[:IN_FORCE_TRUNCATE_CHARS].endswith(" AKIAABCDE")  # the cut splits the key
+    (tmp_path / "global_CLAUDE.md").write_text(text, encoding="utf-8")
+    project = tmp_path / "proj"
+    project.mkdir()
+    result = gather_in_force_instructions(str(project), _cfg(tmp_path), redact=True)
+    assert key_prefixes_present(result) == [], result[-120:]
+    assert "[truncated " in result
+
+
+def test_gather_keeps_instruction_text_verbatim_by_default(tmp_path):
+    """The live fast prompt and environment.md quote the user's own lines
+    verbatim for the duplicate check, so the default does not redact."""
+    secret_line = "- Deploy with " + STRADDLING_KEY + " only from CI.\n"
+    (tmp_path / "global_CLAUDE.md").write_text(secret_line, encoding="utf-8")
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert secret_line in gather_in_force_instructions(str(project), _cfg(tmp_path))
+
+
 def test_gather_without_project_path_says_so(tmp_path):
     (tmp_path / "global_CLAUDE.md").write_text("G", encoding="utf-8")
     result = gather_in_force_instructions("", _cfg(tmp_path))

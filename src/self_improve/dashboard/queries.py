@@ -705,7 +705,10 @@ def inbox(store, cfg) -> dict:
 WHY_QUEUED = {
     "pending": "the eval never ran, so nothing has tested whether this rule helps.",
     "gated_fail": "the eval ran and could not show the rule helps.",
-    "inconclusive": "the gate ran several scenarios and they disagreed.",
+    # Neutral on purpose: `inconclusive` covers several different tallies, and
+    # only one of them is a disagreement. `review_queue` replaces this with
+    # `WHY_INCONCLUSIVE` copy chosen from the retained scenario tally.
+    "inconclusive": "the gate's scenarios did not establish a passing or failing majority.",
     "held": "the apply policy held this rather than writing it.",
     "ungated": "the eval did not establish usable evidence that this rule helps.",
     "gated_pass": "the gate passed, but automatic application is not authorized for this proposal.",
@@ -717,7 +720,11 @@ WHY_QUEUED = {
 WHY_CARVE_OUT = {
     "add": "your configuration requires manual review for instruction additions.",
     "edit": "your configuration requires manual review for instruction edits.",
-    "delete": "your configuration requires manual review for instruction deletions.",
+    "delete": (
+        "this deletes a delivered rule because a re-run without it no longer "
+        "showed the mistake. That evidence is one arm of a few trials, not a "
+        "majority vote, so a deletion always needs your decision."
+    ),
     "new_skill": "your configuration requires manual review for new skills.",
     "new_rule_file": "your configuration requires manual review for new rule files.",
     "recover_rule": "this is a generated recovery proposal. Inspect its exact patch, selected source, and destination before approving.",
@@ -760,7 +767,10 @@ def why_needs_you(status: str, *, action: str, cfg) -> tuple[str, str, bool]:
 # Outcome keys distinguish an unexecuted trial from a judged failure. Zero
 # successes alone proves neither. Unrecognized keys retain their taxonomy rather
 # than receiving a guessed explanation.
-from ..eval_evidence import EVAL_INFRA_ERRORS, EVAL_JUDGED_ERRORS, no_trial_ran as eval_no_trial_ran
+from ..eval_evidence import (
+    EVAL_INFRA_ERRORS, EVAL_JUDGED_ERRORS, EVAL_UNINFORMATIVE_ERRORS,
+    no_trial_ran as eval_no_trial_ran,
+)
 
 #: How many example incidents a card carries. A cap, so it is REPORTED:
 #: every family says how many it held back so a displayed sample cannot be
@@ -785,8 +795,8 @@ MEANS_QUEUED = {
         "never reproduced the mistake cannot show a fix for it."
     ),
     "inconclusive": (
-        "The gate runs several scenarios and they disagreed with each other. "
-        "Contrary evidence exists, so this rule needs a human decision."
+        "The gate's scenarios did not establish a passing or failing majority, "
+        "so this rule needs a human decision."
     ),
     "held": (
         "The apply policy held this rather than writing it. The eval verdict "
@@ -811,6 +821,186 @@ if _why_keys != _means_keys:
     )
 
 
+#: Why an ``inconclusive`` proposal needs a person, by what its retained
+#: scenario tally shows. The majority gate returns ``inconclusive`` for four
+#: different tallies, and only ``disagreed`` is a disagreement. A tally of
+#: errors alone means no scenario tested the rule (BL-22). Placeholders are
+#: the tally counts, ``scenarios`` (their sum) and ``rest`` (the scenarios
+#: that cast no pass or fail vote, in words).
+WHY_INCONCLUSIVE = {
+    "disagreed": (
+        "the gate's scenarios disagreed: {gated_pass} of {scenarios} showed the "
+        "rule helping and {gated_fail} showed it failing.{rest}"
+    ),
+    "too_few_passes": (
+        "{gated_pass} of {scenarios} scenarios showed the rule helping, too few "
+        "for the gate to pass it, and none showed it failing.{rest}"
+    ),
+    "too_few_failures": (
+        "{gated_fail} of {scenarios} scenarios showed the rule failing, too few "
+        "for the gate to reject it, and none showed it helping.{rest}"
+    ),
+    "untested": (
+        "no scenario tested the rule: all {scenarios} ended in an error that "
+        "gave no evidence for or against it."
+    ),
+    "tally_unknown": (
+        "the gate's scenarios did not establish a passing or failing majority. "
+        "The scenario tally was not retained, so this view cannot say whether "
+        "they disagreed or never tested the rule."
+    ),
+}
+
+#: What deciding means for each ``WHY_INCONCLUSIVE`` case. Same keys,
+#: reconciled below in both directions.
+MEANS_INCONCLUSIVE = {
+    "disagreed": (
+        "The gate runs several scenarios and they disagreed with each other. "
+        "Contrary evidence exists, so this rule needs a human decision."
+    ),
+    "too_few_passes": (
+        "No scenario showed the rule failing, but too few showed it helping "
+        "for the gate to pass it. Approving records your decision on that "
+        "partial evidence."
+    ),
+    "too_few_failures": (
+        "Some evidence shows the rule failing, but too little for the gate to "
+        "reject it, and no scenario showed it helping. Read the eval below "
+        "before approving."
+    ),
+    "untested": (
+        "No scenario tested the rule, so the gate has no evidence for or "
+        "against it. A scenario errors when its generation fails, when too "
+        "many of its trials broke or asked the operator, or when different "
+        "models served its arms. Approving records your decision without eval "
+        "evidence."
+    ),
+    "tally_unknown": (
+        "The gate held this without a passing or failing majority, and its "
+        "scenario tally was not retained. Read the eval below and its trial "
+        "directory before deciding."
+    ),
+}
+
+if set(WHY_INCONCLUSIVE) != set(MEANS_INCONCLUSIVE):
+    raise DashboardDataError(
+        "WHY_INCONCLUSIVE and MEANS_INCONCLUSIVE disagree: "
+        f"{sorted(set(WHY_INCONCLUSIVE) ^ set(MEANS_INCONCLUSIVE))}"
+    )
+
+
+def inconclusive_reason(tally: dict | None, *, owner: str) -> tuple[str, str, str]:
+    """``(case, why, means)`` for one ``inconclusive`` proposal.
+
+    ``tally`` is the scenario tally retained with the gate attempt that set
+    the proposal's status, or ``None`` when no attempt retained one. Raises,
+    naming ``owner``, in three cases: the tally is not a dict of a
+    non-negative int for exactly ``SCENARIO_OUTCOMES``, it counts zero
+    scenarios, or it has no pass or fail and at least one ``ungated``.
+
+    It does not re-run the vote. A tally such as ``{'gated_fail': 2,
+    'error': 1}``, which the current thresholds call ``gated_fail``, still
+    gets copy here. A later threshold change must not make a tally the gate
+    stored under the old thresholds raise.
+    """
+    if tally is None:
+        return ("tally_unknown", WHY_INCONCLUSIVE["tally_unknown"],
+                MEANS_INCONCLUSIVE["tally_unknown"])
+    from ..evals.regression import SCENARIO_OUTCOMES
+
+    if (not isinstance(tally, dict) or set(tally) != set(SCENARIO_OUTCOMES)
+            or any(type(n) is not int or n < 0 for n in tally.values())):
+        raise DashboardDataError(
+            f"{owner}: scenario_tally must hold a non-negative count for exactly "
+            f"{list(SCENARIO_OUTCOMES)}, got {tally!r}"
+        )
+    n_pass, n_fail = tally["gated_pass"], tally["gated_fail"]
+    n_ungated, n_error = tally["ungated"], tally["error"]
+    scenarios = sum(tally.values())
+    if scenarios == 0 or (not n_pass and not n_fail and n_ungated):
+        # The gate calls a tally with no pass or fail vote and at least one
+        # unreproduced mistake `ungated`, and it raises before it votes on
+        # zero scenarios. Neither can be the tally of an inconclusive verdict.
+        raise DashboardDataError(
+            f"{owner}: an inconclusive verdict cannot come from the tally {tally!r}"
+        )
+    if n_pass and n_fail:
+        case = "disagreed"
+    elif n_pass:
+        case = "too_few_passes"
+    elif n_fail:
+        case = "too_few_failures"
+    else:
+        case = "untested"
+    parts = [f"{n} did not reproduce the mistake" for n in (n_ungated,) if n]
+    parts += [f"{n} did not test the rule" for n in (n_error,) if n]
+    others = n_ungated + n_error
+    if not parts:
+        rest = ""
+    elif len(parts) == 1:
+        rest = f" The other {parts[0]}."
+    else:
+        rest = f" Of the other {others}, {' and '.join(parts)}."
+    why = WHY_INCONCLUSIVE[case].format(**tally, scenarios=scenarios, rest=rest)
+    return case, why, MEANS_INCONCLUSIVE[case]
+
+
+def _inconclusive_tallies(store, rows) -> dict[str, tuple[str, dict]]:
+    """``(owner, tally)`` retained for each queued ``inconclusive`` proposal.
+
+    The tally lives only in the eval attempt whose result set the proposal's
+    status, so the lookup follows that exact link: the attempt belongs to the
+    proposal and its result names the proposal's ``eval_result_id``. A
+    proposal with no such attempt, from an older database or from before
+    attempts were retained, is left out, and its card says the tally is
+    unknown. A linked result that disagrees with the proposal raises.
+    """
+    from .. import eval_history
+
+    wanted = {r["id"]: r["eval_result_id"] for r in rows
+              if r["status"] == "inconclusive" and r["eval_result_id"]}
+    if not wanted or not eval_history.available(store):
+        return {}
+    ids = sorted(wanted)
+    attempts = {
+        a["id"]: a["proposal_id"]
+        for a in store.query(
+            "SELECT id, proposal_id FROM eval_attempts WHERE proposal_id IN ("
+            + ",".join("?" * len(ids)) + ")",
+            tuple(ids),
+        )
+    }
+    if not attempts:
+        return {}
+    events = store.query(
+        "SELECT * FROM eval_attempt_events WHERE kind='attempt_result' AND attempt_id IN ("
+        + ",".join("?" * len(attempts)) + ") ORDER BY created_at, id",
+        tuple(sorted(attempts)),
+    )
+    out: dict[str, tuple[str, dict]] = {}
+    for row in events:
+        owner = f"eval_attempt_events.{row['id']}"
+        data = eval_history._read(row, "eval_attempt_events")["data"]
+        proposal_id = attempts[row["attempt_id"]]
+        if data.get("eval_result_id") != wanted[proposal_id]:
+            continue
+        if data.get("verdict") != "inconclusive":
+            raise DashboardDataError(
+                f"{owner}: proposal {proposal_id} is inconclusive, but the attempt "
+                f"that produced its eval result {wanted[proposal_id]} recorded "
+                f"{data.get('verdict')!r}"
+            )
+        if proposal_id in out:
+            raise DashboardDataError(
+                f"{owner}: a second attempt result names eval result "
+                f"{wanted[proposal_id]} of proposal {proposal_id}"
+            )
+        if "scenario_tally" not in data:
+            raise DashboardDataError(f"{owner}: the gate attempt result has no scenario_tally")
+        out[proposal_id] = (owner, data["scenario_tally"])
+    return out
+
+
 def _arm(metrics: dict, name: str) -> dict:
     """One trial arm's counts, or ``{}`` when the eval recorded no such arm."""
     raw = metrics.get(name)
@@ -824,6 +1014,24 @@ def _arm(metrics: dict, name: str) -> dict:
         "errors": errors if isinstance(errors, dict) else {},
         "transcripts_dir": str(raw.get("transcripts_dir") or ""),
     }
+
+
+def _served_models(metrics: dict, row_id) -> list[dict]:
+    """The (provider, model) pairs that served one scenario's trials.
+
+    The gate lists them and refuses to vote when there is more than one. A row
+    without the key was not checked, which is an empty list. A malformed list
+    raises with the row named.
+    """
+    served = metrics.get("served_models", [])
+    if not isinstance(served, list) or any(
+            not isinstance(m, dict) or not isinstance(m.get("provider"), str)
+            or not isinstance(m.get("model"), str) for m in served):
+        raise DashboardDataError(
+            f"eval_results {row_id!r}: metrics_json served_models is not a "
+            "list of provider/model objects"
+        )
+    return served
 
 
 def eval_story(row) -> dict:
@@ -852,6 +1060,7 @@ def eval_story(row) -> dict:
         )
 
     without, with_ = _arm(metrics, "without"), _arm(metrics, "with")
+    served = _served_models(metrics, row["id"])
     attempted = int(row["attempted"] or 0)
     succeeded = int(row["succeeded"] or 0)
     trials = without.get("attempted", 0) + with_.get("attempted", 0)
@@ -869,7 +1078,21 @@ def eval_story(row) -> dict:
             f"object, it is {type(taxonomy).__name__}"
         )
     causes = set(taxonomy)
-    unknown = causes - EVAL_INFRA_ERRORS - EVAL_JUDGED_ERRORS
+    unknown = causes - EVAL_UNINFORMATIVE_ERRORS - EVAL_JUDGED_ERRORS
+    # Only a graded failure is the agent making the mistake; agent, grader and
+    # asked-operator outcomes say nothing about the rule.
+    reproduced = int(without.get("errors", {}).get("graded_fail", 0) or 0)
+    uninformative = without.get("failed", 0) - reproduced
+    # Mirror with_arm_verdict: the with arm tested the rule only if its
+    # failures were mostly graded, not agent, grader or operator outcomes.
+    with_failed = with_.get("failed", 0)
+    with_graded = int(with_.get("errors", {}).get("graded_fail", 0) or 0)
+    with_tested = bool(with_graded) and (with_failed - with_graded) * 2 < with_failed
+    uninformative_note = (
+        f" {uninformative} of the without-rule trials were uninformative "
+        "(an agent, grader or operator-question outcome) and are not counted."
+        if uninformative > 0 else ""
+    )
 
     if eval_no_trial_ran(row, taxonomy=taxonomy):
         shape = "no_trial_ran"
@@ -889,6 +1112,14 @@ def eval_story(row) -> dict:
     elif not without and not with_:
         shape = "no_arms"
         summary = "The eval recorded no trial arms, so nothing was compared."
+    elif len(served) > 1:
+        shape = "mixed_models"
+        names = ", ".join(f"{m['provider']}/{m['model']}" for m in served)
+        summary = (
+            f"Different models served this scenario's trials ({names}), so the "
+            "arms are not comparable and the gate did not vote. This is a "
+            "harness result, not a judgement about the rule."
+        )
     elif without.get("failed", 0) == 0 and without.get("attempted", 0) > 0:
         shape = "never_reproduced"
         summary = (
@@ -897,21 +1128,62 @@ def eval_story(row) -> dict:
             "trials. With nothing to fix, the trial cannot show this rule "
             "helps. That is not evidence against it."
         )
+    elif metrics.get("with") is None:
+        # The gate records `with: null` when it skips the with-rule arm. That
+        # arm has no result, so "0 of 0 passed with the rule" describes a
+        # trial that never happened (BL-45).
+        shape = "with_arm_skipped"
+        named = ", ".join(f"{n} {k}" for k, n in sorted(without.get("errors", {}).items())
+                          if k in EVAL_UNINFORMATIVE_ERRORS and n)
+        if not reproduced and uninformative >= without.get("attempted", 0):
+            summary = (
+                "The with-rule arm never ran, so nothing tested this rule. All "
+                f"{without.get('attempted', 0)} without-rule trials were "
+                f"uninformative{f' ({named})' if named else ''}, so none could "
+                "show the mistake. That is not a judgement about the rule."
+            )
+        else:
+            summary = (
+                "The with-rule arm never ran, so nothing tested this rule. "
+                f"Without the rule the agent made the mistake {reproduced} of "
+                f"{without.get('attempted', 0)} times, too few for the gate to "
+                f"run the with-rule arm.{uninformative_note}"
+            )
+    elif (with_.get("succeeded", 0) == 0 and without.get("succeeded", 0) == 0
+          and reproduced and with_tested):
+        # The gate records a reproduced mistake as graded_fail, so a without
+        # arm of graded failures is the strongest detection there is, and a
+        # with arm that also lost means the rule did not prevent it.
+        shape = "rule_failed"
+        summary = (
+            f"Without the rule the agent made the mistake {reproduced} of "
+            f"{without.get('attempted', 0)} times. With the rule it passed 0 "
+            f"of {with_.get('attempted', 0)}, so the rule did not prevent the "
+            f"mistake.{uninformative_note}"
+        )
     elif with_.get("succeeded", 0) == 0 and without.get("succeeded", 0) == 0:
         shape = "both_arms_failed"
+        if not reproduced:
+            why = "no without-rule trial reproduced the mistake"
+        elif with_graded:
+            why = (f"{with_failed - with_graded} of its {with_failed} failures "
+                   "with the rule were agent, grader or operator-question "
+                   "outcomes, too many to judge the rule")
+        else:
+            why = ("the with-rule arm ran no usable trial (agent, grader or "
+                   "operator-question outcomes)")
         summary = (
             f"Both arms failed: 0 of {with_.get('attempted', 0)} passed with "
-            f"the rule and 0 of {without.get('attempted', 0)} without it. The "
-            "eval could not reproduce the situation, so this is a harness "
-            "result, not a judgement about the rule."
+            f"the rule and 0 of {without.get('attempted', 0)} without it, and "
+            f"{why}, so this is a harness result, not a judgement about the rule."
         )
     else:
         shape = "tested"
         summary = (
             f"Without the rule the agent made the mistake "
-            f"{without.get('failed', 0)} of {without.get('attempted', 0)} "
+            f"{reproduced} of {without.get('attempted', 0)} "
             f"times. With the rule it passed {with_.get('succeeded', 0)} of "
-            f"{with_.get('attempted', 0)}."
+            f"{with_.get('attempted', 0)}.{uninformative_note}"
         )
 
     return {
@@ -1012,7 +1284,8 @@ def _provenance(store, learning_ids: list[str]) -> dict:
 def _line_budget(cfg, target_path: str, pending: int) -> dict:
     """How full the target instruction file is, and what this card would add.
 
-    Only the global CLAUDE.md has a declared budget
+    Only the global delivery target (``cfg.delivery_path("global_claude_md")``,
+    the file global proposals are written to) has a declared budget
     (``cfg.global_claude_md_line_budget``); for any other target this returns
     ``{}`` rather than inventing a denominator. A budget bar drawn against a
     made-up cap is the "invented number" failure AGENTS.md records.
@@ -1020,7 +1293,7 @@ def _line_budget(cfg, target_path: str, pending: int) -> dict:
     A missing or unreadable target is reported, never defaulted to zero: a
     bar reading 0/250 on a file that does not exist says "plenty of room".
     """
-    global_path = str(_cfg_attr(cfg, "global_claude_md"))
+    global_path = str(_cfg_attr(cfg, "delivery_path")("global_claude_md"))
     if not target_path or os.path.abspath(target_path) != os.path.abspath(global_path):
         return {}
     budget = int(_cfg_attr(cfg, "global_claude_md_line_budget"))
@@ -1068,10 +1341,13 @@ def review_queue(store, cfg) -> dict:
         " ORDER BY p.created_at, p.id"
     )
     rows = [row for row in rows if row["id"] in waiting]
+    tallies = _inconclusive_tallies(store, rows)
 
     families: dict[str, dict] = {}
+    means: dict[str, str] = {}
     for row in rows:
         execution = waiting[row['id']]['execution']
+        detail = ""
         if execution['reason'] == 'fresh_approval_required':
             code, copy, carve = execution['reason'], execution['detail'], True
         else:
@@ -1080,6 +1356,9 @@ def review_queue(store, cfg) -> dict:
             )
         if row["status"] == "gated_pass" and not carve:
             copy = waiting[row["id"]]["execution"]["detail"]
+        if row["status"] == "inconclusive" and not carve:
+            owner, tally = tallies.get(row["id"], (f"proposals.{row['id']}", None))
+            detail, copy, means[row["id"]] = inconclusive_reason(tally, owner=owner)
         fam = families.setdefault(
             row["learning_id"],
             {
@@ -1108,6 +1387,9 @@ def review_queue(store, cfg) -> dict:
                 "eval_result_id": row["eval_result_id"],
                 "created_at": row["created_at"],
                 "reason_code": code,
+                # The case within an inconclusive verdict ("untested",
+                # "disagreed", ...), empty for every other reason.
+                "reason_detail": detail,
                 "why_needs_you": copy,
                 "carve_out": carve,
             }
@@ -1161,9 +1443,13 @@ def review_queue(store, cfg) -> dict:
         fam["eval"] = stories[0] if stories else {}
         fam["eval_verdicts"] = sorted({s["verdict"] for s in stories})
         fam["evals_disagree"] = len(fam["eval_verdicts"]) > 1
-        fam["means"] = MEANS_QUEUED.get(
-            fam["proposals"][0]["reason_code"], ""
-        ) if not fam["has_carve_out"] else ""
+        first = fam["proposals"][0]
+        if fam["has_carve_out"]:
+            fam["means"] = ""
+        elif first["id"] in means:
+            fam["means"] = means[first["id"]]
+        else:
+            fam["means"] = MEANS_QUEUED.get(first["reason_code"], "")
         # Targets with their multiplicity: N proposals writing one file is one
         # write after approval, and the card has to say so or the operator
         # reads N pending edits to the same line.
@@ -1525,31 +1811,55 @@ def classify_eval_result(row: dict) -> dict:
         row.get("error_taxonomy_json"), f"eval_results.{row.get('id')}.error_taxonomy_json"
     )
     verdict = _require(row, "verdict", f"eval_results.{row.get('id')}")
-    agent_errors = int(taxonomy.get("agent_error", 0))
+    agent_errors = sum(int(taxonomy.get(k, 0)) for k in EVAL_INFRA_ERRORS)
     failed = int(_require(row, "failed", f"eval_results.{row.get('id')}"))
     with_arm = metrics.get("with")
     without_arm = metrics.get("without")
 
     if failed > 0 and agent_errors * 2 >= failed:
+        named = " or ".join(sorted(k for k in EVAL_INFRA_ERRORS if taxonomy.get(k)))
         return {
             "class": "harness_broken",
             "label": "The harness broke",
             "why": (
-                f"{agent_errors} of {failed} failed trials were agent_error — the "
-                "agent could not run, so this says nothing about the rule"
+                f"{agent_errors} of {failed} failed trials were {named} — the "
+                "agent or its grader could not run, so this says nothing about the rule"
             ),
             "verdict": verdict,
             "agent_errors": agent_errors,
             "failed": failed,
         }
+    served = _served_models(metrics, row.get("id"))
+    if len(served) > 1:
+        # The same check eval_story makes. The gate turns such a scenario
+        # into a non-voting `error`, which no verdict branch below names.
+        names = ", ".join(f"{m['provider']}/{m['model']}" for m in served)
+        return {
+            "class": "mixed_models",
+            "label": "Different models served the arms",
+            "why": (
+                f"different models served this scenario's trials ({names}), so the "
+                "arms are not comparable and the gate did not vote"
+            ),
+            "verdict": verdict,
+        }
     if with_arm is None:
+        if failed == 0:
+            shown = "the without-rule arm did not fail"
+        else:
+            # Count only graded failures as the mistake. An operator question
+            # failed the trial but judged nothing (BL-45), so it is listed
+            # with the other outcomes rather than read as "did not fail".
+            attempted = int(_require(row, "attempted", f"eval_results.{row.get('id')}"))
+            graded = int(taxonomy.get("graded_fail", 0))
+            others = ", ".join(f"{n} {k}" for k, n in sorted(taxonomy.items())
+                               if k != "graded_fail" and n)
+            shown = (f"the without-rule arm reproduced the mistake in {graded} of "
+                     f"{attempted} trials" + (f" (other outcomes: {others})" if others else ""))
         return {
             "class": "eval_invalid",
             "label": "The eval could not reproduce the mistake",
-            "why": (
-                "the with-rule arm never ran, so the rule was never tested; the "
-                "without-rule arm did not fail"
-            ),
+            "why": f"the with-rule arm never ran, so the rule was never tested; {shown}",
             "verdict": verdict,
             "without_arm": bool(without_arm),
         }
@@ -1960,14 +2270,6 @@ def _count_by(rows: list[dict], key: str) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 # V4 — Projects
 # ---------------------------------------------------------------------------
-
-
-def _import_context_weight():
-    try:
-        from .context_weight import context_weight  # noqa: PLC0415
-    except ImportError as exc:
-        return None, f"src/self_improve/dashboard/context_weight.py is not importable ({exc})"
-    return context_weight, ""
 
 
 # Separate repository identity methods from path-only or unresolved methods.

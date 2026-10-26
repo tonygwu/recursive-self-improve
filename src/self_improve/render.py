@@ -165,8 +165,13 @@ def render_environment(store, incident_row: dict, cfg: Config, out_path: Path) -
     Path(out_path).write_text(environment_document(store, incident_row, cfg, text), encoding="utf-8")
 
 
-def environment_document(store, incident_row: dict, cfg: Config, transcript_text: str) -> str:
-    """Read session context and instructions without creating a sandbox."""
+def environment_document(store, incident_row: dict, cfg: Config, transcript_text: str,
+                         *, redact_instructions: bool = False) -> str:
+    """Read session context and instructions without creating a sandbox.
+
+    ``redact_instructions`` is passed to ``gather_in_force_instructions`` as
+    ``redact``. Only a caller that freezes redacted input sets it.
+    """
     # Lazy import: miner imports this module at top level; importing miner
     # lazily here breaks the cycle without duplicating gather logic.
     from .miner import MinerError, gather_in_force_instructions
@@ -209,7 +214,8 @@ def environment_document(store, incident_row: dict, cfg: Config, transcript_text
             "",
             "## Instruction files in force for this project",
             "",
-            gather_in_force_instructions(incident_row.get("project_path", ""), cfg),
+            gather_in_force_instructions(incident_row.get("project_path", ""), cfg,
+                                         redact=redact_instructions),
             "",
         ]
     )

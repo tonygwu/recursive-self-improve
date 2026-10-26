@@ -256,3 +256,42 @@ def worker_plist_content(cfg: Config) -> dict:
 
 def render_worker_plist(cfg: Config) -> str:
     return plistlib.dumps(worker_plist_content(cfg), sort_keys=False).decode('utf-8')
+
+
+DEPLOY_LABEL = 'com.tonygwu.self-improve.deploy'
+
+
+def deploy_script_path(cfg: Config) -> Path:
+    """The deploy-prod.sh launchd must execute: the PRODUCTION checkout's copy.
+
+    The script fast-forwards the very checkout it lives in. It survives that by
+    re-execing from a temporary copy before touching git; see section 0 of
+    ops/deploy-prod.sh. Derive the path from the configured checkout so a
+    repository move does not leave the installed job pointing at an old path.
+    """
+    return Path(cfg.production_repo_path).expanduser() / 'ops' / 'deploy-prod.sh'
+
+
+def deploy_plist_content(cfg: Config) -> dict:
+    """Reviewable gated-deploy definition; this function installs nothing.
+
+    01:00 is deliberate. It precedes the 02:30 nightly, so code that passes the
+    gate is exercised by the same night's pipeline. Both jobs take the same
+    ``<state>/run.lock``, so a deploy that overruns into 02:30 makes the nightly
+    skip rather than swap code under a running pipeline.
+    """
+    logs = cfg.state_path('logs')
+    return {
+        'Label': DEPLOY_LABEL,
+        'ProgramArguments': ['/bin/bash', str(deploy_script_path(cfg))],
+        'StartCalendarInterval': {'Hour': 1, 'Minute': 0},
+        'StandardOutPath': str(logs / 'deploy.stdout.log'),
+        # launchd requires StandardErrorPath. A misspelled key can parse as valid
+        # plist XML while leaving stderr without the intended destination.
+        'StandardErrorPath': str(logs / 'deploy.stderr.log'),
+        'RunAtLoad': False,
+    }
+
+
+def render_deploy_plist(cfg: Config) -> str:
+    return plistlib.dumps(deploy_plist_content(cfg), sort_keys=False).decode('utf-8')

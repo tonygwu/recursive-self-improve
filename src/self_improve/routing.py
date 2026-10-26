@@ -16,22 +16,27 @@ Two responsibilities:
      already written and was ignored anyway, so adding more advisory prose
      anywhere is pointless — deterministic enforcement is the fix. (Review
      queue; ``convert_to_hook`` is in ``cfg.review_queue_actions``.)
+  0b. ``scope_guess == "personal"`` → the private file at
+     ``cfg.delivery_path("global_private")``, before the project-count
+     promotion. With no private target configured, routing raises rather than
+     publish a personal rule in the shared global file.
   1. ``project_count >= cfg.global_promotion_min_projects`` OR
-     ``scope_guess == "global"``  → global ``~/.claude/CLAUDE.md``
+     ``scope_guess == "global"``  → ``cfg.delivery_path("global_claude_md")``
+     (the ``[targets]`` table; default the loaded ``~/.claude/CLAUDE.md``)
   2. ``scope_guess == "hook"``    → ``convert_to_hook`` against settings.json
      (review queue; no diff is applied in the MVP)
-  3. ``scope_guess == "skill"``   → new skill dir under ``cfg.skills_dir``
+  3. ``scope_guess == "skill"``   → new skill dir under ``cfg.delivery_path("skill")``
   4. ``scope_guess == "rule_path"`` → ``new_rule_file`` at
      ``<project>/.claude/rules/<slug>.md`` (path-glob-scoped rule file)
   5. ``scope_guess == "codex_global"`` OR (source codex AND cross-project,
-     i.e. ``project_count >= 2``) → ``~/.codex/AGENTS.md``
+     i.e. ``project_count >= 2``) → ``cfg.delivery_path("codex_global")``
   6. otherwise → the learning's primary project file via ``detect_topology()``.
 
   The order above is the contract: an explicit ``scope_guess`` of ``hook`` /
   ``skill`` / ``rule_path`` / ``codex_global`` does NOT outrank the
   project-count promotion in rule 1. That is a deliberate, documented
-  consequence of the table order. Only rule 0 (enforcement gap) outranks
-  everything.
+  consequence of the table order. Only rules 0 (enforcement gap) and 0b
+  (personal) outrank it.
 
 Fail-loud policy: a learning with no resolvable primary project, an unparseable
 ``projects_json``, or a project directory that no longer exists raises
@@ -193,9 +198,10 @@ _REPO_N_RE = re.compile(r"^repo-(\d+)$")
 # night. This is a different question from `repo-0`, which is the checkout
 # automation writes TO. A path landing here is redirected, never written.
 #
-# A scanned session can originate in the production checkout. Its raw cwd can
-# reach primary_project_path before canonical working-copy selection, so routing
-# must handle production paths explicitly.
+# A scanned session can originate in the production checkout. miner.py redirects
+# such a cwd to a verified repo-0 sibling, but stores the raw repo-prod path when
+# it finds none, and learnings mined before BL-13 keep their raw cwd. Routing
+# must therefore handle production paths explicitly.
 _NEVER_WRITE_NAMES = ("repo-prod",)
 
 
@@ -330,6 +336,17 @@ def canonical_working_copy(
     return best
 
 
+def _origin_remote(path: str) -> str:
+    """The normalized origin remote of a checkout, or '' when none is readable.
+
+    Reads local git config only. ``_run_git`` already returns '' for a missing
+    directory, a failed git, or no origin. Callers must treat '' as "identity
+    unknown", never as "nothing to check".
+    """
+    from .project_identity import _run_git, normalize_remote_url
+    return normalize_remote_url(_run_git(path, "remote", "get-url", "origin"))
+
+
 def primary_project(learning: dict) -> str:
     """First project path of the learning; raises RoutingError if none.
 
@@ -345,14 +362,31 @@ def primary_project(learning: dict) -> str:
     p = learning.get("primary_project_path")
     if isinstance(p, str) and p:
         if is_never_write(p):
-            # miner.py stores the incident's RAW cwd here, and the nightly runs
-            # from repo-prod, so this path is reachable in normal operation.
-            redirected = redirect_never_write(p)
+            # Reachable in normal operation: the nightly runs from repo-prod, so
+            # its sessions index under repo-prod. miner.py stores a repo-prod
+            # cwd here when it finds no verified repo-0 sibling, and learnings
+            # mined before BL-13 keep the raw cwd they were stored with.
+            # Verify the sibling is the same repository: both checkouts must
+            # name the same origin remote. This reads local git config only.
+            # Without a readable repo-prod origin nothing can be verified, so
+            # refuse: an empty key would skip the identity check.
+            origin = _origin_remote(p)
+            if not origin:
+                cause = ("does not exist" if not os.path.isdir(p)
+                         else "has no readable origin remote")
+                raise RoutingError(
+                    f"learning {learning.get('id', '<no id>')!r} is routed to "
+                    f"{p!r}, which is a production checkout that must never be "
+                    f"written to, and it {cause}, so no repo-0 sibling can be "
+                    "verified as the same repository"
+                )
+            redirected = redirect_never_write(p, resolver=_origin_remote, project_key=origin)
             if not redirected:
                 raise RoutingError(
                     f"learning {learning.get('id', '<no id>')!r} is routed to "
                     f"{p!r}, which is a production checkout that must never be "
-                    "written to, and no repo-0 sibling was found next to it"
+                    "written to, and no repo-0 sibling with the same origin "
+                    f"remote ({origin}) was found next to it"
                 )
             return redirected
         return p
@@ -396,8 +430,8 @@ def skill_slug(learning: dict) -> str:
 
 
 def skill_md_path(cfg: Config, learning: dict) -> Path:
-    """SKILL.md path for a new-skill proposal: <skills_dir>/<slug>/SKILL.md."""
-    return Path(cfg.skills_dir) / skill_slug(learning) / "SKILL.md"
+    """SKILL.md path for a new-skill proposal: <skills delivery dir>/<slug>/SKILL.md."""
+    return Path(cfg.delivery_path("skill")) / skill_slug(learning) / "SKILL.md"
 
 
 def rule_file_path(learning: dict) -> Path:
@@ -435,8 +469,20 @@ def instruction_target_paths(project_paths: list[str], cfg: Config) -> list[str]
 
     Order is stable (globals first) so callers that truncate get a predictable
     corpus rather than a filesystem-order-dependent one.
+
+    User rule files (``rules/**/*.md`` beside the global CLAUDE.md, where a
+    private ``personal.md`` lives) follow the globals. Paths that resolve to
+    the same real file are listed once, at their first position: the Claude
+    and Codex global entrypoints can both be symlinks to one shared body, and
+    listing it twice would double its weight in every dedup comparison.
     """
     paths = [cfg.global_claude_md, cfg.codex_global_agents_md]
+    rules = Path(cfg.global_claude_md).parent / "rules"
+    if rules.is_dir():
+        paths.extend(sorted(str(r) for r in rules.rglob("*.md")))
+    # A private file can live outside that folder in another layout.
+    if cfg.delivery_path("global_private"):
+        paths.append(cfg.delivery_path("global_private"))
     for proj in project_paths:
         if not proj:
             continue
@@ -448,7 +494,14 @@ def instruction_target_paths(project_paths: list[str], cfg: Config) -> list[str]
     skills = Path(cfg.skills_dir)
     if skills.is_dir():
         paths.extend(sorted(str(s) for s in skills.glob("*/SKILL.md")))
-    return paths
+    unique: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        real = os.path.realpath(os.path.expanduser(p))
+        if real not in seen:
+            seen.add(real)
+            unique.append(p)
+    return unique
 
 
 def violated_existing_rule(learning: dict) -> str:
@@ -484,6 +537,23 @@ def route(learning: dict, cfg: Config) -> RouteDecision:
             ),
         )
 
+    if scope == "personal":
+        # Before the project-count promotion: personal rules span every
+        # project by nature, and promoting one would publish it.
+        private = cfg.delivery_path("global_private")
+        if not private:
+            raise RoutingError(
+                f"learning {learning.get('id', '<no id>')!r}: scope_guess is 'personal' "
+                "but no private target is configured; set [targets] global_private. "
+                "A personal rule is never written to the shared global file."
+            )
+        return RouteDecision(
+            target_path=Path(private),
+            target_kind="global_private",
+            action="add",
+            reason="scope_guess == 'personal': private, machine-specific rule",
+        )
+
     if project_count >= cfg.global_promotion_min_projects or scope == "global":
         if project_count >= cfg.global_promotion_min_projects:
             reason = (
@@ -493,7 +563,7 @@ def route(learning: dict, cfg: Config) -> RouteDecision:
         else:
             reason = "scope_guess == 'global'"
         return RouteDecision(
-            target_path=Path(cfg.global_claude_md),
+            target_path=Path(cfg.delivery_path("global_claude_md")),
             target_kind="global_claude_md",
             action="add",
             reason=reason,
@@ -516,6 +586,7 @@ def route(learning: dict, cfg: Config) -> RouteDecision:
         )
 
     if scope == "rule_path":
+        _refuse_excluded(cfg, learning, primary_project(learning))
         return RouteDecision(
             target_path=rule_file_path(learning),
             target_kind="rule_file",
@@ -530,13 +601,14 @@ def route(learning: dict, cfg: Config) -> RouteDecision:
             else f"source codex and cross-project (project_count {project_count} >= 2)"
         )
         return RouteDecision(
-            target_path=Path(cfg.codex_global_agents_md),
+            target_path=Path(cfg.delivery_path("codex_global")),
             target_kind="codex_global",
             action="add",
             reason=reason,
         )
 
     project = primary_project(learning)
+    _refuse_excluded(cfg, learning, project)
     # A session's cwd does not establish a project repository. Use git
     # rev-parse so repository subdirectories qualify while unrelated folders
     # cannot become instruction-file targets.
@@ -560,6 +632,22 @@ def route(learning: dict, cfg: Config) -> RouteDecision:
         reason=f"project-scoped ({topology_label(topo)}) in {project}",
         topology=topo,
     )
+
+
+def _refuse_excluded(cfg: Config, learning: dict, project: str) -> None:
+    """Raise when the project is an excluded directory.
+
+    Callers run this before their own stat or git checks. Resolving a
+    production-checkout path in ``primary_project`` can still read git config.
+    """
+    from .instruction_exclusions import excluded_by
+
+    entry = excluded_by(cfg, project)
+    if entry:
+        raise RoutingError(
+            f"learning {learning.get('id', '<no id>')!r}: refusing to write an "
+            f"instruction file into {project} — instruction_excluded_dirs contains {entry}."
+        )
 
 
 def _inside_git_repo(path: Path) -> bool:

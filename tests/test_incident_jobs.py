@@ -210,6 +210,21 @@ def test_archived_evidence_and_secret_redaction_reach_the_final_job_files(env,sh
     if shape=='occurrence':assert '7x' in text and 'old.jsonl' in text
 
 
+@pytest.mark.parametrize('mode',['fast','agentic'])
+def test_an_instruction_secret_straddling_the_cut_leaves_no_prefix_in_the_frozen_job(env,mode):
+    """Leak of the BL-04 shape: gather_in_force_instructions cut each file at
+    4,000 characters and snapshot redacted only afterwards (the fast prompt and
+    the agentic environment.md), so a key straddling the cut kept a clear
+    prefix such as 'AKIAABCDE' in the frozen job source."""
+    from tests.test_miner import key_prefixes_present, straddling_instruction_text
+    cfg,store,incident,_=env;cfg=replace(cfg,mine_mode=mode)
+    Path(cfg.global_claude_md).write_text(straddling_instruction_text(),encoding='utf-8')
+    frozen=incident_jobs.snapshot(store,cfg,incident['id'])['snapshot']
+    carrier=frozen['prompt'] if mode=='fast' else frozen['files']['environment.md']
+    assert '[truncated ' in carrier  # the instruction file reached the carrier and was cut
+    assert key_prefixes_present(json.dumps(frozen,ensure_ascii=False))==[]
+
+
 def test_a_newly_named_copy_of_a_rejected_lesson_stays_suppressed(env):
     cfg,store,incident,calls=env
     seed_learning(store,status='rejected',rule=agentic_payload()['generalized_rule'])
@@ -343,3 +358,47 @@ def test_selected_job_publishes_one_atomic_queue_processing_receipt(env):
     assert call['run_id']==receipt['run_id'] and call['prompt_sha']==receipt['prompt_sha']
     assert job_worker.run_once(store,cfg) is None
     assert len(store.query('SELECT * FROM queue_processing'))==1
+
+
+def test_selected_mining_persists_its_write_target_without_gh(env,tmp_path,monkeypatch):
+    """BL-13 review: the job writer chose the learning's working copy with a gh
+    lookup inside its write transaction. No gh call happens now, and an
+    uncached GitHub identity keeps the incident's own copy."""
+    from tests.test_mining_history import recording_gh,widget_clones
+    cfg,store,_,calls=env
+    log=recording_gh(tmp_path,monkeypatch)
+    incident,clones=widget_clones(store,tmp_path,cached=False)
+    submit_command(store,cfg,request((cfg,store,incident,calls)))
+    result=job_worker.run_once(store,cfg)
+    assert result['state']=='completed',(result['error_code'],result['error_detail'])
+    assert not log.exists(),log.read_text()
+    learning=store.query_one('SELECT * FROM learnings WHERE id=?',(result['result']['learning_id'],))
+    assert learning['primary_project_path']==clones['repo-3'],learning['primary_project_path']
+
+
+@pytest.mark.parametrize('prod_state',['no_origin','missing'])
+def test_an_unverifiable_repo_prod_target_is_recorded_without_a_proposal(env,tmp_path,monkeypatch,prod_state):
+    """BL-13 review: routing now refuses a repo-prod learning whose origin
+    cannot be read. The job records that refusal and completes; it neither
+    crashes nor proposes into the unrelated repo-0 beside it."""
+    import subprocess
+    from tests.test_scan_observations import make_repo
+    cfg,store,_,calls=env
+    zero=make_repo(tmp_path/'Code'/'widget'/'repo-0',remote='git@github.com:someone/else.git')
+    prod=tmp_path/'Code'/'widget'/'repo-prod'
+    if prod_state=='no_origin':
+        prod.mkdir();subprocess.run(['git','init','-q',str(prod)],check=True)
+    incident=seed_incident(store,str(tmp_path/'prod-session.jsonl'),project=str(prod))
+    def execute(self,call_id,stage,model_class,prompt,expect_json,**kwargs):
+        calls.append({'id':call_id,'stage':stage})
+        payload=agentic_payload(scope_guess='project')
+        return _ExecResult(ok=True,text=json.dumps(payload),parsed=payload,outcome='ok',provider='claude',model_reported='claude-sonnet-4-6')
+    monkeypatch.setattr(LLMRunner,'_execute',execute)
+    submit_command(store,cfg,request((cfg,store,incident,calls)))
+    result=job_worker.run_once(store,cfg)
+    assert result['state']=='completed',(result['error_code'],result['error_detail'])
+    assert result['result']['outcome']=='mined_without_proposal',result['result']
+    assert result['result']['proposal_error']['code']=='RoutingError'
+    assert 'verified as the same repository' in result['result']['proposal_error']['detail']
+    assert store.query('SELECT * FROM proposals')==[]
+    assert sorted(p.name for p in Path(zero).iterdir())==['.git']

@@ -33,12 +33,12 @@ def rig(tmp_path):
     pick_marker = tmp_path / "preflight_ran"
     project = tmp_path / "project with spaces"
 
-    def run(pick_payload: dict, uv_rc: int = 0, on_ac: bool = False, args=()):
+    def run(pick_payload: dict, uv_rc: int = 0, on_ac: bool = False, args=(), uv_first: str = ""):
         _fake_bin(
             bins, "quotapick",
             f'''echo called > "{pick_marker}"\ncat <<'EOF'\n{json.dumps(pick_payload)}\nEOF''',
         )
-        _fake_bin(bins, "uv", f'printf "%s\\0" "$@" > "{ran_marker}"; exit {uv_rc}')
+        _fake_bin(bins, "uv", f'{uv_first}\nprintf "%s\\0" "$@" > "{ran_marker}"; exit {uv_rc}')
         # `pmset -g batt` prints one of these two lines; the script greps it.
         drawing = "AC Power" if on_ac else "Battery Power"
         _fake_bin(bins, "pmset", f"echo \"Now drawing from '{drawing}'\"")
@@ -84,6 +84,44 @@ def test_healthy_fleet_runs_the_pipeline(rig):
     proc = rig(_decision(True))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.pipeline_ran
+
+
+def _utc_start_time(pid: int) -> str:
+    """The lock's start-time format: fixed C locale and UTC, whatever the caller's."""
+    return subprocess.run(
+        ["/bin/ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+        check=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC"},
+    ).stdout
+
+
+def test_a_live_lock_holder_is_respected_under_another_time_zone(rig, tmp_path, monkeypatch):
+    """Review of BL-47: ps prints lstart in local time and locale. A lock taken
+    under one TZ looked stale to a checker under another, which then removed a
+    live holder's lock and ran a second pipeline beside it."""
+    lock = tmp_path / "run.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(os.getpid()))
+    (lock / "started").write_text(_utc_start_time(os.getpid()))
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    r = rig(_decision(True))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "lock held by live PID" in r.stdout, r.stdout
+    assert not r.pipeline_ran
+    assert lock.exists()
+
+
+def test_the_nightly_lock_records_its_start_time_in_utc(rig, tmp_path, monkeypatch):
+    """The recorder must write the format the checker reads, whatever TZ it runs in."""
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    recorded, expected = tmp_path / "recorded", tmp_path / "expected"
+    # The fake pipeline runs while the script holds the lock.
+    probe = (f'cp "$SI_LOCK_DIR/started" "{recorded}"; '
+             f'LC_ALL=C TZ=UTC /bin/ps -o lstart= -p "$(cat "$SI_LOCK_DIR/pid")" > "{expected}"')
+    r = rig(_decision(True), uv_first=probe)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.pipeline_ran
+    assert expected.read_text().strip(), "ps printed no start time for the lock holder"
+    assert recorded.read_text() == expected.read_text()
 
 
 def test_genuinely_tight_quota_skips_quietly_with_exit_0(rig):
@@ -200,7 +238,7 @@ def test_default_home_paths_and_discovered_uv_run_without_machine_overrides(tmp_
     ]
     proc = subprocess.run(["/bin/bash", str(SCRIPT)], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert marker.read_text().startswith(f"run --project {SCRIPT.parent.parent} ")
+    assert marker.read_text().startswith(f"run --locked --project {SCRIPT.parent.parent} ")
     assert (home / ".self-improve" / "logs").is_dir()
     assert not (home / ".self-improve" / "run.lock").exists()
 
@@ -419,7 +457,7 @@ def test_nightly_preserves_explicit_policy_mode_and_child_status(rig, on_ac, arg
     """Default policy reaches the CLI; only an explicit request adds the veto."""
     proc = rig(_decision(True), on_ac=on_ac, args=args, uv_rc=uv_rc)
     assert proc.returncode == uv_rc, proc.stdout + proc.stderr
-    assert proc.uv_args == ["run", "--project", proc.project, "selfimprove", "run", *args]
+    assert proc.uv_args == ["run", "--locked", "--project", proc.project, "selfimprove", "run", *args]
     assert proc.caffeinated is on_ac
     assert proc.preflight_ran
     assert not proc.lock_exists

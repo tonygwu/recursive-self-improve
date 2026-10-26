@@ -15,9 +15,8 @@ source evidence and have no authentication. Inject an aware UTC clock for
 wall-time questions such as data freshness.
 
 Async route handlers keep SQLite use on the connection's event-loop thread.
-Slow queries still block that loop, so expensive filesystem walks have explicit
-caps and report omissions. Project context weight covers the selected top-N
-repositories; a repo-wide Markdown walk requires an explicit request.
+Slow queries still block that loop. Project pages read retained inventories and
+measurements; the web process does not walk repositories.
 
 Serialize through JSONResponse so unexpected objects fail instead of being
 coerced. Rules and complete retained evidence use bounded read APIs; there is no server
@@ -263,7 +262,7 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
             "Local views and durable review decisions. The dashboard records "
             "intent; a separate worker delivers instruction edits."
         ),
-        version="0.1.2",
+        version="0.1.3",
         lifespan=lifespan,
     )
     app.state.cfg = cfg
@@ -321,6 +320,26 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
                     "a row in the state database has a shape the dashboard "
                     "refuses to guess about; it is reported rather than "
                     "rendered as a zero"
+                ),
+            },
+        )
+
+    from ..execution_policy import PolicyError
+
+    @app.exception_handler(PolicyError)
+    async def _policy_error(request, exc):  # noqa: ANN001
+        # Review membership and command authorization share this resolver. A
+        # running row with a corrupt process identity raises here, named by
+        # its run id; a bare 500 would hide which row to repair.
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "PolicyError",
+                "detail": str(exc),
+                "meaning": (
+                    "the execution policy cannot decide Review membership or "
+                    "permission from the state database; it is reported "
+                    "rather than guessed"
                 ),
             },
         )
@@ -443,7 +462,7 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
         )
 
     @app.get("/api/overview", summary="V1 Overview: freshness, grid, backlog, failures")
-    async def api_overview(window_days: int | None = DEFAULT_WINDOW_DAYS):
+    async def api_overview(window_days: int | None = fastapi.Query(DEFAULT_WINDOW_DAYS, ge=1, le=3660)):
         with store().transaction():
             return _json(
                 queries.overview(store(), cfg, now_utc=now(), window_days=window_days)
@@ -570,7 +589,7 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
             return _json(rule_data.detail(store(),learning_id))
 
     @app.get("/api/rules", summary="V2 Rules: every learning with provenance and verdict")
-    async def api_rules(evidence_sample: int = 5):
+    async def api_rules(evidence_sample: int = fastapi.Query(5, ge=0, le=1000)):
         return _json(queries.rules(store(), evidence_sample=evidence_sample))
 
     @app.get(
@@ -1057,25 +1076,6 @@ def create_app(cfg, *, static_dir=None, clock=None, db_path=None) -> "FastAPI":
     return app
 
 
-def _context_weigher(*, scan_other_md: bool):
-    """The context-weight walker, or ``None`` and the reason it is unavailable.
-
-    ``scan_other_md=False`` skips the repo-wide markdown walk, which is the
-    only expensive part and is never added into context weight (PRD 8a).
-    """
-    try:
-        from .context_weight import context_weight  # noqa: PLC0415
-    except ImportError as exc:
-        return None, (
-            f"src/self_improve/dashboard/context_weight.py is not importable ({exc})"
-        )
-
-    def weigh(path):
-        return context_weight(path, scan_other_md=scan_other_md)
-
-    return weigh, ""
-
-
 def serve(cfg, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> int:
     """Run the dashboard until interrupted. Returns a process exit code."""
     bind = _require_loopback(host)
@@ -1085,7 +1085,7 @@ def serve(cfg, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> int:
     # banner that only appears when the process dies is not a banner.
     print(
         f"dashboard: http://{bind}:{port}  "
-        "(reads only, except V3 approve/reject; ctrl-c to stop)",
+        "(records review, policy and job commands; never writes instruction files; ctrl-c to stop)",
         flush=True,
     )
     uvicorn.run(app, host=bind, port=port, log_level="warning")

@@ -13,10 +13,11 @@ No general improvement rate is claimed.
 *Overview — Figma v2 design with invented data. The pipeline, stage history, and
 review queue show how the pieces fit together.*
 
-The images below are **Figma design exports** with invented examples. Their counts,
-trends, and trial outcomes are illustrative. The dashboard now implements this v2
-design, so the disposable demo shows the same screens. Complete visual parity is
-not claimed, and the demo does not match these exports pixel for pixel. See
+The images below are **Figma design exports** with invented examples, taken from
+the reconciled v2 design. Their counts, trends, and trial outcomes are
+illustrative. The dashboard implements this v2 design, so the disposable demo
+shows the same screens. Complete visual parity is not claimed, and the demo does
+not match these exports pixel for pixel. See
 [preview scope](docs/RESEARCH_PREVIEW.md) for implemented behavior.
 
 ## Try it without personal history
@@ -45,7 +46,23 @@ See [installation and package checks](docs/DISTRIBUTION.md).
 
 ## Supported workflow
 
-The latest preview rebuilds every screen on the v2 design and adds a full Review
+Version 0.1.3 separates where an edit is written from where an agent reads it,
+through an optional `[targets]` table, and routes personal or machine-specific
+lessons to the private rules file you name as `[targets] global_private`. Without
+that target, routing refuses a personal lesson. Instruction files in folders listed
+in `instruction_excluded_dirs` are never read, and routing offers no new
+destination there. Folders match by path text, without following symlinks. A
+proposal created before a folder was excluded can still be approved and written.
+A corrected-target recovery can now deliver a lesson into an existing skill. The
+release also adds an opt-in pre-mining filter benchmark (`eval-filter`), a
+scope-routing check (`eval-scope`), an optional gated deployment job, and fixes
+and added tests for about fifty findings from a code audit, including stricter
+redaction rules.
+See [delivery targets](docs/TARGETS.md), [the example
+configuration](examples/config.example.toml), [the filter
+benchmark](docs/EVAL_FILTER.md) and [gated deployment](docs/DEPLOYMENT.md).
+
+Version 0.1.2 rebuilt every screen on the v2 design and added a full Review
 detail view, a command palette, grouped project navigation, and Run backlog and
 delivery context. It records observational recurrence measurements, human quality
 judgments, display-only rule families, retained instruction text, and native
@@ -64,10 +81,10 @@ run the instruction worker explicitly; inspect its result; and request a
 conflict-aware rollback. Scoped rejection can suppress one target or a lesson.
 Automatic classes start off. Review decisions alone do not write instruction files.
 
-![Figma v2 Review detail showing a proposed instruction diff, invented source excerpts, paired trials, and approval controls](docs/images/dashboard-review-detail-v2.png)
+![Figma v2 Review detail showing one combined edit across three targets, invented source excerpts, paired trials, and approval and scoped rejection controls](docs/images/dashboard-review-detail-v2.png)
 
-*Review detail — inspect the proposed edit, its source evidence, and example trial
-outcomes together before making a decision.*
+*Review detail — inspect the combined edit, its source evidence, and example trial
+outcomes together, then approve or reject it for these files or everywhere.*
 
 [The workflow guide](docs/WORKFLOW.md) explains explicit delivery, stale previews,
 retries, rejection and rollback. Project delivery may create a commit on its
@@ -75,11 +92,13 @@ recorded delivery branch rather than change the checked-out file.
 
 ## Evals & Trends
 
-![Figma v2 Evals and Trends with invented monthly signal rates, evaluation outcomes, and paired-trial history](docs/images/dashboard-evals-trends-v2.png)
+![Figma v2 Evals and Trends with per-class automatic-delivery switches, invented signal rates, evaluation attempts, and human quality judgments](docs/images/dashboard-evals-trends-v2.png)
 
-Explore monthly signal rates by detector version, then open an evaluation to inspect
-its source rule, scenarios, paired trials, and served models. Review historical
-outcomes and missing coverage before deciding whether to test a rule again.
+Each automatic target class starts off, and its switch shows evidence as advice
+rather than a threshold that unlocks it. Compare signal rates per 100,000 eligible
+lines within one detector version, then open an evaluation to inspect its source
+rule, scenarios, paired trials, and served models. Review historical outcomes and
+missing coverage before deciding whether to test a rule again.
 
 *Figma v2 design preview with invented data; trends and example verdicts do not
 establish real-world improvement.*
@@ -89,7 +108,7 @@ establish real-world improvement.*
 The Project page brings together sessions, linked lessons, instruction inventories,
 and recorded rule availability. Working copies share one repository identity.
 
-![Figma v2 Project detail with example rules, instruction files, symlinks, and three working copies](docs/images/dashboard-project-detail-v2.png)
+![Figma v2 Project detail with example rules, instruction wiring, Markdown sizes, and three working copies](docs/images/dashboard-project-detail-v2.png)
 
 *Project detail — Figma v2 design showing example instructions, file links, and
 working copies. The examples do not establish that an agent read or followed a rule.*
@@ -122,6 +141,8 @@ state, while holding instruction changes. The regular dashboard binds to
 
 `run --dry-run` also writes scan and incident state. It is not a read-only rehearsal.
 This preview does not install unattended services or enable automatic classes.
+Name where approved edits are written with the optional `[targets]` table; see
+[delivery targets](docs/TARGETS.md) and [the example configuration](examples/config.example.toml).
 
 ## Boundaries and limits
 

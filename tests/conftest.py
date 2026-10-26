@@ -72,7 +72,15 @@ def _system_policy_path(text) -> bool:
     return any(normalized.startswith(root.replace("\\", "/").casefold()) for root in _SYSTEM_POLICY_ROOTS)
 
 
-def _forbidden_prefix(text: str) -> bool:
+def _path_text(value) -> str:
+    """A path argument as text: bytes and PathLike decode, never str(b'...')."""
+    if isinstance(value, (bytes, os.PathLike)):
+        return os.fsdecode(value)
+    return str(value)
+
+
+def _forbidden_prefix(text) -> bool:
+    text = _path_text(text)
     return any(text.startswith(str(root)) for root in _FORBIDDEN) or _system_policy_path(text)
 
 
@@ -83,12 +91,12 @@ def _audit(event: str, args) -> None:
         argv = args[1] if len(args) > 1 else None
         parts: list[str] = []
         if isinstance(argv, (list, tuple)):
-            parts.extend(str(a) for a in argv)
+            parts.extend(_path_text(a) for a in argv)
         elif isinstance(argv, (str, bytes)):
-            parts.append(str(argv))
+            parts.append(_path_text(argv))
         cwd = args[2] if len(args) > 2 else None
         if cwd:
-            parts.append(str(cwd))
+            parts.append(_path_text(cwd))
         for part in parts:
             if _forbidden_prefix(part):
                 _violations.append(part)
@@ -96,8 +104,8 @@ def _audit(event: str, args) -> None:
         return
     if event in _FS_EVENTS:
         for arg in args:
-            if isinstance(arg, (str, bytes, Path)) and _forbidden_prefix(str(arg)):
-                _violations.append(str(arg))
+            if isinstance(arg, (str, bytes, Path)) and _forbidden_prefix(arg):
+                _violations.append(_path_text(arg))
                 return
         return
     if event not in _PATH_EVENTS:
@@ -108,11 +116,18 @@ def _audit(event: str, args) -> None:
         return
     if not isinstance(path, (str, bytes, Path)):
         return  # a file descriptor or a connection object, not a path
-    text = str(path)
-    # sqlite3 accepts a URI: file:/abs/path?mode=ro. Strip the scheme and the
-    # query so the prefix comparison below sees the same string `open` would.
+    text = _path_text(path)
+    # sqlite3 accepts a URI: file:/abs/path?mode=ro, or Path.as_uri()'s
+    # file:///abs%23path?mode=ro. Strip the scheme, an empty or localhost
+    # authority and the query, and percent-decode, so the prefix comparison
+    # below sees the same string `open` would.
     if text.startswith("file:"):
+        from urllib.parse import unquote
         text = text[len("file:"):].split("?", 1)[0]
+        if text.startswith("//"):
+            authority, _, rest = text[2:].partition("/")
+            text = "/" + rest if authority in ("", "localhost") else text
+        text = unquote(text)
     # Fast reject before touching the filesystem: str comparison only.
     if _forbidden_prefix(text):
         _violations.append(text)

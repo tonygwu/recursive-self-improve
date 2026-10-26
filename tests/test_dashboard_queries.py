@@ -41,6 +41,10 @@ class _Cfg:
     max_cheap_calls_per_run = 80
     project_branch_name = "self-improve/rules"
 
+    def delivery_path(self, kind):
+        # No [targets] table: global proposals are written to the loaded file.
+        return {"global_claude_md": self.global_claude_md}[kind]
+
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -1929,9 +1933,18 @@ def test_every_taxonomy_key_the_pipeline_writes_has_operator_words():
     from self_improve import pipeline as pl
 
     source = Path(pl.__file__).read_text(encoding="utf-8")
-    literal = set(re.findall(r'_bump_tax\("([a-z_]+)"\)', source))
-    literal |= set(re.findall(r'mine_stats\["taxonomy"\]\["([a-z_]+)"\]', source))
+    # The taxonomy writer reaches helpers under other names: gate_one_proposal
+    # takes it as bump_taxonomy and _persist_prune_proposals as bump.
+    # Both quote styles: the _bump_tax calls use single quotes, and some keys
+    # carry an exception class name, so the key alphabet is mixed case.
+    literal = {key for _, key in re.findall(
+        r"""\b(?:_bump_tax|bump_taxonomy|bump)\((["'])([A-Za-z0-9_]+)\1\)""", source)}
+    literal |= {key for _, key in re.findall(
+        r"""mine_stats\[["']taxonomy["']\]\[(["'])([A-Za-z0-9_]+)\1\]""", source)}
     assert literal, "the scanner found no taxonomy keys; it has stopped working"
+    # Prove each call form was reached, not just one of them.
+    assert {"gate_sandbox_unverified", "prune_learning_missing",
+            "propose_LessonRejected", "budget_exhausted"} <= literal, sorted(literal)
 
     missing = sorted(k for k in literal if q.failure_copy(k) is None
                      and k not in q.NOT_FAILURE_TAXONOMY)
@@ -2076,6 +2089,29 @@ def test_a_mixed_family_keeps_a_reason_per_proposal(tmp_path):
     reasons = {p["reason_code"] for p in biggest["proposals"]}
     assert reasons == {"inconclusive", "gated_fail"}
     assert len(set(p["why_needs_you"] for p in biggest["proposals"])) == 2
+
+
+def test_an_inconclusive_proposal_without_a_retained_tally_claims_no_disagreement(tmp_path):
+    """BL-22: every inconclusive card said the scenarios "disagreed". A result
+    retained without its gate attempt has no tally, so the card must say the
+    tally is unknown rather than name a cause."""
+    store, path = _writable(tmp_path)
+    _run(store, started="2026-08-22T02:30:00Z", stats={"review_only": True})
+    lid = _learning(store)
+    eid = _eval(store, subject_id=lid, verdict="error", attempted=3, succeeded=0, failed=3,
+                taxonomy={"agent_error": 3})
+    _proposal(store, learning_id=lid, status="inconclusive", eval_result_id=eid)
+    store.close()
+    out = q.review_queue(_read_only(path), _Cfg())
+    card = out["families"][0]["proposals"][0]
+    assert card["reason_detail"] == "tally_unknown"
+    assert card["why_needs_you"] == (
+        "the gate's scenarios did not establish a passing or failing majority. "
+        "The scenario tally was not retained, so this view cannot say whether "
+        "they disagreed or never tested the rule."
+    )
+    assert "Contrary evidence" not in out["families"][0]["means"]
+    assert "not retained" in out["families"][0]["means"]
 
 
 def test_every_queueing_status_has_copy_or_the_lookup_raises(tmp_path):
@@ -2297,7 +2333,7 @@ def test_review_queue_with_no_carve_out_actions_configured(tmp_path):
     assert set(ids) == {"queues", "mandatory-hook"}, ids
     out = q.review_queue(ro, NoCarveOuts())
     assert out["count"] == 2
-    assert set(out["carve_out_actions"]) == {"convert_to_hook", "delete_human_line", "resolve_rollback", "reapply", "recover_rule"}
+    assert set(out["carve_out_actions"]) == {"convert_to_hook", "delete", "delete_human_line", "resolve_rollback", "reapply", "recover_rule"}
 
 
 class _SqlRecorder:
@@ -2312,6 +2348,10 @@ class _SqlRecorder:
 
     def query_one(self, sql, params=()):
         self.sql.append(sql)
+        return None
+
+    def transaction_memo(self):
+        # No owned transaction: Store answers None, and readers read afresh.
         return None
 
 
@@ -2797,3 +2837,172 @@ def test_a_malformed_eval_taxonomy_fails_loud_and_names_the_row():
         q.eval_story(_eval_row(error_taxonomy_json="{not json"))
     with pytest.raises(q.DashboardDataError, match="not an object"):
         q.eval_story(_eval_row(error_taxonomy_json='"a string"'))
+
+
+def _arms(without: dict, with_: dict) -> str:
+    def arm(errors):
+        failed = sum(errors.values())
+        return {"attempted": 3, "succeeded": 3 - failed, "failed": failed, "errors": errors}
+    return json.dumps({"without": arm(without), "with": arm(with_)})
+
+
+def test_a_reproduced_mistake_the_rule_did_not_fix_is_not_a_harness_result():
+    """BL-10: both arms at zero successes were described as a harness result,
+    but a without-rule arm of graded failures is the mistake reproduced."""
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"graded_fail": 6}),
+        metrics_json=_arms({"graded_fail": 3}, {"graded_fail": 3})))
+    assert story["shape"] == "rule_failed", story
+    for wrong in ("harness", "could not reproduce"):
+        assert wrong not in story["summary"], story["summary"]
+    assert "made the mistake 3 of 3" in story["summary"], story["summary"]
+
+
+def test_both_arms_failing_on_infrastructure_is_still_a_harness_result():
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"agent_error": 3, "asked_operator": 3}),
+        metrics_json=_arms({"asked_operator": 3}, {"agent_error": 3})))
+    assert story["shape"] == "both_arms_failed", story
+    assert "harness" in story["summary"], story["summary"]
+
+
+def test_the_tested_summary_counts_only_reproduced_mistakes():
+    """An agent_error is not the agent making the mistake."""
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"graded_fail": 2, "agent_error": 1}),
+        metrics_json=_arms({"graded_fail": 2, "agent_error": 1}, {})))
+    assert story["shape"] == "tested", story
+    assert "made the mistake 2 of 3" in story["summary"], story["summary"]
+    assert "1 of the without-rule trials" in story["summary"], story["summary"]
+
+
+def test_a_with_arm_that_never_ran_is_a_harness_result_not_a_rule_failure():
+    """Review of BL-10: rule_failed checked only that the without arm
+    reproduced the mistake, so a with arm of agent errors (gate verdict
+    "error", no vote) read as "the rule did not prevent the mistake"."""
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"graded_fail": 3, "agent_error": 3}),
+        metrics_json=_arms({"graded_fail": 3}, {"agent_error": 3})))
+    assert story["shape"] == "both_arms_failed", story
+    assert "did not prevent" not in story["summary"] and "harness" in story["summary"], story["summary"]
+
+
+def test_a_scenario_served_by_two_models_is_not_described_as_a_rule_failure():
+    """Second review of BL-07: the gate refuses to vote on a scenario that
+    two models served, but the card still said the rule did not prevent the
+    mistake."""
+    metrics = json.loads(_arms({"graded_fail": 3}, {"graded_fail": 3}))
+    metrics["served_models"] = [{"provider": "claude", "model": "model-a"},
+                                {"provider": "codex", "model": "model-b"}]
+    story = q.eval_story(_eval_row(verdict="error",
+        error_taxonomy_json=json.dumps({"graded_fail": 6}), metrics_json=json.dumps(metrics)))
+    assert story["shape"] == "mixed_models", story
+    assert "did not prevent" not in story["summary"], story["summary"]
+    assert "claude/model-a" in story["summary"] and "codex/model-b" in story["summary"]
+
+
+def test_gate_health_names_a_scenario_served_by_two_models(tmp_path):
+    """Review: eval_story called this row mixed_models, but gate health called
+    it "Unclassified verdict" because classify_eval_result never read
+    served_models."""
+    metrics = json.loads(_arms({"graded_fail": 3}, {}))
+    metrics["served_models"] = [{"provider": "claude", "model": "model-a"},
+                                {"provider": "codex", "model": "model-b"}]
+    store, path = _writable(tmp_path)
+    _eval(store, eval_id="mixed", subject_id="seed-x", verdict="error", attempted=6,
+          succeeded=3, failed=3, taxonomy={"graded_fail": 3}, metrics=metrics)
+    store.close()
+    row = q.gate_health(_read_only(path))["rows"][0]
+    assert (row["class"], row["label"]) == ("mixed_models", "Different models served the arms"), row
+    assert "claude/model-a, codex/model-b" in row["why"], row["why"]
+    assert row["verdict"] == "error"
+
+
+def test_gate_health_names_the_row_with_malformed_served_models(tmp_path):
+    metrics = json.loads(_arms({"graded_fail": 3}, {}))
+    metrics["served_models"] = "claude/model-a"
+    store, path = _writable(tmp_path)
+    _eval(store, eval_id="bad-served", subject_id="seed-x", verdict="error", attempted=6,
+          succeeded=3, failed=3, taxonomy={"graded_fail": 3}, metrics=metrics)
+    store.close()
+    with pytest.raises(q.DashboardDataError, match="bad-served.*served_models"):
+        q.gate_health(_read_only(path))
+
+
+def test_one_served_model_keeps_the_ordinary_story():
+    metrics = json.loads(_arms({"graded_fail": 3}, {"graded_fail": 3}))
+    metrics["served_models"] = [{"provider": "claude", "model": "model-a"}]
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"graded_fail": 6}), metrics_json=json.dumps(metrics)))
+    assert story["shape"] == "rule_failed", story
+
+
+def test_malformed_served_models_are_named_not_ignored():
+    metrics = json.loads(_arms({"graded_fail": 3}, {"graded_fail": 3}))
+    metrics["served_models"] = "claude/model-a"
+    with pytest.raises(q.DashboardDataError, match="served_models"):
+        q.eval_story(_eval_row(metrics_json=json.dumps(metrics)))
+
+
+def _skipped_with_arm(errors: dict, *, succeeded: int = 0, verdict: str = "error"):
+    """A gate row whose with-rule arm was skipped, as the gate writes it."""
+    failed = sum(errors.values())
+    without = {"attempted": failed + succeeded, "succeeded": succeeded, "failed": failed,
+               "errors": errors}
+    return {"id": "e1", "verdict": verdict, "attempted": failed + succeeded,
+            "succeeded": succeeded, "failed": failed,
+            "error_taxonomy_json": json.dumps(errors),
+            "metrics_json": json.dumps({"without": without, "with": None})}
+
+
+@pytest.mark.parametrize("errors,named", [
+    ({"grader_error": 3}, "3 grader_error"),
+    ({"asked_operator": 3}, "3 asked_operator"),
+    ({"asked_operator": 2, "grader_error": 1}, "2 asked_operator, 1 grader_error"),
+])
+def test_a_skipped_with_rule_arm_is_not_read_as_both_arms_failing(errors, named):
+    """BL-45: a gate `error` row is a scenario whose without-rule arm was all
+    uninformative, so the with-rule arm never ran and is recorded as null.
+    Review read it as "Both arms failed: 0 of 0 passed with the rule"."""
+    story = q.eval_story(_eval_row(**_skipped_with_arm(errors)))
+    assert story["shape"] == "with_arm_skipped", story
+    assert story["summary"] == (
+        "The with-rule arm never ran, so nothing tested this rule. All 3 "
+        f"without-rule trials were uninformative ({named}), so none could show "
+        "the mistake. That is not a judgement about the rule."
+    )
+
+
+def test_a_rarely_reproduced_mistake_does_not_report_a_with_rule_pass_count():
+    """BL-45, same shape: an ungated row whose without-rule arm reproduced the
+    mistake once read "With the rule it passed 0 of 0"."""
+    story = q.eval_story(_eval_row(**_skipped_with_arm({"graded_fail": 1}, succeeded=2,
+                                                       verdict="ungated")))
+    assert story["shape"] == "with_arm_skipped", story
+    assert "0 of 0" not in story["summary"], story["summary"]
+    assert "made the mistake 1 of 3 times, too few for the gate" in story["summary"]
+
+
+@pytest.mark.parametrize("errors,succeeded,verdict,shown", [
+    ({"asked_operator": 3}, 0, "error",
+     "the without-rule arm reproduced the mistake in 0 of 3 trials (other outcomes: 3 asked_operator)"),
+    ({"graded_fail": 1}, 2, "ungated", "the without-rule arm reproduced the mistake in 1 of 3 trials"),
+    ({}, 3, "ungated", "the without-rule arm did not fail"),
+])
+def test_a_skipped_with_rule_arm_is_classified_by_what_the_without_arm_did(errors, succeeded, verdict, shown):
+    """BL-45: three operator questions are failed trials that judged nothing.
+    Gate health said "the without-rule arm did not fail" for them."""
+    info = q.classify_eval_result(_skipped_with_arm(errors, succeeded=succeeded, verdict=verdict))
+    assert info["class"] == "eval_invalid", info
+    assert info["why"] == f"the with-rule arm never ran, so the rule was never tested; {shown}"
+
+
+def test_a_partly_graded_with_arm_is_not_said_to_have_run_no_usable_trial():
+    """Second review of BL-10: one graded failure and two agent errors is a
+    with arm that ran one usable trial, not none."""
+    story = q.eval_story(_eval_row(
+        error_taxonomy_json=json.dumps({"graded_fail": 4, "agent_error": 2}),
+        metrics_json=_arms({"graded_fail": 3}, {"graded_fail": 1, "agent_error": 2})))
+    assert story["shape"] == "both_arms_failed", story
+    assert "no usable trial" not in story["summary"], story["summary"]
+    assert "2 of its 3 failures" in story["summary"], story["summary"]

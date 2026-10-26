@@ -30,6 +30,9 @@ def snapshot(store,cfg,incident_id):
     if incident['status']!='new':
         raise CommandError('IncidentAlreadyHandled','This incident is already mined or dismissed. Inspect its existing evidence and results.',409)
     session=store.query_one('SELECT * FROM sessions WHERE file_path=?',(incident['session_file'],))
+    from .scan import incident_denylist_match
+    denied=incident_denylist_match(cfg,incident,session['project_path'] if session else '')
+    if denied:raise CommandError('IncidentDenylisted',f'denylist_substrings contains {denied!r}, which names this incident\'s session, so it is never mined.',409)
     if not session:raise CommandError('IncidentDataError','The incident has no source session.',500)
     if cfg.mine_mode not in {'agentic','fast'}:raise CommandError('InvalidMineMode','Mining mode must be agentic or fast.',500)
     from .incident_evidence import parse_window, IncidentEvidenceError
@@ -39,12 +42,15 @@ def snapshot(store,cfg,incident_id):
     if cfg.mine_mode=='agentic':
         try:
             events,start=miner._full_mine_events(store,incident,cfg);coverage['kind']='full_session'
-        except miner.TranscriptAgedOut:
+        except (miner.TranscriptAgedOut, miner.IncidentReferenceMissing) as exc:
             events,start=miner._fallback_mine_events(store,incident)
+            coverage['reason']='full_reference_missing' if isinstance(exc,miner.IncidentReferenceMissing) else 'transcript_aged_out'
+            note=miner.retained_window_note(exc)
         transcript,stats=render.session_document(events)
-        if coverage['kind']=='retained_window':transcript=miner.AGED_OUT_NOTE+'\n\n'+transcript
+        if coverage['kind']=='retained_window':transcript=note+'\n\n'+transcript
         files={'transcript.md':transcript,
-            'environment.md':redact_text(render.environment_document(store,{**incident,'start_line':start},cfg,transcript))}
+            'environment.md':redact_text(render.environment_document(store,{**incident,'start_line':start},cfg,transcript,
+                redact_instructions=True))}
         coverage.update(asdict(stats),bytes=len(transcript.encode()))
         mapping={'signal_type':incident['signal_type'],'matched_text':incident['matched_text'],
             'start_line':str(start),'project':incident['project_path'] or '(unknown)',
@@ -56,11 +62,12 @@ def snapshot(store,cfg,incident_id):
         prompt,template_sha=miner.render_prompt_revision(bundled_path('prompts','mine_incident.md'),{
             'signal_type':incident['signal_type'],'project':incident['project_path'] or '(unknown)',
             'window':json.dumps(window,indent=2,ensure_ascii=False),
-            'in_force_instructions':miner.gather_in_force_instructions(incident['project_path'],cfg)})
+            'in_force_instructions':miner.gather_in_force_instructions(incident['project_path'],cfg,redact=True)})
     learnings=store.query('SELECT * FROM learnings ORDER BY id')
     fields=('id','status','rule_text','why','category','scope','evidence_count','project_count','duplicate_of')
     rows=[{k:redact_text(r[k]) if k in {'rule_text','why','duplicate_of'} else r[k] for k in fields} for r in learnings]
-    projects=[r['project_path'] for r in store.query("SELECT DISTINCT project_path FROM sessions WHERE project_path!='' ORDER BY project_path")]
+    from .instruction_exclusions import included
+    projects=included(cfg,[r['project_path'] for r in store.query("SELECT DISTINCT project_path FROM sessions WHERE project_path!='' ORDER BY project_path")])
     unreadable=[]
     rules=[{'text':redact_text(text),'path':str(path)} for text,path in _in_force_rule_units(cfg,projects,unreadable=unreadable)]
     coverage['unreadable_instructions']=unreadable

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Example only. Render configured paths with self_improve.launchd.render_deploy_plist. -->
+<dict>
+	<key>Label</key>
+	<string>com.tonygwu.self-improve.deploy</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/path/to/self-improve/repo-prod/ops/deploy-prod.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/path/to/private-state/logs/deploy.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/path/to/private-state/logs/deploy.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>1</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>

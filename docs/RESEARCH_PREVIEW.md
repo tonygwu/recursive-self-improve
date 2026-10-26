@@ -1,4 +1,4 @@
-# v0.1.2 research preview
+# v0.1.3 research preview
 
 recursive-self-improve supports a deliberately bounded local workflow:
 
@@ -12,7 +12,35 @@ Automatic classes start off. This preview installs no unattended service.
 The dashboard has no authentication and serves only on loopback. Existing code
 for broader experiments remains available; its presence is not a completion claim.
 
-## Added inspection features
+## Added in 0.1.3
+
+- Delivery paths are separate from load paths. An optional `[targets]` table
+  names where approved edits are written, so a loaded file can be a symlink into
+  a checkout that automation never writes. See [delivery targets](TARGETS.md).
+- Personal or machine-specific lessons route to a private rules file named by
+  `[targets] global_private`, checked before a lesson is promoted to the shared
+  file. Without that target, routing refuses the lesson instead of publishing it.
+  Enabling the global automatic class also covers this private file. Nothing yet
+  refuses a `global_private` path that names the shared file, so check it.
+- Instruction files in folders listed in `instruction_excluded_dirs` are never
+  read, and routing offers no new destination there. Folders match by path text,
+  without following symlinks. The writer does not check
+  the setting, so a proposal created before a folder was excluded can still be
+  approved and written. A later denylist entry stops mining of waiting incidents.
+- A corrected-target recovery can deliver a lesson into an existing skill as a
+  reviewed edit.
+- `eval-filter` is an opt-in benchmark of the pre-mining filter against a model
+  challenger, on private frozen inputs. `eval-scope` measures how the shipped
+  guidance chooses a lesson's scope on invented cases. Neither changes production
+  behavior. See [the filter benchmark](EVAL_FILTER.md).
+- An optional deployment script fast-forwards a production checkout only after
+  the full suite passes and no migration is pending. Nothing installs it. See
+  [gated deployment](DEPLOYMENT.md).
+- Fixes and added tests for about fifty findings from a code audit. They include
+  stricter redaction with versioned rules, bounded provider calls, a gate that
+  refuses mixed served models, run-liveness checks, and Linux test fixes.
+
+## Added in 0.1.2
 
 - Every screen follows the v2 design. Review gains a full detail view with the
   proposed edit, its source evidence, and paired trials together. A command

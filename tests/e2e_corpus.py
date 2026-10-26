@@ -449,8 +449,8 @@ class ScriptedLLM:
             return _Result(ok=True, parsed=self.other_responses[stage])
         # Unscripted non-mine stages fail cleanly: the pipeline treats that as
         # a failed call, which is the honest outcome for "we didn't script it".
-        self._record(stage, "parse_failure")
-        return _Result(ok=False, parsed=None, outcome="parse_failure")
+        self._record(stage, "parse_error")
+        return _Result(ok=False, parsed=None, outcome="parse_error")
 
     def call_agentic(self, stage, model_class, prompt, cwd, expect_json=True, **kw):
         sandbox = Path(cwd)
@@ -467,8 +467,8 @@ class ScriptedLLM:
             self._record(stage, outcome, error)
             return _Result(ok=False, parsed=None, outcome=outcome, error=error)
         if not self.mine_responses:
-            self._record(stage, "parse_failure")
-            return _Result(ok=False, parsed=None, outcome="parse_failure")
+            self._record(stage, "parse_error")
+            return _Result(ok=False, parsed=None, outcome="parse_error")
         self._record(stage, "ok")
         return _Result(ok=True, parsed=self.mine_responses.pop(0))
 

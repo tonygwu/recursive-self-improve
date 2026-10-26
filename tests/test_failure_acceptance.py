@@ -124,6 +124,40 @@ def test_report_explains_all_prd_classes_and_keeps_recorded_suffixes(tmp_path):
     assert 'failed to launch' in text
 
 
+GATE_CALL = 'gate_call_failed:spawn_error'
+GATE_CALL_NAME = 'The eval-generation call never produced an answer'
+
+
+def test_a_gate_call_failure_is_explained_by_its_outcome_not_as_an_exception_class(tmp_path):
+    """BL-19 review: `gate_call_failed:spawn_error` matched only the generic
+    `gate_` copy, which says the suffix records an exception class. The
+    suffix is a call outcome, and "the CLI would not start" was lost."""
+    from self_improve.failure_presentation import FAILURE_COPY, failure_copy
+    from tests.test_report import _run_with_stats
+
+    copy = failure_copy(GATE_CALL)
+    assert copy['name'] == GATE_CALL_NAME
+    assert 'failed to launch' in copy['explanation']
+    assert 'exception' not in copy['explanation']
+    # An outcome with no copy of its own keeps the family words and adds nothing.
+    assert failure_copy('gate_call_failed:invented_outcome') == FAILURE_COPY['gate_call_failed']
+
+    stats = {'run_id':'gated', 'apply':{'attempted':0, 'applied':0, 'held':0, 'failed':0,
+                                        'taxonomy':{GATE_CALL:2}}}
+    with closing(Store(tmp_path/'state.db')) as store:
+        store.insert('runs', {'id':'gated', 'started':'2030-01-01T00:00:00Z', 'status':'degraded',
+                              'stats_json':json.dumps(stats)})
+        store.commit()
+        causes = next(s for s in run_data.detail(store, 'gated')['stages'] if s['name']=='apply')['causes']
+        assert [(r['class'], r['kind'], r['name']) for r in causes] == [(GATE_CALL, 'failure', GATE_CALL_NAME)]
+        panel = q.failure_panel(store)
+        row = next(r for key in ('open', 'quiet') for r in panel[key] if r['class']==GATE_CALL)
+        assert row['name'] == GATE_CALL_NAME and 'failed to launch' in row['explanation']
+    text = _run_with_stats(tmp_path/'report', stats)
+    assert GATE_CALL_NAME in text and 'failed to launch' in text
+    assert 'The gate stage raised' not in text
+
+
 def test_actual_renderer_exposes_fix_evidence_and_excludes_old_recurrence_from_current_health(tmp_path):
     from self_improve.dashboard import app
     from tests.spa_assets import copy_spa_dependencies

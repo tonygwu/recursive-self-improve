@@ -25,6 +25,12 @@ gate budgets are separate. Review-only holds instruction changes; removing that
 flag does not grant automatic-class consent. Do not use `run --dry-run` as a
 read-only rehearsal because it writes scan and incident state.
 
+Name where approved edits are written with the optional `[targets]` table in the
+same private config. Delivery paths can differ from the files an agent loads, for
+example when a loaded file is a symlink into a checkout that automation must not
+write. See [delivery targets](TARGETS.md) and the
+[example configuration](../examples/config.example.toml).
+
 For a disposable demonstration:
 
 ```sh
@@ -100,6 +106,12 @@ uv run selfimprove --config /absolute/private/config.toml service delivery unins
 Installation records the selected config, database, uv executable and runtime PATH.
 A missing database, a pending upgrade or a changed database selection prevents
 startup. Registration alone does not prove the worker is healthy.
+
+## Optional gated deployment
+
+If you run the nightly pipeline from a separate production checkout,
+`ops/deploy-prod.sh` can fast-forward it only after the full suite passes and no
+migration is pending. Nothing installs it for you. See [gated deployment](DEPLOYMENT.md).
 
 ## Native session reports
 

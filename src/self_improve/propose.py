@@ -24,7 +24,8 @@ Construction rules:
   (``paths:`` globs) + the marker-tagged bullet; action ``new_rule_file``
   diffs it against empty content, mirroring ``new_skill``.
 
-- Global budget guard: an add aimed at ``cfg.global_claude_md`` whose current
+- Global budget guard: an add aimed at the global delivery target
+  (``cfg.delivery_path("global_claude_md")``) whose current
   content is at/over ``cfg.global_claude_md_line_budget`` lines is demoted to
   a ``new_skill`` proposal, with the demotion reason recorded on the proposal.
 
@@ -33,10 +34,14 @@ Construction rules:
   on this fail-loud behavior; there is no fuzz).
 
 Newline convention (recorded, never silent): diffs are line-based; applied
-content is always ``'\\n'``-joined and newline-terminated when non-empty. If a
-target file lacked a trailing newline, the proposal records
-``normalized_trailing_newline: True`` — the one byte-level normalization this
-module performs.
+content is always ``'\\n'``-joined and newline-terminated when non-empty.
+``apply_unified_diff`` therefore refuses a non-empty target that lacks a
+final newline (:class:`UnsupportedLineEndings`). Adding one would change a
+byte outside the reviewed lines, even for an edit in the middle of the file.
+A proposal built against such a target records
+``normalized_trailing_newline: True`` so the refusal is visible early. Only
+the recomputation of a retained record opts out; it reproduces the newline an
+earlier applier added.
 """
 
 from __future__ import annotations
@@ -149,6 +154,9 @@ def append_learned_rule(content: str, bullet: str) -> str:
             new_lines = lines[:insert_at] + [bullet] + lines[insert_at:]
         else:
             # Empty section: normalize its body to one blank line + bullet.
+            # No blank line is added before a following heading: the next
+            # rule would go between the bullet and that blank line, and
+            # rollback of this rule could no longer find its inserted block.
             new_lines = lines[: header_idx + 1] + ["", bullet] + lines[end:]
     return "\n".join(new_lines) + "\n"
 
@@ -248,7 +256,50 @@ def make_unified_diff(old: str, new: str, path: str) -> str:
     return "\n".join(diff_lines) + "\n"
 
 
-def apply_unified_diff(content: str, diff: str) -> str:
+class UnsupportedLineEndings(PatchConflict):
+    """The target uses line boundaries that a delivered edit would rewrite.
+
+    ``problem`` says what the target holds and ``fix`` says how to change
+    the file. The message tells the reader to fix the file first, which is
+    right when no delivery is prepared. A caller that refuses a prepared
+    delivery words its own order from these two parts, because there the
+    cancel must come before the fix (apply._refuse_rewritten_forward_record).
+    """
+
+    def __init__(self, problem: str, fix: str):
+        super().__init__(f"{problem}; {fix} first")
+        self.problem = problem
+        self.fix = fix
+
+
+# Every line boundary str.splitlines() honours besides "\n". The applier
+# splits and rejoins with "\n", so a target containing any of these would come
+# back with bytes changed outside the reviewed hunk. Refuse it by name instead.
+_REWRITTEN_BOUNDARIES = ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+
+
+def _refuse_rewritten_boundaries(content: str) -> None:
+    found = [c for c in _REWRITTEN_BOUNDARIES if c in content]
+    if found:
+        names = ", ".join(repr(c)[1:-1] for c in found)
+        raise UnsupportedLineEndings(
+            f"target contains line boundaries that applying this edit would rewrite "
+            f"to \\n ({names})",
+            "convert the file to LF line endings",
+        )
+    # The result is always newline-terminated, so a missing final newline
+    # would be added outside the reviewed lines. Refuse rather than preserve:
+    # retained records were written with the newline added, and one
+    # recomputation rule must keep describing all of them.
+    if content and not content.endswith("\n"):
+        raise UnsupportedLineEndings(
+            "target does not end with a newline, so applying this edit would add a "
+            "final newline outside the reviewed lines",
+            "add a final newline to the file",
+        )
+
+
+def apply_unified_diff(content: str, diff: str, *, refuse_rewritten_boundaries: bool = True) -> str:
     """Strictly apply ``diff`` (as produced by make_unified_diff) to ``content``.
 
     Every context and delete line must match the source exactly, hunks must be
@@ -257,7 +308,18 @@ def apply_unified_diff(content: str, diff: str) -> str:
 
     Returned content is '\\n'-joined and newline-terminated when non-empty
     (see the module-level newline convention).
+
+    By default, content whose line boundaries the result would rewrite is
+    refused with :class:`UnsupportedLineEndings`. Pass
+    ``refuse_rewritten_boundaries=False`` only to recompute a retained record
+    from its own retained before-content.
     """
+    # Refusal is the default, so a new preview, combination or delivery cannot
+    # forget it. The only opt-outs (delivery_records.validated_delivery and
+    # rollback._application_source) recompute what an earlier applier already
+    # wrote. Refusing there would make that retained history unreadable.
+    if refuse_rewritten_boundaries:
+        _refuse_rewritten_boundaries(content)
     dlines = diff.splitlines()
     if not dlines:
         raise PatchConflict("empty diff")
@@ -401,7 +463,7 @@ def build_proposal(
     demotion_reason = ""
 
     # --- global line-budget guard (adds only) ---
-    if action == "add" and target == Path(cfg.global_claude_md):
+    if action == "add" and target == Path(cfg.delivery_path("global_claude_md")):
         n_lines = len(current_content.splitlines())
         if n_lines >= cfg.global_claude_md_line_budget:
             demotion_reason = (
@@ -462,7 +524,7 @@ def build_proposal(
     proposal["diff_unified"] = make_unified_diff(current_content, new_content, str(target))
     if current_content and not current_content.endswith("\n"):
         proposal["normalized_trailing_newline"] = True
-        note = "target lacked a trailing newline; applied content is newline-terminated"
+        note = "target lacks a trailing newline; delivery is refused until the file ends with one"
         proposal["note"] = f"{proposal['note']}; {note}" if proposal["note"] else note
     return proposal
 
@@ -536,7 +598,7 @@ def build_edit_proposal(
     if current_content and not current_content.endswith("\n"):
         proposal["normalized_trailing_newline"] = True
         proposal["note"] += (
-            "; target lacked a trailing newline; applied content is "
-            "newline-terminated"
+            "; target lacks a trailing newline; delivery is refused until "
+            "the file ends with one"
         )
     return proposal

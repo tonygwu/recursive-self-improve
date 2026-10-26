@@ -201,6 +201,12 @@ def _classify_headless(originator: object, source: object) -> tuple[bool, bool]:
     return headless, is_subagent
 
 
+# Session sources whose headless classification was decided from observed
+# rollouts. Anything else (mcp, internal, a future value) keeps the
+# interactive default but is counted as session_meta_unknown_source.
+_CLASSIFIED_SOURCES = frozenset({"cli", "vscode", "exec"})
+
+
 def _source_label(source: object) -> str:
     """Flatten the string-or-object source union to a short label for meta."""
     if isinstance(source, str):
@@ -208,6 +214,54 @@ def _source_label(source: object) -> str:
     if isinstance(source, dict):
         return "subagent" if "subagent" in source else json.dumps(source, ensure_ascii=False)
     return repr(source)
+
+
+def _prefix_state(file_path: str, end_offset: int, denylist=()) -> tuple[dict, int]:
+    """Session state in force at ``end_offset``, and the lines before it.
+
+    Replays only the transitions ``_parse_inner`` makes on ``session_meta`` and
+    ``turn_context`` records; other lines are counted but not decoded.
+    """
+    state = {"session_id": "", "cwd": "", "headless": False,
+             "is_subagent": False, "identity_known": False, "denylisted": False}
+    lines = 0
+    remaining = end_offset
+    with open(file_path, "rb") as fh:
+        for raw in fh:
+            if remaining <= 0:
+                break
+            remaining -= len(raw)
+            if not raw.endswith(b"\n"):
+                break
+            lines += 1
+            if b"session_meta" not in raw and b"turn_context" not in raw:
+                continue
+            try:
+                d = _loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            payload = d.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            new_cwd = payload.get("cwd")
+            valid_cwd = new_cwd if isinstance(new_cwd, str) and Path(new_cwd).is_absolute() else ""
+            if d.get("type") == "session_meta":
+                sid = payload.get("session_id") or payload.get("id")
+                if not isinstance(sid, str) or not sid.strip():
+                    # _parse_inner keeps the previous denylist state here.
+                    state.update(session_id="", cwd="", identity_known=False)
+                    continue
+                headless, is_subagent = _classify_headless(
+                    payload.get("originator"), payload.get("source"))
+                state.update(session_id=str(sid), cwd=valid_cwd, headless=headless,
+                             is_subagent=is_subagent, identity_known=True,
+                             denylisted=any(s in valid_cwd for s in denylist))
+            elif d.get("type") == "turn_context":
+                state["cwd"] = valid_cwd
+                state["denylisted"] = any(s in valid_cwd for s in denylist) if valid_cwd else False
+    return state, lines
 
 
 class CodexSource:
@@ -306,6 +360,18 @@ class CodexSource:
         Stats for the consumption are on self.parse_stats (created
         eagerly, filled as the returned iterator is drained).
         """
+        identity_known = resume_state is not None
+        if start_offset > 0 and resume_state is None:
+            # A mid-file resume starts after the session_meta and turn_context
+            # records that set the session, cwd and headless state. Without
+            # them, a codex exec session's later prompts read as human text and
+            # a denylisted turn cwd is forgotten. Rebuild that state from the
+            # prefix, together with the absolute line count.
+            resume_state, prefix_lines = _prefix_state(
+                file_path, start_offset, self.config.denylist_substrings)
+            identity_known = bool(resume_state.pop("identity_known"))
+            if start_line == 0:
+                start_line = prefix_lines
         stats = CodexParseStats()
         stats.bytes_consumed = start_offset
         stats.last_line_no = start_line
@@ -320,7 +386,8 @@ class CodexSource:
             cwd=str(state.get("cwd", "")),
             headless=bool(state.get("headless", False)),
             is_subagent=bool(state.get("is_subagent", False)),
-            identity_known=resume_state is not None,
+            identity_known=identity_known,
+            denylisted=bool(state["denylisted"]) if "denylisted" in state else None,
             record_lines=record_lines,
         )
 
@@ -336,10 +403,14 @@ class CodexSource:
         headless: bool,
         is_subagent: bool,
         identity_known: bool = False,
+        denylisted: bool | None = None,
         record_lines: bool = False,
     ) -> Iterator[TurnEvent]:
         denylist = self.config.denylist_substrings
-        denylisted = any(s in cwd for s in denylist) if cwd else False
+        # A replayed prefix supplies the state its transitions produced; it can
+        # differ from the cwd alone after a session_meta that had no id.
+        if denylisted is None:
+            denylisted = any(s in cwd for s in denylist) if cwd else False
         # call_id -> tool name, for matching outputs to their calls.
         call_names: dict[str, str] = {}
         pos = start_offset
@@ -462,6 +533,12 @@ class CodexSource:
                         originator = payload.get("originator")
                         source_val = payload.get("source")
                         headless, is_subagent = _classify_headless(originator, source_val)
+                        # Old archived rollouts carry no source field at all.
+                        # Only a string can be a classified source; an object or
+                        # list is unhashable, so test the type before membership.
+                        classified = isinstance(source_val, str) and source_val in _CLASSIFIED_SOURCES
+                        if source_val is not None and not is_subagent and not classified:
+                            stats.malformed_taxonomy["session_meta_unknown_source"] += 1
                         if record_lines:
                             from ..session_context import native_context
                             context = native_context("creation", payload)

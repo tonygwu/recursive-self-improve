@@ -1,5 +1,6 @@
 """Recovery requests generate one explicit manual-review proposal, never delivery."""
 import json
+import re
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,12 @@ from self_improve.llm import LLMRunner, _ExecResult
 from self_improve.store import Store,new_id
 from tests.test_apply import cfg,store
 from tests.test_miner_agentic import seed_learning
+
+@pytest.fixture(autouse=True)
+def _fresh_option_caches(monkeypatch):
+    # The options caches are module-level; never let one test's entries reach another.
+    monkeypatch.setattr(recovery_jobs,'_identity_caches',{'store':None,'at':None,'path_cache':{},'cache':{},'destinations':{}})
+
 
 @pytest.fixture
 def env(cfg,store,tmp_path,monkeypatch):
@@ -24,7 +31,9 @@ def env(cfg,store,tmp_path,monkeypatch):
             value={'supported':True,'explanation':'Block an invented unsafe command.','hook':{'event':'PreToolUse','matcher':'Bash','command':'case "$x" in forbidden) exit 2;; esac','timeout':10}}
         else:
             current=source['base']['content'];old='Human footer.' if 'Human footer.' in current else ''
-            value={'supported':True,'explanation':'Put this lesson at the selected destination.','edits':[{'old':old,'new':old+'\n- Inspect the original request identifier before retrying. <!-- si:'+learning['id']+' -->\n'}]}
+            # Like a real model, take the marker's ID from the prompt itself.
+            lid=re.search(r'LEARNING ID: ([0-9a-f]{32})\n',prompt).group(1)
+            value={'supported':True,'explanation':'Put this lesson at the selected destination.','edits':[{'old':old,'new':old+'\n- Inspect the original request identifier before retrying. <!-- si:'+lid+' -->\n'}]}
         return _ExecResult(ok=True,text=json.dumps(value),parsed=value,outcome='ok',provider='claude',model_reported='claude-opus-4-6')
     monkeypatch.setattr(LLMRunner,'_execute',execute)
     return cfg,store,learning,calls
@@ -267,3 +276,122 @@ def test_recovery_from_review_supersedes_only_its_selected_old_proposal(env,mode
     assert result['state']=='completed',result
     assert [store.query_one('SELECT status FROM proposals WHERE id=?',(pid,))['status'] for pid in ids]==['superseded','pending','approved_user','applied']
     assert result['result']['superseded_proposal_ids']==[ids[0]]
+
+
+def test_correct_target_can_edit_an_existing_skill_in_the_delivery_folder(env,tmp_path):
+    cfg,store,learning,calls=env
+    clone=tmp_path/'clone-skills';existing=clone/'fixture-skill'/'SKILL.md';existing.parent.mkdir(parents=True)
+    body='---\nname: fixture-skill\ndescription: x\n---\n# Fixture\n\nHuman footer.\n';existing.write_text(body)
+    loaded=Path(cfg.skills_dir)/'loaded-only'/'SKILL.md';loaded.parent.mkdir(parents=True);loaded.write_text('# Loaded\n')
+    cfg=replace(cfg,targets=(('skills_dir',str(clone)),))
+    opts=recovery_jobs.options(store,cfg,learning['id'])
+    labels={t['label']:t for t in opts['targets']}
+    target=labels['Existing skill · fixture-skill']
+    assert target['destination']['target_path']==str(existing) and 'correct_target' in target['modes']
+    assert not any(t['destination']['target_path']==str(loaded) for t in opts['targets'])
+    args={'learning_id':learning['id'],'mode':'correct_target','target_id':target['id'],'proposal_ids':[]}
+    shown=recovery_jobs.preview(store,cfg,**args)
+    submit_command(store,cfg,{'action':'propose_recovery',**args,'preview_revision':shown['revision'],'request_key':new_id()})
+    result=job_worker.run_once(store,cfg)
+    assert result['state']=='completed',(result['error_code'],result['error_detail'])
+    row=store.query_one('SELECT * FROM proposals WHERE id=?',(result['result']['proposal_id'],))
+    assert (row['target_kind'],row['target_path'],row['action'])==('skill',str(existing),'recover_rule')
+    assert 'si:'+learning['id'] in row['diff_unified'] and existing.read_text()==body
+
+
+def test_an_existing_skill_missing_from_the_delivery_base_is_not_offered_as_an_edit(env,tmp_path):
+    from tests.test_apply import init_git_repo,run_git
+    cfg,store,learning,_=env
+    clone=init_git_repo(tmp_path/'clone','README.md','# clone\n')
+    tracked=clone/'skills'/'tracked'/'SKILL.md';tracked.parent.mkdir(parents=True)
+    tracked.write_text('---\nname: tracked\n---\nHuman footer.\n')
+    run_git(['add','--','skills/tracked/SKILL.md'],clone);run_git(['commit','-q','-m','tracked skill'],clone)
+    untracked=clone/'skills'/'untracked'/'SKILL.md';untracked.parent.mkdir(parents=True)
+    untracked.write_text('---\nname: untracked\n---\nHuman footer.\n')
+    cfg=replace(cfg,targets=(('skills_dir',str(clone/'skills')),))
+    opts=recovery_jobs.options(store,cfg,learning['id'])
+    labels={t['label'] for t in opts['targets']}
+    assert 'Existing skill · tracked' in labels and 'Existing skill · untracked' not in labels
+    assert any(u.get('target_path')==str(untracked) and 'delivery base' in u['detail'] for u in opts['unavailable'])
+
+
+def test_excluded_folders_are_never_offered_as_new_destinations(env,tmp_path):
+    cfg,store,learning,_=env
+    cloud=tmp_path/'Cloud';(cloud/'skills'/'fx').mkdir(parents=True)
+    (cloud/'skills'/'fx'/'SKILL.md').write_text('# fx\n');(cloud/'private.md').write_text('# p\n')
+    cfg=replace(cfg,instruction_excluded_dirs=(str(cloud),),
+                targets=(('global_private',str(cloud/'private.md')),('skills_dir',str(cloud/'skills'))))
+    opts=recovery_jobs.options(store,cfg,learning['id'])
+    assert not any(t['destination']['target_path'].startswith(str(cloud)) for t in opts['targets'])
+    causes={u.get('target_path'):u['detail'] for u in opts['unavailable']}
+    assert 'instruction_excluded_dirs' in causes[str(cloud/'private.md')]
+
+
+def test_repeated_options_reads_reuse_project_identity_within_the_interval(env,tmp_path,monkeypatch):
+    from tests.test_apply import init_git_repo,run_git
+    from tests.test_miner_agentic import seed_incident
+    from self_improve import project_identity
+    cfg,store,learning,_=env
+    # No remote: a git-root identity is cacheable, while a failed gh lookup is
+    # deliberately retried on every read (tested separately).
+    repo=init_git_repo(tmp_path/'project'/'repo-0','AGENTS.md','original\n')
+    incident=seed_incident(store,str(tmp_path/'absent.jsonl'),project=str(repo))
+    key=project_identity.resolve(str(repo)).key
+    store.conn.execute('UPDATE sessions SET project_key=? WHERE file_path=?',(key,incident['session_file']));store.commit()
+    git_calls=[];real=project_identity._run_git
+    monkeypatch.setattr(project_identity,'_run_git',lambda *a:git_calls.append(a) or real(*a))
+    resolved=[];real_dest=recovery_jobs.resolve_destination
+    monkeypatch.setattr(recovery_jobs,'resolve_destination',lambda *a:resolved.append(a[1]) or real_dest(*a))
+    first=recovery_jobs.options(store,cfg,learning['id'])
+    after_first=len(git_calls);assert after_first>0
+    destinations_first=len(resolved);assert destinations_first>0
+    second=recovery_jobs.options(store,cfg,learning['id'])
+    assert len(git_calls)==after_first, 'a second read inside the interval re-ran identity git calls'
+    assert len(resolved)==destinations_first, 'a second read inside the interval re-resolved candidate destinations'
+    assert first['unavailable']==second['unavailable']
+    assert [t['id'] for t in first['targets']]==[t['id'] for t in second['targets']]
+    monkeypatch.setattr(recovery_jobs,'IDENTITY_CACHE_SECONDS',-1)
+    recovery_jobs.options(store,cfg,learning['id'])
+    assert len(git_calls)>after_first, 'an expired interval must verify identity again'
+
+
+def test_a_cached_refusal_raises_a_fresh_exception_with_the_same_cause(env,tmp_path,monkeypatch):
+    import sys
+    cfg,store,learning,_=env
+    calls=[]
+    def refuse(cfg_,path,kind):
+        calls.append(path);raise FileNotFoundError(2,'gone',path)
+    monkeypatch.setattr(recovery_jobs,'resolve_destination',refuse)
+    errors=[]
+    for _ in range(3):
+        try:recovery_jobs._candidate_destination(store,cfg,str(tmp_path/'x.md'),'global_claude_md')
+        except Exception as exc:errors.append(exc)
+    assert len(calls)==1 and len(errors)==3
+    assert len({id(e) for e in errors})==3, 'a cached refusal must not re-raise one shared object'
+    assert len({(type(e).__name__,str(e)) for e in errors})==1
+    depth=lambda e:sum(1 for _ in iter(lambda t=[e.__traceback__]:(t.append(t[-1].tb_next) or t[-2]) if t[-1] else None,None))
+    assert depth(errors[0])==depth(errors[2]), 'the traceback grew across reads'
+
+
+def test_a_failed_github_lookup_is_retried_on_the_next_read(env,monkeypatch):
+    from self_improve.project_identity import ProjectIdentity,METHOD_REMOTE_URL
+    cfg,store,learning,_=env
+    memo=recovery_jobs._fresh_caches(store)
+    weak=ProjectIdentity('remote:example.invalid/x','x',METHOD_REMOTE_URL)
+    memo['cache']['example.invalid/x']=weak;memo['path_cache']['/some/clone']=weak
+    recovery_jobs._identity_resolver(store)
+    assert 'example.invalid/x' not in memo['cache'] and '/some/clone' not in memo['path_cache']
+
+
+def test_the_model_receives_the_learning_id_it_must_write_in_the_marker(env):
+    # Learning IDs are 32-hex UUIDs, which the high-entropy redaction rule
+    # removes. The prompt must still carry the exact ID for si:<learning_id>.
+    cfg,store,learning,calls=env
+    assert len(learning['id'])==32 and set(learning['id'])<=set('0123456789abcdef')
+    submit_command(store,cfg,request(env))
+    result=job_worker.run_once(store,cfg)
+    assert result['state']=='completed',(result['error_code'],result['error_detail'])
+    (prompt,)=calls
+    assert f'LEARNING ID: {learning["id"]}\n' in prompt
+    frozen=prompt.split('\nFROZEN INPUT\n')[1]
+    assert learning['id'] not in frozen  # the frozen evidence itself stays redacted

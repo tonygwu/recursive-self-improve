@@ -5,12 +5,58 @@ only while their source transcripts remain available. Transcript retention can
 delete those sources. An archived ``window_json`` can then be the only surviving
 evidence, and a rescan cannot recover it.
 
-The rebuild preserves sessions with missing transcripts and their incidents.
-It requires a new private backup directory outside Git. It writes and verifies
-the retained evidence before deletion, with all database changes in one transaction.
+The rebuild preserves sessions whose transcripts a rescan cannot replay, and
+their incidents. It requires a new private backup directory outside Git. It
+writes and verifies the retained evidence before deletion, with all database
+changes in one transaction.
+
+A transcript is unchanged when every line hash retained in ``scan_lines``
+(active and superseded rows, under every compatibility key) still matches the
+bytes at its recorded range. Superseded rows survive ordinary scans, so a file
+that was truncated or replaced stays detectable after the nightly rescans it.
+Rebuild reads transcript bytes only to hash them; it stores no content.
+
+Matching hashes prove only that the hashed bytes are unchanged. They say
+nothing about bytes no scan hashed. An incident is verified when a
+``produced`` row in ``scan_incident_links`` names the observation that
+created it. That observation hashed every byte it read, in the same
+transaction, and the check above compares those hashes with the file.
+An incident mined before migration 0022 has no such row. A later scan
+of a truncated or replaced file hashes only the new bytes, and a later
+``corroborated`` link shows only that the trigger line survived, not its
+context. So a session with any unverified incident is kept. On a database
+without migration 0022 no link exists, so every session that holds an
+incident is kept.
+
+The scanner never links a cross-session ``repeated_error`` promotion, so
+every promotion is unverified and keeps its anchor session. A rescan cannot
+be relied on to make the promotion again: it promotes only while enough
+sessions still hold the error, and a truncated member transcript or a
+truncated legacy anchor can leave too few. Keeping the anchor costs a
+rebuild of that session even when every transcript is unchanged.
+
+The rule also keeps an incident whose bytes a scan did hash but could not
+link. The scanner links an incident only when exactly one occurrence and
+one incident share its signal and raw timestamp. When several share them,
+the observation adds those incidents to ``incident_links_ambiguous``. An
+incident whose key matches no occurrence of that scan, for example because
+the detector supplied no candidates, gets no link and no count. So that
+counter is not a count of what this rule keeps. Keeping these incidents
+costs a rebuild. A possible later refinement could verify one through its
+``run_id``: the scan run that inserted it also measured the same file in the
+same transaction, and a complete observation from that run hashed the bytes
+it read. That join exists in the schema, but rebuild does not use it yet.
+
+A session with no incident to verify and no retained line hashes for its
+scanned bytes (scanned before migration 0022, or by a source without line
+records) is decided by existence and size alone, and the report counts it as
+``sessions_without_line_identity``.
 
 What is kept:
-  - sessions without readable regular transcripts and their incident windows
+  - sessions whose transcripts are unreadable, shorter than their scanned
+    bytes, or changed under a retained line hash, or that hold an unverified
+    incident (every promotion's anchor among them), with their incident
+    windows, error fingerprints and complete scan projections
   - command/evaluation/application history and its connected source evidence
 
 What goes:
@@ -26,7 +72,9 @@ What is never touched:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
+import hashlib
 import stat
 import os
 
@@ -69,32 +117,147 @@ def _transcript_exists(file_path: str | None) -> bool:
     return _transcript_version(file_path) is not None
 
 
-def _orphaned_sessions(store: Store, exists=_transcript_exists) -> list[dict]:
-    """Preserve when a readable regular transcript cannot be established."""
-    return [dict(r) for r in store.query('SELECT * FROM sessions') if not exists(r['file_path'])]
+#: Why a rescan cannot regenerate a session's evidence.
+UNREADABLE = "unreadable"  # missing, not a regular file, or a failed read
+SHORTER_THAN_SCANNED = "shorter_than_scanned"
+CONTENT_CHANGED = "content_changed"  # a retained line hash no longer matches
+#: An incident with no ``produced`` scan link, so no retained hash covers its bytes.
+UNVERIFIED_INCIDENT = "unverified_incident"
+
+
+def _unverified_incident_files(store: Store, has_scan: bool) -> set[str]:
+    """Session files holding an incident that no scan observation produced.
+
+    The scanner records a ``produced`` link in the same transaction as the
+    line hashes of the bytes it read, and no code path deletes those lines
+    while it keeps the link. So that link is what ties an incident to
+    retained hashes. The scanner never links a cross-session
+    ``repeated_error`` promotion, so every promotion is unverified and keeps
+    its anchor session. Before migration 0022 no link table exists, so every
+    incident is unverified.
+    """
+    produced = (" WHERE NOT EXISTS (SELECT 1 FROM scan_incident_links l "
+                "WHERE l.incident_id = i.id AND l.link_kind = 'produced')") if has_scan else ""
+    return {r["session_file"] for r in store.query(
+        "SELECT DISTINCT i.session_file FROM incidents i" + produced)}
+
+
+def _retained_lines(store: Store, file_path: str) -> list[tuple[int, int, str]]:
+    """Every distinct retained line range and hash recorded for this path."""
+    return [(r["byte_start"], r["byte_end"], r["line_sha256"]) for r in store.query(
+        "SELECT DISTINCT byte_start, byte_end, line_sha256 FROM scan_lines WHERE transcript_id IN "
+        "(SELECT DISTINCT transcript_id FROM scan_observations WHERE session_file = ?) "
+        "ORDER BY byte_start, byte_end, line_sha256", (file_path,))]
+
+
+def _covered_prefix(lines: list[tuple[int, int, str]]) -> int:
+    """End of the contiguous byte range from 0 that retained hashes cover."""
+    covered = 0
+    for start, end, _ in lines:
+        if start > covered:
+            break
+        covered = max(covered, end)
+    return covered
+
+
+def _inspect_transcript(file_path: str | None, lines: list[tuple[int, int, str]]):
+    """Return (version, matches) from one open of a readable regular file.
+
+    ``version`` is None when no readable regular file is at the path, or a read
+    fails. ``matches`` is False when any retained range is short or hashes
+    differently. The version comes from before the read; rebuild compares it
+    again after the backup, so a file that changes later is refused there.
+    """
+    if not (file_path or '').strip():
+        return None, False
+    fd = None
+    try:
+        fd = os.open(file_path, os.O_RDONLY | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, False
+        version = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        for start, end, digest in lines:
+            if end > info.st_size:
+                return version, False
+            data = os.pread(fd, end - start, start)
+            if len(data) != end - start or hashlib.sha256(data).hexdigest() != digest:
+                return version, False
+        return version, True
+    except OSError:
+        return None, False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _unrebuildable_sessions(store: Store, has_scan: bool, versions: dict) -> tuple[list[dict], dict]:
+    """Sessions whose evidence a rescan cannot regenerate, and why.
+
+    A session is kept when its transcript is unreadable, shorter than its
+    recorded ``bytes_scanned``, or no longer matches a retained line hash.
+    The last check survives later scans, which supersede rather than delete
+    old line rows. A session is also kept when it holds an incident that no
+    retained hash vouches for (see the module docstring). ``versions``
+    receives each path's metadata for the post-backup change check. A session
+    with no incident to verify and no complete retained line hashes for its
+    scanned bytes is decided by existence and size alone and counted.
+    """
+    kept: list[dict] = []
+    reasons: dict[str, int] = {}
+    without_identity = 0
+    unverified = _unverified_incident_files(store, has_scan)
+    for row in store.query('SELECT * FROM sessions'):
+        path = row['file_path']
+        lines = _retained_lines(store, path) if has_scan and (path or '').strip() else []
+        version, matches = _inspect_transcript(path, lines)
+        versions[path] = version
+        scanned = int(row['bytes_scanned'] or 0)
+        if version is None:
+            reason = UNREADABLE
+        elif version[2] < scanned:
+            reason = SHORTER_THAN_SCANNED
+        elif not matches:
+            reason = CONTENT_CHANGED
+        elif path in unverified:
+            reason = UNVERIFIED_INCIDENT
+        else:
+            reason = ''
+            without_identity += _covered_prefix(lines) < scanned
+        if reason:
+            kept.append(dict(row))
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return kept, {'unrebuildable_sessions': reasons,
+                  'sessions_without_line_identity': without_identity}
 
 
 def _marks(values) -> str:
     return ", ".join("?" for _ in values)
 
 
-def _scan_retention(store: Store, orphan_files: set[str], history_files: set[str], exists=_transcript_exists,
+def _scan_retention(store: Store, orphan_files: set[str], history_files: set[str],
+                    unrebuildable_files: set[str], exists=_transcript_exists,
                     measurement_scan_ids=()) -> dict:
     """Split scan measurement rows into rebuildable and unrecoverable.
 
     Observations and manifests are an audit ledger, like ``runs``, and are
     never deleted. Active and historical line/occurrence projections of a
     surviving transcript are rebuilt by rescanning it. A transcript is
-    preserved when none of its recorded paths still exists, because nothing
-    can regenerate its projection. An incident link survives only with its
-    incident. An applied migration with a missing table raises a named error.
+    preserved when none of its recorded paths still exists, or when any of
+    them belongs to an unrebuildable session, because nothing can regenerate
+    its projection. This is the same set that keeps sessions and incidents.
+    An incident link survives only with its incident. An applied migration
+    with a missing table raises a named error.
     """
     from .scan_observations import require_schema
 
     require_schema(store)
     paths = store.query("SELECT id, transcript_id, session_file FROM scan_observations")
-    live = {r["transcript_id"] for r in paths if exists(r["session_file"])}
-    orphans = sorted({r["transcript_id"] for r in paths} - live)
+    recorded: dict[str, set[str]] = defaultdict(set)
+    for r in paths:
+        recorded[r["transcript_id"]].add(r["session_file"])
+    orphans = sorted(t for t, files in recorded.items()
+                     if files & unrebuildable_files or not any(exists(f) for f in files))
     preserved = sorted(set(orphans) | {r['transcript_id'] for r in paths
                        if r['session_file'] in history_files or r['id'] in measurement_scan_ids})
     orphan_set = set(preserved)
@@ -141,10 +304,16 @@ def _scan_retention(store: Store, orphan_files: set[str], history_files: set[str
 
 
 def _scan_export(store: Store, scan: dict) -> dict:
-    """All scan provenance plus the projections only deleted transcripts produced.
+    """All scan provenance plus the projections of ``scan["orphan_transcripts"]``.
 
-    Projections of surviving transcripts are not exported: a rescan rebuilds
-    them, and they can be large.
+    Those are the transcripts whose recorded paths are all gone, and the
+    transcripts of every unrebuildable session (see _unrebuildable_sessions).
+    Such a session's transcript can still be readable: its bytes changed, or
+    it holds an unverified incident. The stats' ``retention`` splits those
+    sessions into readable and unreadable. Projections of other surviving
+    transcripts are not exported: a rescan rebuilds them, and they can be
+    large. The caller also passes the history-pinned set under this key to
+    export ``execution_scan_projections``.
     """
     orphans = scan["orphan_transcripts"]
     marks = _marks(orphans)
@@ -227,19 +396,6 @@ def rebuild_state(
 def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, reason: str) -> dict:
     """Read, export, verify, and delete under the caller's owned transaction."""
 
-    transcript_versions = {}
-    def exists(path):
-        if path not in transcript_versions:
-            transcript_versions[path] = _transcript_version(path)
-        return transcript_versions[path] is not None
-    orphan_sessions = _orphaned_sessions(store, exists)
-    orphan_files = {s["file_path"] for s in orphan_sessions}
-    orphan_incidents = [
-        dict(r)
-        for r in store.query("SELECT * FROM incidents")
-        if r["session_file"] in orphan_files
-    ]
-
     # Older databases can be previewed without migrating. An applied migration
     # with a missing table must still fail; do not hide schema corruption.
     from .mining_history import MIGRATION as MINING_HISTORY_MIGRATION
@@ -251,6 +407,20 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
     if has_scan:
         from .scan_observations import require_schema
         require_schema(store)
+
+    transcript_versions = {}
+    def exists(path):
+        if path not in transcript_versions:
+            transcript_versions[path] = _transcript_version(path)
+        return transcript_versions[path] is not None
+    orphan_sessions, verification = _unrebuildable_sessions(store, has_scan, transcript_versions)
+    unreadable = verification['unrebuildable_sessions'].get(UNREADABLE, 0)
+    orphan_files = {s["file_path"] for s in orphan_sessions}
+    orphan_incidents = [
+        dict(r)
+        for r in store.query("SELECT * FROM incidents")
+        if r["session_file"] in orphan_files
+    ]
     from .rule_revisions import MIGRATION as AVAILABILITY_MIGRATION, TABLES as AVAILABILITY_TABLES, require_schema as require_availability
     has_availability = bool(store.query_one('SELECT name FROM schema_migrations WHERE name=?', (AVAILABILITY_MIGRATION,)))
     if has_availability:
@@ -280,7 +450,7 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
     source_keys = {t: keys | extras.get(t, set()) for t, keys in history['source_keys'].items()}
     kept_sessions = [r for r in history['rows']['sessions'] if (r['file_path'],) in source_keys['sessions']]
     kept_incidents = [r for r in history['rows']['incidents'] if (r['id'],) in source_keys['incidents']]
-    scan = _scan_retention(store, preserved_files, history_files, exists,
+    scan = _scan_retention(store, preserved_files, history_files, orphan_files, exists,
                            history['measurement_scan_ids']) if has_scan else None
     derived_tables=tuple(t for t in _DERIVED_TABLES if t!='mining_history' or has_history)
     counts = {
@@ -322,8 +492,13 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         },
         "would_delete" if dry_run else "deleted": counts,
         "export_path": str(export_path),
+        # Every kept session counts in orphaned_transcripts. Only the
+        # unreadable ones are deleted or unreachable; the others are on disk.
         'retention': {'orphaned_transcripts': len(orphan_sessions),
+                      'orphaned_transcripts_unreadable': unreadable,
+                      'orphaned_transcripts_readable': len(orphan_sessions) - unreadable,
                       'orphaned_incidents': len(orphan_incidents),
+                      **verification,
                       'execution_history': history['counts'], 'reasons': history['reasons'],
                       'measurement_scan_observations': sorted(history['measurement_scan_ids'])},
     }
@@ -337,9 +512,10 @@ def _rebuild_in_transaction(store: Store, export_path: Path, *, dry_run: bool, r
         stats["warning"] = (
             f"zero orphan sessions found across {total_sessions} sessions, so "
             "NOTHING will be preserved. That is correct if every transcript is "
-            "still on disk, and is also exactly what a failed orphan check "
-            "looks like. Confirm before running without --dry-run: any "
-            "incident whose transcript is already deleted cannot be recovered."
+            "readable and matches its retained line hashes, and a scan produced "
+            "every incident. It is also exactly what a failed orphan check "
+            "looks like. Confirm before running without --dry-run: an incident "
+            "whose transcript is gone or changed cannot be recovered."
         )
 
     if dry_run:

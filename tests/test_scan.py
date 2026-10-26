@@ -1111,3 +1111,58 @@ def test_a_real_scan_actually_checks_its_own_accounting(tmp_path, monkeypatch):
     assert calls, "scan_all finished without checking its own accounting"
     attempted, succeeded, failed = calls[-1]
     assert attempted == succeeded + failed == 2, calls
+
+
+def test_a_parent_and_its_subagent_are_one_session_for_promotion(tmp_path):
+    """BL-41: promotion counted DISTINCT session_file, so a transcript and its
+    subagents/agent-*.jsonl file counted as two sessions."""
+    from self_improve.config import Config
+    from self_improve.scan import ScanStats, _promote_repeated_errors
+    from self_improve.store import Store
+
+    store = Store(tmp_path / "s.db")
+    for path in ("/p/1111.jsonl", "/p/1111/subagents/agent-1.jsonl"):
+        store.upsert_session({"file_path": path, "source": "claude", "session_id": "1111", "project_path": "/p",
+            "headless": 0, "is_subagent": int("subagents" in path), "first_ts": "", "last_ts": "", "mtime": 1.0,
+            "file_size": 1, "bytes_scanned": 1, "lines_scanned": 1, "malformed_lines": 0, "status": "ok",
+            "error": "", "last_scanned_at": "2026-08-10T10:00:00Z"})
+        store.insert("error_fingerprints", {"fingerprint": "fp-x", "session_file": path, "session_id": "1111",
+                                            "project_path": "/p", "count_in_session": 3, "sample_text": "err",
+                                            "first_ts": "2026-08-10T10:00:00Z"})
+    store.commit()
+    stats = ScanStats()
+    _promote_repeated_errors(store, Config(), "run", stats)
+    assert store.query("SELECT id FROM incidents WHERE signal_type='repeated_error'") == []
+    store.close()
+
+
+def test_an_internal_failure_after_inserts_rolls_back_that_file_and_continues(tmp_path, monkeypatch):
+    """The generic handler for a scanner bug had no test. A failure after a
+    file's incidents were inserted must roll back that file's writes,
+    restore its stats, count it as scan_internal, and let the scan finish."""
+    from self_improve import scan as scan_mod
+
+    store = make_store(tmp_path)
+    bad, good = "/virtual/bad.jsonl", "/virtual/good.jsonl"
+    source = FakeSource({
+        bad: FakeFile(jline("CORRECT: first file", ts="2026-08-04T00:00:00Z", sid="sess-bad"), mtime=1.0),
+        good: FakeFile(jline("CORRECT: second file", ts="2026-08-04T00:00:00Z", sid="sess-ok"), mtime=1.0),
+    })
+    original = scan_mod._measure
+
+    def failing_measure(store_, cfg, source_, info, *args, **kwargs):
+        if info.file_path == bad:
+            raise RuntimeError("invented scanner bug")
+        return original(store_, cfg, source_, info, *args, **kwargs)
+
+    monkeypatch.setattr(scan_mod, "_measure", failing_measure)
+    stats = scan_all(store, CFG, [source], RUN_ID, detect_fn=fake_detect, build_window_fn=fake_window)
+
+    assert (stats.files_attempted, stats.files_succeeded, stats.files_failed) == (2, 1, 1)
+    assert stats.error_taxonomy == {"scan_internal:RuntimeError": 1}
+    assert store.get_session(bad)["status"] == "error"
+    assert store.get_session(bad)["error"] == "scan_internal: invented scanner bug"
+    count = lambda path: store.query_one(
+        "SELECT COUNT(*) AS n FROM incidents WHERE session_file = ?", (path,))["n"]
+    assert (count(bad), count(good)) == (0, 1)
+    assert sum(stats.incidents_by_signal.values()) == 1, stats.incidents_by_signal

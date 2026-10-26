@@ -62,3 +62,19 @@ def test_system_policy_guard_covers_windows_native_separators():
     for value in (r'C:\Program Files\ClaudeCode\CLAUDE.md', 'C:/Program Files/ClaudeCode/CLAUDE.md',
                   '/etc/claude-code/CLAUDE.md', '/Library/Application Support/ClaudeCode/CLAUDE.md'):
         assert guard._forbidden_prefix(value)
+
+
+def test_the_hook_records_bytes_paths_and_escaped_sqlite_uris(monkeypatch):
+    """BL-53: str() of a bytes path is "b'/Users/...'", so the prefix never
+    matched. And Path.as_uri() gives file:///abs%23path?mode=ro, which the
+    old file: strip left as ///abs%23path."""
+    import os
+
+    monkeypatch.setattr(guard, "_armed", True)
+    target = Path.home() / ".claude" / "CLAUDE.md"
+    guard._violations.clear()
+    guard._audit("open", (os.fsencode(target), "r", 0))
+    guard._audit("os.scandir", (os.fsencode(target.parent),))
+    guard._audit("sqlite3.connect", ((Path.home() / ".claude" / "a#b.db").as_uri() + "?mode=ro",))
+    assert len(guard._violations) == 3, guard._violations
+    guard._violations.clear()

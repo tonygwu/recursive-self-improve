@@ -1908,6 +1908,9 @@ if (mode === "ok") {
 
   await checkAsync("r_rejects_the_selected_family_over_the_wire", async () => {
     app.state.selectedFamily = "a1111111";
+    // `r` acts only on a loaded preview, exactly like its button (BL-18).
+    const family = app.state.review.families.find((f) => f.learning_id === "a1111111");
+    await app.loadReviewPreview(family);
     const before = fetchCalls.length;
     pressKey("r");
     for (let i = 0; i < 50; i += 1) await new Promise((res) => setTimeout(res, 0));
@@ -2094,6 +2097,35 @@ if (mode === "ok") {
       const html=app.renderDeliveryHistory({loaded:true,items:[{...command,state:"completed",result:{proposal_id:"P-recovery",supported:true,explanation:"Selected target."}}]});
       expect(html.includes("#/review/proposal/P-recovery") && !html.includes("targets delivered"),"recovery omitted manual Review or claimed delivery");
     } finally {globalThis.fetch=originalFetch;}
+  });
+
+  // BL-46: #/review/recovery/null parsed as JSON null. openRecoveryJob threw
+  // inside an async function, the rejection went unhandled, and the previous
+  // job's panel stayed on screen with no error. A bogus mode also opened the
+  // panel with an empty destination list. Unhandled rejections are captured
+  // here so the old wiring fails this check instead of crashing the harness.
+  await checkAsync("an_invalid_recovery_route_hides_the_panel_and_names_the_error", async()=>{
+    const rejections=[], onRejection=reason=>rejections.push(String(reason && reason.message || reason));
+    const savedErrors=app.state.dashboardErrors, savedHash=globalThis.location.hash, originalFetch=globalThis.fetch, reads=[];
+    process.on("unhandledRejection",onRejection);
+    globalThis.fetch=async(url,init)=>{if(url.startsWith("/api/learnings/"))reads.push(url);return originalFetch(url,init);};
+    try {
+      for (const selection of ["null",JSON.stringify({learning_id:"L1",mode:"bogus"}),JSON.stringify({learning_id:"L1",mode:""})]) {
+        app.state.dashboardErrors=new Map();
+        app.setVisible(el("review-eval"),true);
+        globalThis.location.hash="#/review/recovery/"+encodeURIComponent(selection);
+        app.showRoute(app.parseRoute(globalThis.location.hash));
+        await new Promise(resolve=>setTimeout(resolve,10));
+        expect(!el("review-eval").visible(),"the previous recovery panel stayed visible for "+selection);
+        const banner=el("global-error").html();
+        expect(banner.includes("Invalid recovery link") && banner.includes("does not name a lesson and a recovery mode"),"the invalid link was not named for "+selection+": "+banner);
+      }
+      expect(!rejections.length,"an invalid recovery link left an unhandled rejection: "+rejections.join("; "));
+      expect(!reads.length,"an invalid recovery link started a read: "+reads.join(", "));
+    } finally {
+      process.off("unhandledRejection",onRejection);
+      globalThis.fetch=originalFetch;app.state.dashboardErrors=savedErrors;globalThis.location.hash=savedHash;
+    }
   });
 
   await checkAsync("selected_mining_previews_one_incident_and_reuses_uncertain_intent", async()=>{
@@ -2395,7 +2427,9 @@ if (mode === "fail") {
     const html = error.html();
     expect(html.indexOf("/api/rules/browse") !== -1, "the error does not name the URL: " + html);
     expect(html.indexOf("404") !== -1, "the error does not name the status: " + html);
-    expect(html.indexOf("Could not read 1 of " + ENDPOINT_COUNT) !== -1,
+    // Projects has its own error surface and is left out of the shared
+    // banner, so it is left out of the banner's total too (BL-46).
+    expect(html.indexOf("Could not read 1 of " + (ENDPOINT_COUNT - 1) + " endpoints") !== -1,
       "the error does not say how many failed: " + html);
   });
 
@@ -2488,6 +2522,7 @@ JS_CHECKS = [
     "dashboard_read_retry_is_explicit_and_named",
     "dashboard_read_retry_is_get_only_single_flight_and_keeps_route",
     "recovery_binds_known_target_and_reuses_uncertain_intent",
+    "an_invalid_recovery_route_hides_the_panel_and_names_the_error",
     "selected_mining_previews_one_incident_and_reuses_uncertain_intent",
     "reapplication_returns_to_review_and_reuses_uncertain_intent",
     "eval_jobs_preview_cost_recover_requests_and_isolate_shortcuts",

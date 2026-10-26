@@ -72,19 +72,23 @@ def test_trial_symlink_cannot_read_outside_selected_state(tmp_path):
     assert 'OUTSIDE_STATE_SENTINEL' not in result.stdout
 
 
-def test_time_window_excludes_later_runs_without_claiming_attribution(tmp_path):
+def test_results_in_the_run_window_without_a_link_are_not_attributed(tmp_path):
+    """A start time inside the run's window does not show which run produced a
+    result. Only an eval attempt or a history row links a result to a run, so
+    neither unlinked result is shown; the note says what the query found."""
     seed(tmp_path)
     with closing(Store(tmp_path / 'state.db', migrate=False)) as store:
         store.insert('runs', {'id': 'later-run', 'started': '2026-01-02T00:00:00Z'})
-        for name, started in [('selected-evaluation', '2026-01-01T01:00:00Z'),
+        for name, started in [('in-window-evaluation', '2026-01-01T01:00:00Z'),
                               ('later-evaluation', '2026-01-02T01:00:00Z')]:
             store.insert('eval_results', {'id': name, 'kind': 'regression', 'started': started})
         store.commit()
     result = inspect(tmp_path, 'example-run')
     assert result.returncode == 0, result.stderr
-    assert 'selected-evaluation' in result.stdout
+    assert 'in-window-evaluation' not in result.stdout
     assert 'later-evaluation' not in result.stdout
-    assert 'timestamps do not prove run attribution' in result.stdout
+    assert 'no results are linked to this run' in result.stdout
+    assert '2 result(s) in this database have no eval attempt and no run' in result.stdout
 
 
 def test_invalid_stats_fail_loudly_without_an_invented_gate_result(tmp_path):

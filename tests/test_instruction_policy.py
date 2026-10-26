@@ -292,7 +292,10 @@ def test_policy_identity_change_refuses_collection_before_publication(cfg,store,
     original=Path.stat; replaced=False
     def race(self,*a,**kw):
         nonlocal replaced
-        if self==alias and not replaced:
+        # Python 3.12's Path.lstat calls self.stat(follow_symlinks=False) while the
+        # alias is seeded, before the policy signatures are recorded (BL-65). Race
+        # only on the following stat that read() makes, as Python 3.14 does.
+        if self==alias and kw.get('follow_symlinks',True) and not replaced:
             replaced=True
             target.unlink();target.write_text(json.dumps({'claudeMd':'New text','env':{'x':'RACING_RAW_SETTING_SENTINEL'}}))
             alias.unlink();os.link(target,alias)
@@ -301,4 +304,5 @@ def test_policy_identity_change_refuses_collection_before_publication(cfg,store,
     before=list(store.conn.iterdump())
     with pytest.raises(availability.AvailabilityError,match='policy source changed'):
         availability.collect_availability(store,cfg,observed_at='2030-01-01T00:00:00Z')
+    assert replaced
     assert before==list(store.conn.iterdump())

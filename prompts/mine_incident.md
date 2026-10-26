@@ -98,8 +98,42 @@ Field constraints (violations make the whole response unusable):
   actually a mistake. When false, the string fields may be empty strings but
   every key must still be present.
 - `incident_summary`, `generalized_rule`, `why`, `category`: strings.
-- `scope_guess`: exactly one of "global", "project", "skill", "hook",
-  "codex_global".
+- `scope_guess`: exactly one of "global", "personal", "project", "skill",
+  "hook", "codex_global". See "Choosing `scope_guess`" below.
 - `duplicate_of_existing_rule`: a string quoting the matching existing
   instruction line verbatim, or null when no existing line covers the lesson.
 - `confidence`: number between 0 and 1.
+
+<!-- scope-guidance:start -->
+### Choosing `scope_guess`
+
+`scope_guess` decides which instruction file the rule is written into. Ask
+these questions in order and use the first answer that fits.
+
+1. `hook`: a script could enforce the rule mechanically on every tool call,
+   for example "never force-push to main". Advice that needs judgment is not
+   a hook.
+2. `personal`: the rule is only true for this person or this computer. It
+   names their accounts, email addresses, machines, local paths outside a
+   repository, installed tools, aliases, subscriptions or quotas, or it
+   records how this person likes to work or be addressed. Another developer
+   who copied the shared rules would find it wrong or meaningless. Personal
+   rules stay in a private file and are never published.
+3. `project`: the rule depends on one repository, such as its code, layout,
+   commands, tests, deployment or team conventions.
+4. `skill`: the rule is know-how for one kind of task, such as a procedure,
+   a tool's quirks or a checklist, that matters only when that task comes up
+   and in any repository. Choose `skill` also when an existing skill already
+   covers that task. Prefer `skill` to `global` when the rule would be dead
+   weight in every session that does not do that task.
+5. `global`: the rule is a working habit that should hold in every session,
+   for any developer, such as evidence, verification, honest reporting or
+   clear communication. A global rule must not name this person's accounts,
+   machines or private paths.
+6. `codex_global`: the same as `global`, but true only for the Codex harness.
+
+If the lesson is portable but the incident's example is personal, write the
+rule without the personal details and choose `global`. If the rule cannot be
+stated without those details, choose `personal`. The number of projects that
+showed the lesson does not make a personal rule global.
+<!-- scope-guidance:end -->

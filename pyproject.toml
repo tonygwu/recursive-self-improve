@@ -1,6 +1,6 @@
 [project]
 name = "self-improve"
-version = "0.1.2"
+version = "0.1.3"
 description = "Offline trajectory miner: turns Claude Code / Codex session history into eval-gated CLAUDE.md / AGENTS.md / skill / hook improvements"
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Tony Wu" }]
 requires-python = ">=3.12"
 dependencies = [
-    "llm-quota-router @ git+https://github.com/tonygwu/llm-quota-router@ce138e1467127d07fa5974d64eaa337b0e913f1b",
+    "llm-quota-router @ git+https://github.com/tonygwu/llm-quota-router@ad89928e605d168c753958a54621855879f00c5a",
     "model2vec>=0.9.0",
     "huggingface-hub>=0.27",  # resolve an immutable snapshot before model2vec loads it
     "pyyaml>=6.0",
@@ -35,6 +35,7 @@ dev = [
     "hatchling>=1.27",  # build the actual wheel in distribution tests
     "pytest>=8.0",
     "httpx>=0.27",  # fastapi TestClient
+    "pytest-xdist>=3.6",  # parallel suite in CI; see .github/workflows/checks.yml
 ]
 
 [build-system]

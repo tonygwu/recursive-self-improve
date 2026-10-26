@@ -1164,7 +1164,9 @@ class Store:
         if read_only:
             if not self.db_path.exists():
                 raise FileNotFoundError(f"state DB does not exist: {self.db_path}")
-            self.conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            # as_uri() percent-encodes '#', '?' and '%', which would otherwise
+            # cut the path and drop mode=ro (SQLite then creates a new file).
+            self.conn = sqlite3.connect(self.db_path.absolute().as_uri() + "?mode=ro", uri=True)
             self.conn.row_factory = sqlite3.Row
             self.conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             return
@@ -1345,6 +1347,7 @@ class Store:
         if write and self.read_only:
             raise ValueError("a read-only Store cannot start a write transaction")
         self.conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        self._transaction_memo = {}
         try:
             yield
             # Deferred constraints can fail at commit after every statement
@@ -1353,6 +1356,21 @@ class Store:
         except BaseException:
             self.conn.rollback()
             raise
+        finally:
+            self._transaction_memo = None
+
+    #: See transaction_memo. None outside an owned transaction.
+    _transaction_memo: dict | None = None
+
+    def transaction_memo(self) -> dict | None:
+        """A dict that lives exactly as long as the current owned transaction.
+
+        A reader that also consults state outside the database, such as the
+        process table, keeps its reading here. Every read inside one
+        transaction then sees the same answer, as SQLite's snapshot does.
+        Outside an owned transaction this is None and the caller reads afresh.
+        """
+        return self._transaction_memo
 
     def insert(self, table: str, row: dict) -> None:
         cols = list(row)
@@ -1507,3 +1525,13 @@ class Store:
     def close(self) -> None:
         self.conn.commit()
         self.conn.close()
+
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # close() commits; after an exception the block's pending writes are
+        # incomplete, so they are discarded instead of published.
+        if exc_type is not None:
+            self.conn.rollback()
+        self.close()

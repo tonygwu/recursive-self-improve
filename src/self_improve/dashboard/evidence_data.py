@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 from .. import instruction_text, instruction_inventory, rule_revisions, session_context, native_loads
 from .. import scan_observations as scan
+from ..execution_policy import PolicyError
 from ..mining_history import digest, encoded
 from ..redact import redact_text
 from . import evidence_identity as identity
@@ -42,7 +43,10 @@ def _data_errors(reader):
     def wrapped(*args, **kwargs):
         try:
             return reader(*args, **kwargs)
-        except EvidenceError:
+        except (EvidenceError, PolicyError):
+            # A PolicyError names a policy input, such as a running run row
+            # with a corrupt process identity, not retained evidence. The
+            # app's PolicyError handler answers it unchanged.
             raise
         except (ValueError, KeyError, TypeError, sqlite3.DatabaseError, scan.ScanObservationError) as exc:
             raise _corrupt('retained evidence', exc) from exc

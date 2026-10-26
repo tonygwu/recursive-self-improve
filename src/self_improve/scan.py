@@ -217,6 +217,23 @@ def _denylist_match(cfg: Config, project_path: str, project_slug: str) -> str:
     return ""
 
 
+def incident_denylist_match(cfg: Config, incident: Mapping, session_project_path: str = "") -> str:
+    """Return the first denylist substring naming a saved incident's session, or ''.
+
+    Covers what the scan checks for the session's file, its recorded working
+    directory and the Claude project folder name directly under
+    ``claude_projects_dir``, plus the incident's own ``project_path``, which a
+    later Codex turn can change.
+    """
+    try:
+        parts = Path(incident["session_file"]).relative_to(cfg.claude_projects_dir).parts
+    except ValueError:
+        parts = ()
+    return _denylist_match(
+        cfg, incident["project_path"] or "", parts[0] if parts else ""
+    ) or _denylist_match(cfg, session_project_path or "", "")
+
+
 def _parse_stats_field(parse_stats: object, name: str) -> int:
     """Extract a required int field from a source's parse_stats; loud on absence."""
     if isinstance(parse_stats, Mapping):
@@ -290,8 +307,15 @@ def _load_identity_cache(store: Store) -> dict:
     """
     from .project_identity import ProjectIdentity
 
+    from .project_identity import METHOD_REMOTE_URL
+
     cache: dict = {}
     for r in store.query("SELECT * FROM project_identity_cache"):
+        # A remote_url identity is either local arithmetic (non-GitHub remote)
+        # or a gh lookup that degraded. Neither is worth trusting across runs:
+        # reusing a degraded one would split the repository once gh recovers.
+        if r["method"] == METHOD_REMOTE_URL:
+            continue
         cache[r["remote_norm"]] = ProjectIdentity(
             r["project_key"], r["display"], r["method"]
         )
@@ -304,7 +328,12 @@ def _save_identity_cache(store: Store, cache: dict) -> None:
     Upsert rather than insert: a repo rename changes display (and can promote
     the method from remote_url to gh_repo_id) for an unchanged remote_norm.
     """
+    from .project_identity import METHOD_REMOTE_URL
+
     for remote_norm, ident in cache.items():
+        if ident.method == METHOD_REMOTE_URL:
+            # Degraded or locally derived: recompute next run (BL-25).
+            continue
         store.conn.execute(
             "INSERT INTO project_identity_cache "
             " (remote_norm, project_key, display, method, resolved_at) "
@@ -1147,14 +1176,18 @@ def _promote_repeated_errors(
 ) -> None:
     """Create synthetic repeated_error incidents for fingerprints spanning sessions.
 
-    A fingerprint seen in >= cfg.repeated_error_min_sessions distinct session
-    files, with no existing incident whose matched_text equals the
+    A fingerprint seen in >= cfg.repeated_error_min_sessions distinct logical
+    sessions (session_id, or the file when the id is unknown), with no existing incident whose matched_text equals the
     fingerprint, becomes one incident anchored at the earliest-by-data-time
     contributing session; its window carries every session's redacted sample.
     """
     rows = store.query(
-        "SELECT fingerprint, COUNT(DISTINCT session_file) AS n FROM error_fingerprints "
-        "GROUP BY fingerprint HAVING COUNT(DISTINCT session_file) >= ?",
+        # A transcript and its subagents/agent-*.jsonl files share one
+        # session_id and are one logical session; fall back to the file when
+        # the id is unknown.
+        "SELECT fingerprint, COUNT(DISTINCT CASE WHEN session_id <> '' THEN session_id "
+        "ELSE session_file END) AS n FROM error_fingerprints "
+        "GROUP BY fingerprint HAVING n >= ?",
         (cfg.repeated_error_min_sessions,),
     )
     for row in rows:

@@ -72,5 +72,21 @@ counted as reconstructible must stay a readable, unchanged regular file through
 backup verification; a changed source aborts the deletion. A verified backup can
 survive a later failure, so retry with a new private backup directory.
 
+## Excluding folders
+
+`denylist_substrings` keeps matching sessions out of scanning. The scan applies it
+when it first reads a session. If you add an entry later, the miner still skips
+that session's waiting incidents, and a request to mine one of them by hand is
+refused. Incidents and lessons mined before the entry was added are not removed.
+
+`instruction_excluded_dirs` lists absolute folders whose instruction files are
+never read. No reader opens their `AGENTS.md` or `CLAUDE.md`, no
+inventory is collected there, and routing refuses a new destination inside them.
+Their sessions are still scanned and mined unless the denylist also names them.
+Matching is on whole path components, without resolving symlinks. Use it for a
+folder that a scheduled job cannot read, such as macOS cloud storage under launchd.
+The writer does not check this setting, so a proposal that targeted the folder
+before it was excluded can still be approved and written.
+
 `run --dry-run` is different: it writes scan and incident state. It is not a
 read-only test rehearsal. Use invented fixtures and temporary databases for tests.

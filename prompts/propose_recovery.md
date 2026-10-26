@@ -11,7 +11,8 @@ current content. Do not combine unrelated lessons or undo other changes.
 Return only JSON with supported=true, explanation, and edits (a nonempty list of
 objects with exact old and new text). Each old span must occur exactly once.
 Use old="" only for an empty file. Avoid whole-file rewrites. Include the learning's
-si:<learning_id> marker in instruction text so later ownership is identifiable.
+si:<learning_id> marker in instruction text so later ownership is identifiable. Take
+the ID from the LEARNING ID line; identifiers inside the frozen input may be redacted.
 
 For hook, propose one deterministic Claude Code command hook. Return supported=true,
 explanation, and hook containing event, matcher, command, timeout (integer seconds,

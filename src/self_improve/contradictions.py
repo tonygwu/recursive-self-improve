@@ -60,7 +60,8 @@ def _canonical(file_1: str, unit_1: str, file_2: str, unit_2: str) -> tuple[str,
     return fa, ua, fb, ub
 
 
-def find_candidates(cfg: Config, paths: list[str], embedder: Embedder) -> list[dict]:
+def find_candidates(cfg: Config, paths: list[str], embedder: Embedder, *,
+                    unreadable: list[dict] | None = None) -> list[dict]:
     """Embedding-similar rule-unit pairs worth judging for contradiction.
 
     Units come from :func:`cluster.split_rule_units` per file, DEDUPED BY TEXT
@@ -69,7 +70,9 @@ def find_candidates(cfg: Config, paths: list[str], embedder: Embedder) -> list[d
     (units under 3 content tokens skipped; owner_kind ``'rule_unit'``,
     owner_key sha1 of ``"<path>\\n<unit>"`` with the expanded path — so the
     vectors are shared with the dedup system's cache). A listed file that does
-    not exist is skipped; one that exists but cannot be read raises.
+    not exist is skipped; one that exists but cannot be read raises, unless the
+    caller passes an ``unreadable`` list, exactly as in
+    :func:`cluster.existing_rule_vectors`.
 
     Pairs — cross-file AND same-file — qualify when
     ``contradiction_candidate_cosine <= cosine < cluster_dup_cosine``; at or
@@ -90,7 +93,13 @@ def find_candidates(cfg: Config, paths: list[str], embedder: Embedder) -> list[d
         path = Path(p).expanduser()
         if not path.exists():
             continue
-        content = path.read_text(encoding="utf-8", errors="strict")
+        try:
+            content = path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as exc:
+            if unreadable is None:
+                raise
+            unreadable.append({"path": str(path), "cause": type(exc).__name__, "detail": str(exc)})
+            continue
         for unit in split_rule_units(content):
             if len(normalize_tokens(unit)) < 3:
                 continue
@@ -138,6 +147,10 @@ def _already_judged(store: Store, cand: dict) -> bool:
     return row is not None
 
 
+class JudgeRefused(Exception):
+    """The judge call was refused before it ran, for example by the call budget."""
+
+
 def judge_pairs(
     store: Store,
     cfg: Config,
@@ -153,6 +166,9 @@ def judge_pairs(
 
     - already in the contradictions table (either orientation) ->
       ``skipped_already_judged``, no budget consumed;
+    - ``llm_json`` raised :class:`JudgeRefused` for this or an earlier
+      candidate (the shared call budget is spent) -> ``deferred`` and
+      ``budget_deferred``; judged rows are kept;
     - budget of ``cfg.contradiction_max_judgments_per_run`` LLM attempts
       spent -> ``deferred`` (counted, never silent);
     - otherwise render ``prompts/judge_contradiction.md`` and call
@@ -163,7 +179,9 @@ def judge_pairs(
       compatible rows are stored precisely so the pair is never re-judged.
 
     Returns ``{candidates, judged, contradicts, compatible, judge_failed,
-    deferred, skipped_already_judged}``.
+    deferred, budget_deferred, skipped_already_judged}``. ``budget_deferred``
+    is the part of ``deferred`` that the call budget refused; the rest hit
+    the judgment cap.
     """
     stats = {
         "candidates": len(candidates),
@@ -172,12 +190,23 @@ def judge_pairs(
         "compatible": 0,
         "judge_failed": 0,
         "deferred": 0,
+        "budget_deferred": 0,
         "skipped_already_judged": 0,
     }
     template = Path(prompts_dir) / PROMPT_NAME
+    refused = False
     for cand in candidates:
+        # Before the refusal branch: a pair an earlier run judged was not
+        # deferred by this run's budget, and counting it there would overstate
+        # the work the refusal left undone.
         if _already_judged(store, cand):
             stats["skipped_already_judged"] += 1
+            continue
+        if refused:
+            # The budget refused a judgment: keep what was judged and count
+            # every remaining candidate as deferred, never as "did not run".
+            stats["deferred"] += 1
+            stats["budget_deferred"] += 1
             continue
         if stats["judged"] + stats["judge_failed"] >= cfg.contradiction_max_judgments_per_run:
             stats["deferred"] += 1
@@ -191,7 +220,13 @@ def judge_pairs(
                 "unit_b": cand["unit_b"],
             },
         )
-        result = llm_json(prompt)
+        try:
+            result = llm_json(prompt)
+        except JudgeRefused:
+            refused = True
+            stats["deferred"] += 1
+            stats["budget_deferred"] += 1
+            continue
         if (
             not isinstance(result, dict)
             or not isinstance(result.get("contradicts"), bool)
@@ -236,34 +271,158 @@ def report_open(store: Store) -> list[dict]:
     )
 
 
+#: The counters every reader of a recorded sweep uses. judge_pairs has
+#: written ``judged``, ``judge_failed`` and ``deferred`` since the stage was
+#: added. ``budget_deferred`` came with BL-37.
+SWEEP_COUNTERS = ("judged", "judge_failed", "deferred", "budget_deferred")
+
+
+class SweepCounterError(ValueError):
+    """A recorded sweep whose counters cannot be read.
+
+    ``kind`` is ``missing``, ``unreadable`` or ``disagree``. ``reason`` is a
+    short outcome name, such as ``unreadable judged counter``. The message
+    says which value is wrong.
+    """
+
+    def __init__(self, kind: str, reason: str, detail: str):
+        super().__init__(detail)
+        self.kind, self.reason = kind, reason
+
+
+def sweep_counters(entry: dict) -> dict[str, int]:
+    """The counters of one recorded sweep entry, checked, or a raise.
+
+    ``ever_completed``, the report's refusal lines and its pool history read
+    a recorded sweep through this one check, so they agree about which
+    records they can read. Each counter in ``SWEEP_COUNTERS`` must be an int
+    of 0 or more, so a bool, float, string, null or negative value raises.
+    A missing ``budget_deferred`` counts as 0, because an entry written
+    before BL-37 has none and had no refusal. A missing ``judged``,
+    ``judge_failed`` or ``deferred`` raises, because judge_pairs always
+    writes them. ``budget_deferred`` above ``deferred`` raises, because each
+    pair the budget left unjudged is one of the deferred pairs.
+    """
+    counters: dict[str, int] = {}
+    for name in SWEEP_COUNTERS:
+        if name not in entry:
+            if name == "budget_deferred":
+                counters[name] = 0
+                continue
+            raise SweepCounterError("missing", f"missing {name} counter", f"`{name}` is missing")
+        value = entry[name]
+        if type(value) is not int or value < 0:
+            raise SweepCounterError(
+                "unreadable", f"unreadable {name} counter",
+                f"`{name}` is {value!r}, not a whole number of 0 or more",
+            )
+        counters[name] = value
+    if counters["budget_deferred"] > counters["deferred"]:
+        raise SweepCounterError(
+            "disagree", "budget_deferred counter above deferred",
+            f"`budget_deferred` is {counters['budget_deferred']} but `deferred` "
+            f"is only {counters['deferred']}",
+        )
+    return counters
+
+
+#: ever_completed's reason for an older-shape refusal with no verdict in this
+#: database. rebuild_state deletes every contradictions row, so an empty
+#: result does not show that the run stored nothing.
+OLDER_REFUSAL_NO_VERDICT = (
+    "skipped: budget_exhausted, and this database holds no verdict from that "
+    "run; a state rebuild removes stored verdicts"
+)
+
+
+def stored_verdicts(store, run_id: str) -> int:
+    """How many verdicts from run ``run_id`` this database holds, of either
+    verdict and status.
+
+    judge_pairs stores a row for each pair it judged and never re-judges a
+    stored pair, so this is the number of pairs the run judged, unless rows
+    were later removed. A state rebuild removes every row. A reader that has
+    only the older refusal shape uses it as a lower bound on the run's
+    judgments, and 0 does not show that the run judged nothing.
+    """
+    return store.query_one(
+        "SELECT COUNT(*) AS n FROM contradictions WHERE run_id = ?", (run_id,)
+    )["n"]
+
+
 def ever_completed(store) -> tuple[bool, str]:
     """Report whether contradiction detection completed in a recorded run.
 
     An empty result is evidence only after detection ran. Distinguish missing or
     budget-refused stages from completed stages. Return the observed reason with
     the completion flag.
+
+    A run whose call budget refused a judgment before any pair was judged
+    (``budget_deferred > 0`` and ``judged == 0``) does not count: it found
+    candidates and checked none of them. Its reason names any judgment calls
+    that failed before the refusal. A run that judged some pairs before the
+    refusal does
+    count, the same way a run that hit its judgment cap counts. Its verdicts
+    are stored, and its deferred pairs are offered again next run.
+
+    Before BL-37 a refusal replaced the run's whole entry with ``{"skipped":
+    "budget_exhausted"}``, even after the sweep had stored verdicts. Such a
+    run counts when this database holds at least one verdict from it (see
+    :func:`stored_verdicts`), for the same reason a newer partial refusal
+    counts. With no verdict it does not count. Its reason
+    (``OLDER_REFUSAL_NO_VERDICT``) does not say that the run stored nothing,
+    because a state rebuild removes every stored verdict.
+
+    Counters are read through :func:`sweep_counters`. A run whose record
+    cannot be read does not count, and its reason names the run.
     """
     from collections import Counter
 
     outcomes: Counter = Counter()
-    for row in store.query("SELECT stats_json FROM runs WHERE stats_json <> ''"):
+    for row in store.query("SELECT id, stats_json FROM runs WHERE stats_json <> ''"):
+        run = row["id"]
         try:
             stats = json.loads(row["stats_json"])
         except (TypeError, ValueError):
             # A run whose stats we cannot read tells us nothing either way; it
             # must not be counted as evidence that the stage ran.
-            outcomes["unreadable stats_json"] += 1
+            outcomes[f"unreadable stats_json in run {run}"] += 1
+            continue
+        if not isinstance(stats, dict):
+            outcomes[f"stats_json is not an object in run {run}"] += 1
             continue
         entry = stats.get("contradictions")
         if entry is None:
             outcomes["stage absent from the run"] += 1
         elif not isinstance(entry, dict):
-            outcomes["stage recorded a non-object"] += 1
+            outcomes[f"stage recorded a non-object in run {run}"] += 1
+        elif entry.get("skipped") == "budget_exhausted":
+            if stored_verdicts(store, run):
+                # The older refusal shape, written after this run had stored
+                # verdicts: it judged some pairs before the refusal, so it
+                # counts as the newer partial refusal does.
+                return True, ""
+            # No row proves the run stored nothing: a state rebuild deletes
+            # every contradictions row.
+            outcomes[OLDER_REFUSAL_NO_VERDICT] += 1
         elif "skipped" in entry:
             outcomes[f"skipped: {entry['skipped']}"] += 1
         elif "error" in entry:
             outcomes[f"error: {entry['error']}"] += 1
         else:
+            try:
+                counters = sweep_counters(entry)
+            except SweepCounterError as exc:
+                outcomes[f"{exc.reason} in run {run}"] += 1
+                continue
+            if counters["budget_deferred"] and counters["judged"] == 0:
+                # A failed call spent from the pool before the refusal, so
+                # "refused every judgment" is true only with no failure.
+                failed = counters["judge_failed"]
+                outcomes["call budget refused every judgment" if not failed else
+                         f"no pair judged: {failed} judgment call(s) failed, "
+                         "then the call budget refused the next"] += 1
+                continue
             return True, ""
     if not outcomes:
         return False, "no run has ever recorded stats"

@@ -7,7 +7,7 @@ import hashlib
 
 from .commands import CommandError, MAX_MEMBERS, _hash, review_snapshot
 from .destinations import DestinationError, destination_identity, read_destination
-from .propose import PatchConflict, apply_unified_diff, make_unified_diff
+from .propose import PatchConflict, UnsupportedLineEndings, apply_unified_diff, make_unified_diff
 
 
 def combine_edits(before: str, diffs: list[str], path: str) -> tuple[str, str]:
@@ -72,12 +72,15 @@ def prepare_targets(cfg, members: list[dict]) -> list[dict]:
                           before_exists=base['exists'], base_ref=base['base_ref'])
             after, diff = combine_edits(base['content'], [m['snapshot']['proposal']['diff_unified'] for m in group], dest['target_path'])
             target.update(diff_unified=diff, after_hash=hashlib.sha256(after.encode()).hexdigest())
-            if Path(cfg.global_claude_md).expanduser().resolve() == Path(dest['target_path']):
+            if Path(cfg.delivery_path('global_claude_md')).expanduser().resolve() == Path(dest['target_path']):
                 limit = cfg.global_claude_md_line_budget
                 target['budget'] = {'before': len(base['content'].splitlines()), 'after': len(after.splitlines()),
                                     'limit': limit, 'over': len(after.splitlines()) > limit}
         except CommandError as exc:
             target.update(state='conflict', error_code=exc.code, detail=str(exc))
+        except UnsupportedLineEndings as exc:
+            # The file itself must change first; no selection or regeneration fixes it.
+            target.update(state='conflict', error_code='UnsupportedLineEndings', detail=str(exc))
         except PatchConflict as exc:
             target.update(state='conflict', error_code='ConflictingEdits', detail=str(exc))
         except (DestinationError, OSError, UnicodeError) as exc:

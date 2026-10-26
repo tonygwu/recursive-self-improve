@@ -10,10 +10,17 @@ An unexpected binary or exhausted response queue raises AssertionError."""
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
+import logging
 import os
+import signal
 import subprocess
+import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -183,6 +190,8 @@ def pick_kwargs(model: str = "sonnet") -> dict:
 
 
 def make_runner(tmp_path, monkeypatch, **cfg_overrides) -> SimpleNamespace:
+    # A developer's inherited account home must never supply fixture receipts.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     codex_sessions = tmp_path / "codex-sessions"
     codex_sessions.mkdir(parents=True, exist_ok=True)
     cfg = Config(
@@ -193,7 +202,7 @@ def make_runner(tmp_path, monkeypatch, **cfg_overrides) -> SimpleNamespace:
         **cfg_overrides,
     )
     fake = FakeSubprocess()
-    monkeypatch.setattr(llm_mod.subprocess, "run", fake)
+    monkeypatch.setattr(llm_mod, "_run_provider", fake)
     pick = FakeSelectAccount()
     monkeypatch.setattr(llm_mod, "select_account", pick)
     store = Store(tmp_path / "state" / "test.db")
@@ -408,6 +417,101 @@ class TestCodexHappyPath:
 # ---------------------------------------------------------------------------
 # model_mismatch
 # ---------------------------------------------------------------------------
+
+
+class TestCodexAccountIdentity:
+    @pytest.mark.parametrize("agentic", [False, True])
+    @pytest.mark.parametrize("home_source", ["routed", "inherited", "relative"])
+    @pytest.mark.parametrize("receipt", ["matching", "wrong_model", "missing"])
+    def test_identity_uses_only_the_invoked_home(
+        self, tmp_path, monkeypatch, agentic, home_source, receipt
+    ):
+        h = make_runner(tmp_path, monkeypatch)
+        wrong = CODEX_ROLLOUT.replace(b"gpt-5.6-terra", b"gpt-4.1-mini")
+        # Contradictory receipt in the configured default tree exposes both
+        # rejecting the correct account and accepting another account's proof.
+        decoy = wrong if receipt == "matching" else CODEX_ROLLOUT
+        write_codex_rollout(h, content=decoy)
+        sandbox = tmp_path / "workspace"
+        sandbox.mkdir()
+        home = sandbox / "account-home"
+        home.mkdir()
+        if receipt != "missing":
+            root = home / "sessions" / "2026" / "08" / "15"
+            root.mkdir(parents=True)
+            (root / f"rollout-test-{CODEX_THREAD_ID}.jsonl").write_bytes(
+                CODEX_ROLLOUT if receipt == "matching" else wrong
+            )
+        payload = json.loads(PICK_CODEX)
+        if home_source == "inherited":
+            monkeypatch.setenv("CODEX_HOME", str(home))
+        else:
+            # The routed overlay must override the inherited home, too.
+            monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unused-home"))
+            payload["exec"]["env"]["CODEX_HOME"] = (
+                "account-home" if home_source == "relative" else str(home)
+            )
+            payload["decision"]["account"] = "codex_test"
+        h.pick.expect(Selection.from_payload(payload))
+        h.fake.expect_codex((0, CODEX_ENVELOPE, b""))
+        call = h.runner.call_agentic if agentic else h.runner.call
+        result = call("mine", "sonnet", PROMPT, cwd=str(sandbox), expect_json=False)
+
+        assert result.ok is (receipt == "matching"), result.error
+        assert result.outcome == ("ok" if receipt == "matching" else "model_mismatch")
+        expected_model = {
+            "matching": "gpt-5.6-terra", "wrong_model": "gpt-4.1-mini", "missing": ""
+        }[receipt]
+        assert result.model_reported == expected_model
+        if receipt == "missing":
+            assert str(home / "sessions") in result.error
+        row = one_llm_row(h.store)
+        assert row["model_reported"] == expected_model
+        assert row["outcome"] == result.outcome
+        assert row["model_requested"] == "gpt-5.6-terra"
+        assert len(h.fake.calls) == 1
+
+    def test_default_call_does_not_reuse_previous_account_home(self, tmp_path, monkeypatch):
+        h = make_runner(tmp_path, monkeypatch)
+        home = tmp_path / "account-home"
+        root = home / "sessions"
+        root.mkdir(parents=True)
+        (root / f"rollout-test-{CODEX_THREAD_ID}.jsonl").write_bytes(CODEX_ROLLOUT)
+        write_codex_rollout(
+            h, content=CODEX_ROLLOUT.replace(b"gpt-5.6-terra", b"gpt-4.1-mini")
+        )
+        payload = json.loads(PICK_CODEX)
+        payload["exec"]["env"]["CODEX_HOME"] = str(home)
+        h.pick.expect(Selection.from_payload(payload), selection(PICK_CODEX))
+        h.fake.expect_codex((0, CODEX_ENVELOPE, b""), (0, CODEX_ENVELOPE, b""))
+        first = h.runner.call("mine", "sonnet", PROMPT, expect_json=False)
+        second = h.runner.call("mine", "sonnet", PROMPT, expect_json=False)
+        assert first.ok, first.error
+        assert second.outcome == "model_mismatch"
+        assert second.model_reported == "gpt-4.1-mini"
+
+    def test_quota_repick_reads_the_second_accounts_receipt(self, tmp_path, monkeypatch):
+        h = make_runner(tmp_path, monkeypatch)
+        picks = []
+        for index in (1, 2):
+            home = tmp_path / f"account-{index}"
+            root = home / "sessions"
+            root.mkdir(parents=True)
+            content = CODEX_ROLLOUT if index == 2 else CODEX_ROLLOUT.replace(
+                b"gpt-5.6-terra", b"gpt-4.1-mini"
+            )
+            (root / f"rollout-test-{CODEX_THREAD_ID}.jsonl").write_bytes(content)
+            payload = json.loads(PICK_CODEX)
+            payload["decision"]["account"] = f"codex_test_{index}"
+            payload["exec"]["env"]["CODEX_HOME"] = str(home)
+            picks.append(Selection.from_payload(payload))
+        h.pick.expect(*picks)
+        h.fake.expect_codex((1, b"", b"usage limit reached"), (0, CODEX_ENVELOPE, b""))
+        result = h.runner.call("mine", "sonnet", PROMPT, expect_json=False)
+        assert result.ok, result.error
+        assert result.account == "codex_test_2"
+        assert result.model_reported == "gpt-5.6-terra"
+        assert len(h.fake.calls) == 2
 
 
 class TestModelMismatch:
@@ -2102,6 +2206,48 @@ class TestSandboxCapablePick:
         assert len(h.pick.calls) == 1, "a non-sandboxed call was re-picked"
         assert result.provider == "codex"
 
+    def test_a_quota_repick_never_hands_a_sandboxed_trial_to_codex(
+        self, tmp_path, monkeypatch
+    ):
+        """BL-07: the sandbox filter ran only on the first pick, so a quota
+        failure on Claude could re-pick Codex for a sandboxed trial."""
+        h = make_runner(tmp_path, monkeypatch)
+        codex_pick = selection(PICK_CODEX)
+        h.pick.expect(selection(), codex_pick, selection(account="claude_c"))
+        h.fake.expect_claude(
+            (1, b"", b"Claude AI usage limit reached|1755237600"),
+            (0, claude_envelope("done"), b""),
+        )
+        result = h.runner.call(
+            "grade", "sonnet", "p", expect_json=False,
+            cwd=str(tmp_path), sandbox_dir=str(tmp_path),
+        )
+        assert result.ok, result.error
+        assert result.provider == "claude" and result.account == "claude_c"
+        assert not any("codex" in str(args[0]) for args, _ in h.fake.calls), h.fake.calls
+        codex_account = codex_pick.to_dict()["decision"]["account"]
+        assert set(h.pick.calls[2]["exclude"]) == {"claude_b", codex_account}
+
+    def test_a_policy_wait_repick_never_hands_a_sandboxed_trial_to_codex(
+        self, tmp_path, monkeypatch
+    ):
+        """BL-07: the fresh pick after a policy wait skipped the sandbox filter."""
+        h = make_runner(tmp_path, monkeypatch)
+        clock = install_clock(monkeypatch)
+        h.pick.expect(
+            selection(PICK_POLICY_WAIT, available_at=clock.now + 2.0),
+            selection(PICK_CODEX),
+            selection(account="claude_c"),
+        )
+        h.fake.expect_claude((0, claude_envelope("done"), b""))
+        result = h.runner.call(
+            "grade", "sonnet", "p", expect_json=False,
+            cwd=str(tmp_path), sandbox_dir=str(tmp_path),
+        )
+        assert result.ok, result.error
+        assert result.provider == "claude", result.provider
+        assert not any("codex" in str(args[0]) for args, _ in h.fake.calls), h.fake.calls
+
     def test_a_fleet_that_cannot_run_a_trial_REFUSES_instead_of_spending(
         self, tmp_path, monkeypatch
     ):
@@ -2152,3 +2298,948 @@ class TestSandboxCapablePick:
         h.pick.expect(selection(PICK_CLAUDE))
         h.runner._pick("cid", "sonnet", pick_no=2, exclude="claude_d")
         assert h.pick.calls[-1]["exclude"] == ["claude_d"]
+
+
+class TestRouterConformance:
+    """The pinned quota_router must carry the features routing here depends on.
+
+    The dependency is pinned to a commit, and its version string is static
+    across many of them, so the version cannot answer whether a feature is
+    present. These assert on the package itself.
+
+    Regression: the pin once sat behind the commit that added
+    quota_router.reserve, so `manual_rate_per_day` was ignored and a pick could
+    name an account whose weekly pool the config reserved for interactive use.
+    The pick was well-formed and carried a correct CODEX_HOME, so nothing
+    downstream could tell it from a right answer.
+    """
+
+    def test_installed_router_carries_every_required_feature(self):
+        llm_mod.assert_router_conformance()
+
+    def test_missing_feature_names_the_module_the_reason_and_the_fix(self):
+        empty = SimpleNamespace(__name__="not_a_real_package_xyz", __file__="/tmp/x")
+        with pytest.raises(RuntimeError) as excinfo:
+            llm_mod.assert_router_conformance(empty)
+        message = str(excinfo.value)
+        assert "quota_router.reserve" in message
+        assert "manual_rate_per_day" in message
+        assert "pyproject.toml" in message
+
+    def test_the_reserve_actually_reaches_a_pick(self):
+        """Presence is not application. Hold the whole pool back and the
+        account must stop winning -- with the rate at zero it must win again."""
+        from quota_router import reserve as reserve_mod
+
+        held = reserve_mod.manual_reserve(
+            account_id="codex", rate_per_day=1.0, remaining=0.5, days_to_reset=3.0
+        )
+        assert held.spendable == 0.0, held
+        free = reserve_mod.manual_reserve(
+            account_id="codex", rate_per_day=0.0, remaining=0.5, days_to_reset=3.0
+        )
+        assert free.spendable == 0.5, free
+
+
+def test_the_sandbox_allows_the_routed_accounts_config_dir(tmp_path, monkeypatch):
+    """BL-29: the policy read the parent's CLAUDE_CONFIG_DIR, which launchd
+    leaves unset, while the trial ran under the routed account's directory."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    h = make_runner(tmp_path, monkeypatch)
+    sandbox = tmp_path / "trial" / "sandbox"
+    sandbox.mkdir(parents=True)
+    h.pick.expect(selection())
+    h.fake.expect_claude((0, CLAUDE_ENVELOPE, b""))
+    h.runner.call("grade", "sonnet", PROMPT, expect_json=False, cwd=str(sandbox), sandbox_dir=str(sandbox))
+    argv, kw = h.fake.calls[0]
+    allow = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())["filesystem"]["allowWrite"]
+    routed = kw["env"]["CLAUDE_CONFIG_DIR"]
+    assert routed in allow, (routed, allow)
+
+
+# ---------------------------------------------------------------------------
+# BL-08: provider subprocesses run in their own process group. These use real
+# processes, not the scripted fake, because the defect is in process handling.
+# ---------------------------------------------------------------------------
+
+
+def _pid_gone(pid: int, wait_s: float = 3.0) -> bool:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestProviderProcessGroup:
+    def test_a_timeout_kills_the_descendants_too(self, tmp_path, monkeypatch):
+        """The timeout fires only after the shell has recorded its child, by
+        rename: under load the shell could need more than the 1 s timeout to
+        start, and then no pidfile existed (seen at load average 23 to 29)."""
+        pidfile = tmp_path / "child.pid"
+        script = f"sleep 30 & echo $! > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; sleep 30"
+        fired = _timeout_after(pidfile, monkeypatch)
+        with pytest.raises(subprocess.TimeoutExpired):
+            llm_mod._run_provider(
+                ["/bin/sh", "-c", script], capture_output=True, timeout=1,
+                env=dict(os.environ), cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+            )
+        assert time.monotonic() - fired[0] < 10
+        assert _pid_gone(int(pidfile.read_text())), "a descendant outlived the call"
+
+    def test_an_exited_cli_is_not_held_open_by_a_background_child(self, tmp_path):
+        """The CLI printed its answer and exited 0; a child it left behind
+        still holds stdout. The call must return the answer, not time out."""
+        pidfile = tmp_path / "child.pid"
+        script = f"sleep 30 & echo $! > {pidfile}; echo '{{\"answer\": 1}}'; exit 0"
+        started = time.monotonic()
+        proc = llm_mod._run_provider(
+            ["/bin/sh", "-c", script], capture_output=True, timeout=20,
+            env=dict(os.environ), cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+            grace_seconds=0.2,
+        )
+        assert time.monotonic() - started < 10, "the call waited for the background child"
+        assert proc.returncode == 0
+        assert b'{"answer": 1}' in proc.stdout
+        assert _pid_gone(int(pidfile.read_text())), "the background child survived"
+
+    def test_input_is_delivered_and_output_captured(self, tmp_path):
+        proc = llm_mod._run_provider(
+            ["/bin/cat"], capture_output=True, timeout=10,
+            env=dict(os.environ), cwd=str(tmp_path), input=b"prompt text",
+        )
+        assert (proc.returncode, proc.stdout, proc.stderr) == (0, b"prompt text", b"")
+
+
+def _escaping_cli(pidfile, then: str) -> str:
+    """Python source for a CLI whose child escapes the group with setsid and
+    sleeps 30 s. The child records its pid only after setsid, so the group
+    kill can no longer reach it, and the CLI waits for that record before it
+    runs ``then``."""
+    return ("import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            f"    open({str(pidfile)!r} + '.tmp', 'w').write(str(os.getpid()))\n"
+            f"    os.rename({str(pidfile)!r} + '.tmp', {str(pidfile)!r})\n"
+            "    time.sleep(30); os._exit(0)\n"
+            f"while not os.path.exists({str(pidfile)!r}):\n    time.sleep(0.01)\n"
+            + then)
+
+
+def _kill_escaped(pidfile) -> None:
+    """Kill the escaped child of ``_escaping_cli``; the group kill cannot."""
+    if not pidfile.exists():
+        return
+    escaped = int(pidfile.read_text())
+    try:
+        os.kill(escaped, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    assert _pid_gone(escaped), f"could not clean up escaped process {escaped}"
+
+
+def test_a_descendant_that_left_the_group_cannot_hold_the_call_past_its_timeout(tmp_path):
+    """Review of BL-08: closing a pipe while its reader thread was blocked
+    waited for the escaped descendant, so a 2 s call took 15 s. The group kill
+    cannot reach that descendant, so the test kills it at the end."""
+    pidfile = tmp_path / "escaped.pid"
+    child = _escaping_cli(pidfile, "time.sleep(60)\n")
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            llm_mod._run_provider([sys.executable, "-c", child], capture_output=True, timeout=1,
+                                  env=dict(os.environ), cwd=str(tmp_path),
+                                  stdin=subprocess.DEVNULL)
+        assert time.monotonic() - started < 5
+    finally:
+        _kill_escaped(pidfile)
+
+
+@pytest.mark.parametrize("grace, drain", [(2.0, 0.0), (0.0, 2.0)], ids=["grace", "drain"])
+def test_an_escaped_holder_of_both_pipes_costs_one_wait_and_is_named(
+        tmp_path, caplog, monkeypatch, grace, drain):
+    """Review of BL-08: each pipe waited out its own grace period and then its
+    own drain wait. A setsid descendant that held stdout and stderr after the
+    CLI exited 0 made the call take about 12 s (2 x 5 s + 2 x 1 s), and
+    nothing recorded it. Each case makes one of the two waits 2 s long."""
+    monkeypatch.setattr(llm_mod, "_DRAIN_SECONDS", drain)
+    pidfile = tmp_path / "escaped.pid"
+    cli = _escaping_cli(pidfile, "print('answer')\n")
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger=llm_mod.__name__):
+            proc = llm_mod._run_provider(
+                [sys.executable, "-c", cli], capture_output=True, timeout=30,
+                env=dict(os.environ), cwd=str(tmp_path), stdin=subprocess.DEVNULL,
+                grace_seconds=grace,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        _kill_escaped(pidfile)
+    assert (proc.returncode, proc.stdout) == (0, b"answer\n")
+    # One 2 s wait for both pipes. One wait per pipe took 4 s.
+    assert elapsed < 3.0, f"the call took {elapsed:.2f} s"
+    assert proc.held_streams == ("stdout", "stderr")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(llm_mod.HELD_OUTPUT_CONDITION in m and "stdout and stderr" in m
+               for m in warnings), warnings
+
+
+def test_a_normal_call_holds_no_pipes_and_skips_the_grace_wait(tmp_path):
+    """The guard stays alive after the CLI exits, so it must not hold the
+    output pipes itself; otherwise every call waits out the full 5 s grace."""
+    started = time.monotonic()
+    proc = llm_mod._run_provider(["/bin/sh", "-c", "echo ok"], timeout=10, env=dict(os.environ),
+                                 cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    elapsed = time.monotonic() - started
+    assert (proc.returncode, proc.stdout, proc.held_streams) == (0, b"ok\n", ())
+    assert elapsed < 2.0, f"a normal call took {elapsed:.2f} s"
+
+
+def test_a_guard_that_outlives_its_reap_bound_is_a_named_error(tmp_path, monkeypatch):
+    """The reap after SIGKILL is bounded. The fake wait reaps the guard for
+    real and then reports a timeout, so no process is left behind."""
+    original_wait = subprocess.Popen.wait
+
+    def slow_reap(self, timeout=None):
+        result = original_wait(self, timeout=timeout)
+        if timeout == llm_mod._REAP_SECONDS:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return result
+
+    monkeypatch.setattr(subprocess.Popen, "wait", slow_reap)
+    with pytest.raises(llm_mod.ProviderGuardError, match="still running"):
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0"], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+
+
+def test_an_interrupted_call_closes_its_output_pipes(tmp_path, monkeypatch):
+    """The reader threads close their pipe at end of file, so an interrupt
+    that skips collect() does not leave the pipes open while the exception
+    (and with it the call's frame) is still held."""
+    def interrupted_wait(status_r, deadline):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(llm_mod, "_await_guard", interrupted_wait)
+    before = len(os.listdir("/dev/fd"))
+    with pytest.raises(KeyboardInterrupt) as caught:
+        llm_mod._run_provider(["/bin/sh", "-c", "sleep 30"], timeout=30, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    deadline = time.monotonic() + 3
+    while len(os.listdir("/dev/fd")) > before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(os.listdir("/dev/fd")) == before, "an interrupted call left file descriptors open"
+    del caught
+
+
+def test_an_interrupt_kills_the_provider_group(tmp_path, monkeypatch):
+    """Review of BL-08: only TimeoutExpired killed the group, so a Ctrl-C
+    left the provider (in its own session) running."""
+    pidfile = tmp_path / "provider.pid"
+
+    def interrupted_wait(status_r, deadline):
+        # The call waits for the guard's exit report here, not in Popen.wait.
+        stop = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < stop:
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(llm_mod, "_await_guard", interrupted_wait)
+    with pytest.raises(KeyboardInterrupt):
+        llm_mod._run_provider(["/bin/sh", "-c", f"echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; sleep 30"], capture_output=True,
+                              timeout=30, env=dict(os.environ), cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    monkeypatch.undo()
+    assert _pid_gone(int(pidfile.read_text())), "the provider survived the interrupt"
+
+
+def test_an_interrupt_during_the_grace_wait_kills_the_descendants(tmp_path, monkeypatch):
+    """Second review of BL-08: only proc.wait was inside the cleanup, so an
+    interrupt while the readers waited out the descendants' grace period left
+    those descendants running."""
+    import threading
+
+    pidfile = tmp_path / "background.pid"
+    original_join = threading.Thread.join
+
+    def interrupted_join(self, timeout=None):
+        if timeout is not None:  # the grace wait for descendants holding the pipes
+            raise KeyboardInterrupt
+        return original_join(self, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", interrupted_join)
+    with pytest.raises(KeyboardInterrupt):
+        llm_mod._run_provider(["/bin/sh", "-c", f"sleep 30 & echo $! > {pidfile}; exit 0"],
+                              capture_output=True, timeout=60, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    monkeypatch.undo()
+    background = int(pidfile.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(background, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(background, 9)
+    pytest.fail(f"descendant {background} outlived the interrupted call")
+
+
+# A driver process makes one provider call, so a test can signal or kill the
+# caller itself. The provider records its own pid and a background child's.
+_SIGNAL_DRIVER = """\
+import json, os, signal, subprocess, sys
+from self_improve import llm
+# Fixed dispositions, whatever this test process inherited (nohup, a
+# background job that ignores SIGINT).
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+signal.signal(signal.SIGHUP, signal.SIG_IGN if sys.argv[2] == "ignore-hup" else signal.SIG_DFL)
+proc = llm._run_provider(["/bin/sh", "-c", sys.argv[1]], timeout=60,
+                         env=dict(os.environ), stdin=subprocess.DEVNULL)
+print(json.dumps({"returncode": proc.returncode, "stdout": proc.stdout.decode()}))
+"""
+
+
+class _ProviderDriver:
+    """Runs ``_SIGNAL_DRIVER`` in its own process group and kills every process
+    it started, even when the test fails."""
+
+    def __init__(self, tmp_path, provider_tail: str, mode: str = ""):
+        self.cli_pid_file = tmp_path / "cli.pid"
+        self.bg_pid_file = tmp_path / "bg.pid"
+        script = (f"sleep 30 & echo $! > {self.bg_pid_file}; "
+                  f"echo $$ > {self.cli_pid_file}.tmp; "
+                  f"mv {self.cli_pid_file}.tmp {self.cli_pid_file}; {provider_tail}")
+        self.stderr_path = tmp_path / "driver.stderr"
+        self.pids: list[int] = []
+        self.group: int | None = None
+        with open(self.stderr_path, "wb") as stderr:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-c", _SIGNAL_DRIVER, script, mode],
+                cwd=tmp_path, env=dict(os.environ), stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=stderr, start_new_session=True,
+            )
+
+    def wait_for_provider(self) -> None:
+        deadline = time.monotonic() + 15
+        while not self.cli_pid_file.exists():
+            if self.proc.poll() is not None:
+                pytest.fail(f"driver exited {self.proc.returncode} before the provider "
+                            f"started: {self.stderr_path.read_text()}")
+            if time.monotonic() > deadline:
+                pytest.fail("the provider never started")
+            time.sleep(0.05)
+        self.pids = [int(self.cli_pid_file.read_text()), int(self.bg_pid_file.read_text())]
+        for pid in self.pids:  # the CLI may already have exited; its child has not
+            try:
+                self.group = os.getpgid(pid)
+                break
+            except ProcessLookupError:
+                continue
+        else:
+            pytest.fail("the provider and its child exited before their group could be read")
+        assert self.group != self.proc.pid, "the provider must run outside the caller's group"
+        time.sleep(0.2)  # let the driver settle in its wait for the guard's report
+
+    def assert_provider_gone(self, wait_s: float = 3.0) -> None:
+        """Every process in the provider's group is gone, the guard included.
+
+        The guard leads the group, so its pid is the group id. On macOS,
+        killpg(group, 0) fails with EPERM while the only member left is an
+        unreaped zombie, so wait for the guard's pid first, and read EPERM as
+        "members remain"."""
+        for pid in [*self.pids, self.group]:
+            assert _pid_gone(pid, wait_s), f"provider process {pid} outlived the caller's call"
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                os.killpg(self.group, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            assert time.monotonic() < deadline, f"provider group {self.group} still has members"
+            time.sleep(0.05)
+        self.group = None  # confirmed gone: cleanup must not signal a reused group id
+
+    def cleanup(self) -> None:
+        if self.proc.poll() is None:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+            self.proc.wait()
+        self.proc.stdout.close()
+        if self.group is not None:
+            try:
+                os.killpg(self.group, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):  # gone, or only a zombie left
+                pass
+
+
+@pytest.mark.parametrize("signum, exit_status", [
+    (signal.SIGTERM, 128 + signal.SIGTERM),  # converted to SystemExit
+    (signal.SIGHUP, 128 + signal.SIGHUP),    # converted to SystemExit
+    (signal.SIGINT, -signal.SIGINT),         # KeyboardInterrupt re-raises SIGINT
+], ids=["SIGTERM", "SIGHUP", "SIGINT"])
+def test_a_signal_that_ends_the_caller_ends_the_provider_group(tmp_path, signum, exit_status):
+    """Review of BL-08: the provider runs in its own session, so a terminal
+    hangup or launchd's SIGTERM to the caller's group never reached it. The
+    exit status proves the caller ran its cleanup, not merely that it died."""
+    driver = _ProviderDriver(tmp_path, "wait")
+    try:
+        driver.wait_for_provider()
+        os.killpg(driver.proc.pid, signum)
+        assert driver.proc.wait(timeout=10) == exit_status, driver.stderr_path.read_text()
+        driver.assert_provider_gone()
+    finally:
+        driver.cleanup()
+
+
+def test_a_caller_killed_with_sigkill_leaves_no_provider_running(tmp_path):
+    """Review of BL-08: SIGKILL to the caller's group (launchd's cleanup of a
+    dead job) cannot be handled, and it does not reach the provider's session.
+    The guard sees its parent die and kills the group. The guard polls every
+    _GUARD_POLL_SECONDS (0.2 s); this test allows 3 s."""
+    driver = _ProviderDriver(tmp_path, "wait")
+    try:
+        driver.wait_for_provider()
+        os.killpg(driver.proc.pid, signal.SIGKILL)
+        assert driver.proc.wait(timeout=10) == -signal.SIGKILL
+        driver.assert_provider_gone(wait_s=3.0)
+    finally:
+        driver.cleanup()
+
+
+def test_a_caller_killed_during_the_grace_wait_leaves_no_descendant_running(tmp_path):
+    """The CLI exits at once; its background child holds stdout, so the call
+    is in its grace wait when the caller dies. The guard outlives the CLI for
+    this reason: it is still there to kill the child. This test allows 3 s."""
+    driver = _ProviderDriver(tmp_path, "exit 0")
+    try:
+        driver.wait_for_provider()
+        os.killpg(driver.proc.pid, signal.SIGKILL)
+        assert driver.proc.wait(timeout=10) == -signal.SIGKILL
+        driver.assert_provider_gone(wait_s=3.0)
+    finally:
+        driver.cleanup()
+
+
+def test_an_ignored_hangup_stays_ignored_and_the_call_completes(tmp_path):
+    """A run started under nohup ignores SIGHUP. The call must not turn that
+    hangup into an exit; it returns the provider's answer as usual."""
+    driver = _ProviderDriver(tmp_path, "kill $!; sleep 1; echo done", mode="ignore-hup")
+    try:
+        driver.wait_for_provider()
+        os.killpg(driver.proc.pid, signal.SIGHUP)
+        out, _ = driver.proc.communicate(timeout=20)
+        assert driver.proc.returncode == 0, driver.stderr_path.read_text()
+        assert json.loads(out) == {"returncode": 0, "stdout": "done\n"}
+        driver.assert_provider_gone()
+    finally:
+        driver.cleanup()
+
+
+# A fake agent CLI shaped like claude and codex: it starts its tool command in
+# a session of its own (claude starts its Bash tool shell with Node's
+# `detached: true`, which is setsid), and its SIGTERM shutdown kills the
+# tool's group. No group kill reaches the tool; only that shutdown can. The
+# agent creates the ready file after its handler is in place.
+_DETACHING_AGENT = """\
+import os, signal, subprocess, sys, time
+tool_pidfile, ready = sys.argv[1], sys.argv[2]
+tool = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                        start_new_session=True, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+open(tool_pidfile + ".tmp", "w").write(str(tool.pid))
+os.rename(tool_pidfile + ".tmp", tool_pidfile)
+def shutdown(signum, frame):
+    os.killpg(tool.pid, signal.SIGKILL)
+    tool.wait()
+    os._exit(143)
+signal.signal(signal.SIGTERM, shutdown)
+open(ready + ".tmp", "w").close()
+os.rename(ready + ".tmp", ready)
+time.sleep(60)
+"""
+
+# A CLI that records each SIGTERM and keeps running, so only SIGKILL ends it.
+_TERM_RECORDING_CLI = """\
+import os, signal, sys, time
+received, ready = sys.argv[1], sys.argv[2]
+signal.signal(signal.SIGTERM, lambda signum, frame: open(received, "a").write("SIGTERM\\n"))
+open(ready + ".tmp", "w").write(str(os.getpid()))
+os.rename(ready + ".tmp", ready)
+while True:
+    time.sleep(60)
+"""
+
+
+def _wait_for_file(path, wait_s: float = 15.0) -> None:
+    deadline = time.monotonic() + wait_s
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path.name} did not appear within {wait_s} s"
+        time.sleep(0.02)
+
+
+class _DetachedTool:
+    """The tool of ``_DETACHING_AGENT``. No group kill of the call reaches
+    it, so the test kills it itself, unless the test already saw it gone:
+    its pid, and so its group id, could then belong to another process."""
+
+    def __init__(self, tmp_path):
+        self.pidfile = tmp_path / "tool.pid"
+        self.confirmed_gone = False
+
+    def assert_gone(self, what: str) -> None:
+        assert _pid_gone(int(self.pidfile.read_text())), f"the agent's tool outlived {what}"
+        self.confirmed_gone = True
+
+    def cleanup(self) -> None:
+        if self.confirmed_gone or not self.pidfile.exists():
+            return
+        try:
+            os.killpg(int(self.pidfile.read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _timeout_after(path, monkeypatch) -> list[float]:
+    """Make the call's real timeout fire only after ``path`` exists, so the
+    CLI's SIGTERM handler is in place on a loaded machine too. Returns a list
+    that receives the time at which the timeout fired."""
+    original = llm_mod._await_guard
+    fired: list[float] = []
+
+    def after_ready(status_r, deadline):
+        _wait_for_file(path)
+        outcome = original(status_r, deadline)
+        fired.append(time.monotonic())
+        return outcome
+
+    monkeypatch.setattr(llm_mod, "_await_guard", after_ready)
+    return fired
+
+
+def test_a_timeout_lets_the_cli_end_the_tools_it_started_in_other_sessions(
+        tmp_path, monkeypatch):
+    """Third review of the guard: every kill path sent SIGKILL only, so the
+    CLI never ran its SIGTERM shutdown, and a tool it had started in another
+    session (an eval agent's Bash command) kept running in the sandbox."""
+    tool, ready = _DetachedTool(tmp_path), tmp_path / "ready"
+    _timeout_after(ready, monkeypatch)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            llm_mod._run_provider([sys.executable, "-c", _DETACHING_AGENT, str(tool.pidfile),
+                                   str(ready)], timeout=0.5, env=dict(os.environ),
+                                  cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+        tool.assert_gone("the timeout")
+    finally:
+        tool.cleanup()
+
+
+@pytest.mark.parametrize("signum, exit_status", [
+    (signal.SIGKILL, -signal.SIGKILL),       # the guard ends the group
+    (signal.SIGTERM, 128 + signal.SIGTERM),  # the caller's cleanup ends it
+    (signal.SIGINT, -signal.SIGINT),
+], ids=["SIGKILL", "SIGTERM", "SIGINT"])
+def test_a_caller_that_dies_lets_the_cli_end_the_tools_it_started_in_other_sessions(
+        tmp_path, signum, exit_status):
+    """Third review of the guard: the same detached tool outlived a caller
+    killed with SIGKILL, because the guard sent SIGKILL only. A caller ended
+    by SIGTERM or an interrupt goes through the call's own cleanup."""
+    tool, ready = _DetachedTool(tmp_path), tmp_path / "ready"
+    agent = tmp_path / "agent.py"
+    agent.write_text(_DETACHING_AGENT)
+    driver = _ProviderDriver(tmp_path, f"exec {sys.executable} {agent} {tool.pidfile} {ready}")
+    try:
+        driver.wait_for_provider()
+        _wait_for_file(ready)
+        os.killpg(driver.proc.pid, signum)
+        assert driver.proc.wait(timeout=10) == exit_status, driver.stderr_path.read_text()
+        driver.assert_provider_gone()
+        tool.assert_gone("the caller")
+    finally:
+        driver.cleanup()
+        tool.cleanup()
+
+
+def test_an_interrupt_before_the_readers_start_lets_the_cli_end_its_tools(tmp_path, monkeypatch):
+    """The cleanup in _run_provider, for an interrupt before _supervise's own
+    cleanup is in place, also sends SIGTERM first."""
+    tool, ready = _DetachedTool(tmp_path), tmp_path / "ready"
+
+    def interrupted_start(self):
+        _wait_for_file(ready)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading.Thread, "start", interrupted_start)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            llm_mod._run_provider([sys.executable, "-c", _DETACHING_AGENT, str(tool.pidfile),
+                                   str(ready)], timeout=30, env=dict(os.environ),
+                                  cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+        monkeypatch.undo()
+        tool.assert_gone("the interrupt")
+    finally:
+        monkeypatch.undo()
+        tool.cleanup()
+
+
+def test_a_cli_that_ignores_sigterm_is_killed_after_the_grace(tmp_path, monkeypatch):
+    """SIGTERM comes first and SIGKILL follows after _TERM_GRACE_SECONDS,
+    so a CLI that does not exit on SIGTERM still ends with the call."""
+    monkeypatch.setattr(llm_mod, "_TERM_GRACE_SECONDS", 1.0)
+    received, ready = tmp_path / "received", tmp_path / "ready"
+    fired = _timeout_after(ready, monkeypatch)
+    with pytest.raises(subprocess.TimeoutExpired):
+        llm_mod._run_provider([sys.executable, "-c", _TERM_RECORDING_CLI, str(received),
+                               str(ready)], timeout=0.5, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    after_timeout = time.monotonic() - fired[0]
+    assert received.read_text() == "SIGTERM\n"
+    assert _pid_gone(int(ready.read_text())), "a CLI that ignored SIGTERM outlived the call"
+    # The grace, then at most the drain and reap waits and some slack.
+    assert 0.9 <= after_timeout < 1.0 + 4.0, f"the call ended {after_timeout:.2f} s after its timeout"
+
+
+def test_a_cli_that_exits_on_sigterm_costs_no_grace(tmp_path, monkeypatch):
+    """The grace ends when the guard reports the CLI's exit, so a timeout
+    does not wait it out for a CLI that SIGTERM ends at once. The test sets
+    SIGTERM to its default itself: a test process started with SIGTERM
+    ignored would pass that on to the CLI."""
+    monkeypatch.setattr(llm_mod, "_TERM_GRACE_SECONDS", 30.0)
+    started = time.monotonic()
+    with _caller_disposition(signal.SIGTERM, signal.SIG_DFL):
+        with pytest.raises(subprocess.TimeoutExpired):
+            llm_mod._run_provider(["/bin/sh", "-c", "sleep 30"], timeout=0.5,
+                                  env=dict(os.environ), cwd=str(tmp_path),
+                                  stdin=subprocess.DEVNULL)
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"a timeout took {elapsed:.2f} s with a 30 s grace"
+
+
+def test_a_second_signal_during_the_grace_still_ends_in_sigkill(tmp_path, monkeypatch):
+    """A second interrupt while the cleanup waits out the grace must not skip
+    the SIGKILL. The fake selector raises KeyboardInterrupt in that wait, as
+    a signal handler would. The CLI ignores SIGTERM, so only SIGKILL ends it,
+    and SIGKILL must come from that same cleanup, before the guard's reap."""
+    monkeypatch.setattr(llm_mod, "_TERM_GRACE_SECONDS", 30.0)
+    received, ready = tmp_path / "received", tmp_path / "ready"
+    _timeout_after(ready, monkeypatch)
+    real_selectors = llm_mod.selectors
+
+    class InterruptedGrace(real_selectors.DefaultSelector):
+        def select(self, timeout=None):
+            if timeout == llm_mod._TERM_GRACE_SECONDS:
+                raise KeyboardInterrupt
+            return super().select(timeout)
+
+    monkeypatch.setattr(llm_mod, "selectors", SimpleNamespace(
+        DefaultSelector=InterruptedGrace, EVENT_READ=real_selectors.EVENT_READ))
+    sent = []
+    original = llm_mod._signal_group
+
+    def recording(proc, signum):
+        sent.append((signum, proc.returncode))
+        original(proc, signum)
+
+    monkeypatch.setattr(llm_mod, "_signal_group", recording)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        llm_mod._run_provider([sys.executable, "-c", _TERM_RECORDING_CLI, str(received),
+                               str(ready)], timeout=0.5, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    elapsed = time.monotonic() - started
+    assert sent == [(signal.SIGTERM, None), (signal.SIGKILL, None)], sent
+    assert _pid_gone(int(ready.read_text())), "the CLI outlived the interrupted grace"
+    assert elapsed < 5.0, f"the interrupted cleanup took {elapsed:.2f} s with a 30 s grace"
+
+
+def test_a_dead_caller_lets_a_cli_that_ignores_sigterm_live_out_the_grace_only(tmp_path):
+    """The guard's own escalation: SIGTERM when the caller dies, then SIGKILL
+    after _TERM_GRACE_SECONDS (2 s; the driver cannot be patched)."""
+    received, ready = tmp_path / "received", tmp_path / "ready"
+    cli = tmp_path / "cli.py"
+    cli.write_text(_TERM_RECORDING_CLI)
+    driver = _ProviderDriver(tmp_path, f"exec {sys.executable} {cli} {received} {ready}")
+    try:
+        driver.wait_for_provider()
+        _wait_for_file(ready)
+        os.killpg(driver.proc.pid, signal.SIGKILL)
+        assert driver.proc.wait(timeout=10) == -signal.SIGKILL
+        _wait_for_file(received, wait_s=3.0)  # within about one guard poll
+        time.sleep(0.5)
+        os.kill(int(ready.read_text()), 0)  # raises if SIGKILL came before the grace
+        driver.assert_provider_gone(wait_s=llm_mod._TERM_GRACE_SECONDS + 3.0)
+        assert received.read_text() == "SIGTERM\n"
+    finally:
+        driver.cleanup()
+
+
+# /bin/sh is bash on macOS and dash on Ubuntu, and the two differ in how they
+# treat a signal the shell sends itself. macOS also ships /bin/dash, so both
+# shells run on a Mac and the dash case runs on Linux as well.
+_SHELLS = [
+    "/bin/sh",
+    pytest.param("/bin/dash", marks=pytest.mark.skipif(
+        not os.path.exists("/bin/dash"), reason="/bin/dash is not installed")),
+]
+
+
+def _plain_session_run(argv: list[str]) -> tuple[int, bytes]:
+    """The same command as a plain child that leads its own session, as the
+    CLI's group did before the guard. Its own session keeps a `kill 0` away
+    from the test process."""
+    plain = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL,
+                           start_new_session=True, timeout=10)
+    return plain.returncode, plain.stdout
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+@pytest.mark.parametrize("script", [
+    "trap '' TERM; trap 'kill 0' EXIT; echo answer",
+    *(f"trap '' {sig}; kill -{sig} 0; echo answer" for sig in ("HUP", "INT", "TERM", "USR1")),
+], ids=["kill-0-on-exit", "HUP", "INT", "TERM", "USR1"])
+def test_a_cli_that_signals_its_own_group_does_not_kill_the_guard(tmp_path, script, shell):
+    """Review of the guard: the CLI shares the guard's process group, so a
+    shell's `trap 'kill 0' EXIT` also signalled the guard. The guard died
+    before it reported the exit, and a finished answer became a
+    ProviderGuardError. Each CLI here ignores the signal it sends, so it
+    exits 0 in every shell."""
+    proc = llm_mod._run_provider([shell, "-c", script], timeout=10, env=dict(os.environ),
+                                 cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    assert (proc.returncode, proc.stdout) == (0, b"answer\n")
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_a_cli_ended_by_its_own_kill_0_reports_its_true_status(tmp_path, shell):
+    """CI review of the guard: dash runs the EXIT trap's `kill 0` and then
+    dies of that SIGTERM, so the CLI's status is -15 there and 0 in bash.
+    The guard must report what the CLI really did, as a plain child shows."""
+    argv = [shell, "-c", "trap 'kill 0' EXIT; echo answer"]
+    plain = _plain_session_run(argv)
+    assert plain in ((0, b"answer\n"), (-signal.SIGTERM, b"answer\n")), plain
+    proc = llm_mod._run_provider(argv, timeout=10, env=dict(os.environ), cwd=str(tmp_path),
+                                 stdin=subprocess.DEVNULL)
+    assert (proc.returncode, proc.stdout) == plain
+
+
+def test_a_signal_the_guard_cannot_survive_is_a_guard_error(tmp_path):
+    """Characterizes the limit named in the guard's comment: a CLI that sends
+    its own group a signal the guard does not catch usually ends the guard
+    before it reports, so the call raises ProviderGuardError where a plain
+    child returns the CLI's status. Now and then the guard's report wins
+    that race, and the call returns the CLI's true status. Nothing else is
+    allowed. SIGKILL stands for the list, because the fault signals would
+    also write core files."""
+    argv = ["/bin/sh", "-c", "kill -KILL 0; echo unreachable"]
+    plain = _plain_session_run(argv)
+    assert plain == (-signal.SIGKILL, b"")
+    try:
+        proc = llm_mod._run_provider(argv, timeout=10, env=dict(os.environ),
+                                     cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    except llm_mod.ProviderGuardError as exc:
+        assert "before it reported the CLI's exit" in str(exc), exc
+    else:
+        assert (proc.returncode, proc.stdout) == plain
+
+
+@contextlib.contextmanager
+def _caller_disposition(signum: int, handler):
+    """Set this process's disposition of ``signum`` and unblock it for the
+    block, then restore both. A CI runner can start the test process with a
+    signal ignored (SIGQUIT on GitHub's macOS runner), and a child inherits
+    that, so a test of the default must set the default itself."""
+    previous = signal.getsignal(signum)
+    assert previous is not None, f"{signum} has a handler not set from Python; cannot restore it"
+    signal.signal(signum, handler)
+    blocked = signal.pthread_sigmask(signal.SIG_UNBLOCK, [signum])
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        signal.signal(signum, previous)
+
+
+# SIGTSTP is left out: the provider's group is orphaned, so the kernel drops a
+# default stop and a default SIGTSTP cannot be told apart from an ignored one.
+@pytest.mark.parametrize("disposition", ["default", "ignored"])
+@pytest.mark.parametrize("name", [n for n in llm_mod._GUARD_SURVIVES if n != "SIGTSTP"])
+def test_the_cli_keeps_the_callers_signal_dispositions(tmp_path, name, disposition):
+    """The guard catches those signals with Python handlers, which reset to
+    the default at exec, so a signal the CLI does not handle still ends it.
+    A signal the caller ignores stays ignored in the CLI. A plain child in
+    the same state is the reference: the guard must give the CLI exactly what a
+    plain child gets. Some runners cannot give even a plain child the default
+    (GitHub's macOS runner, for SIGQUIT); the case is then skipped by name
+    after the equality check, not failed."""
+    signum = getattr(signal, name)
+    argv = ["/bin/sh", "-c", f"kill -{name[3:]} $$; echo survived"]
+    expected = (-signum, b"") if disposition == "default" else (0, b"survived\n")
+    with _caller_disposition(signum, signal.SIG_DFL if disposition == "default" else signal.SIG_IGN):
+        plain = _plain_session_run(argv)
+        proc = llm_mod._run_provider(argv, timeout=10, env=dict(os.environ), cwd=str(tmp_path),
+                                     stdin=subprocess.DEVNULL)
+    assert (proc.returncode, proc.stdout) == plain, f"the guard changed the CLI's {disposition} {name}"
+    if plain != expected:
+        pytest.skip(f"this environment does not give a plain child the {disposition} {name}: {plain!r}")
+
+
+@pytest.mark.parametrize("script, timeout, error, signals", [
+    ("exit 0", 10, None, [signal.SIGKILL]),
+    ("sleep 30", 0.5, subprocess.TimeoutExpired, [signal.SIGTERM, signal.SIGKILL]),
+], ids=["exit", "timeout"])
+def test_the_group_is_never_signalled_after_the_guard_is_reaped(tmp_path, monkeypatch,
+                                                                script, timeout, error, signals):
+    """Second review of the guard: after a timeout the outer cleanup killed
+    the group again, after the guard was reaped. Its pid, and so the group
+    id, may then belong to an unrelated process group. A CLI that exited gets
+    no SIGTERM; one that is still running gets SIGTERM before SIGKILL."""
+    sent = []
+    original = llm_mod._signal_group
+
+    def recording(proc, signum):
+        sent.append((signum, proc.returncode))
+        original(proc, signum)
+
+    monkeypatch.setattr(llm_mod, "_signal_group", recording)
+    call = lambda: llm_mod._run_provider(  # noqa: E731
+        ["/bin/sh", "-c", script], timeout=timeout, env=dict(os.environ),
+        cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    if error is None:
+        call()
+    else:
+        with pytest.raises(error):
+            call()
+    assert sent == [(signum, None) for signum in signals], sent
+
+
+def test_an_argv_over_the_os_limit_is_still_a_spawn_error(tmp_path):
+    """Second review of the guard: E2BIG names the interpreter too, but it is
+    about this spawn, not a broken interpreter. _invoke must record it as
+    spawn_error, so it stays an OSError and is not a ProviderGuardError."""
+    with pytest.raises(OSError) as caught:
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0", "x" * (os.sysconf("SC_ARG_MAX") + 1)],
+                              timeout=10, env=dict(os.environ), cwd=str(tmp_path),
+                              stdin=subprocess.DEVNULL)
+    assert caught.value.errno == errno.E2BIG
+    assert not isinstance(caught.value, llm_mod.ProviderGuardError)
+
+
+def test_the_call_restores_the_previous_signal_handlers(tmp_path):
+    def custom(signum, frame):
+        raise AssertionError("no signal is sent in this test")
+
+    previous = {s: signal.signal(s, custom) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0"], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+        assert signal.getsignal(signal.SIGTERM) is custom
+        assert signal.getsignal(signal.SIGHUP) is custom
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
+def test_a_call_from_another_thread_leaves_the_signal_handlers_alone(tmp_path):
+    """Second review of the guard: only the main thread may set a signal
+    handler, so a call from a worker thread must skip them. Without that
+    check the call raised ValueError ("signal only works in main thread")."""
+    def custom(signum, frame):
+        raise AssertionError("no signal is sent in this test")
+
+    previous = {s: signal.signal(s, custom) for s in llm_mod._CALLER_END_SIGNALS}
+    outcome: dict = {}
+
+    def call() -> None:
+        try:
+            proc = llm_mod._run_provider(["/bin/sh", "-c", "echo ok"], timeout=10,
+                                         env=dict(os.environ), cwd=str(tmp_path),
+                                         stdin=subprocess.DEVNULL)
+            outcome["result"] = (proc.returncode, proc.stdout)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            outcome["error"] = exc
+
+    try:
+        worker = threading.Thread(target=call)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the call from a thread did not finish in 30 s"
+        after = {s: signal.getsignal(s) for s in llm_mod._CALLER_END_SIGNALS}
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+    assert "error" not in outcome, outcome
+    assert outcome["result"] == (0, b"ok\n")
+    assert all(handler is custom for handler in after.values()), after
+
+
+def test_a_cli_that_cannot_start_raises_the_spawn_error(tmp_path):
+    """The guard starts the CLI, so it reports the spawn error that
+    subprocess.Popen raised before; _invoke maps OSError to spawn_error."""
+    missing = tmp_path / "no-such-cli"
+    with pytest.raises(FileNotFoundError) as caught:
+        llm_mod._run_provider([str(missing)], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+    assert caught.value.filename == str(missing)
+    not_executable = tmp_path / "not-executable"
+    not_executable.write_text("#!/bin/sh\nexit 0\n")
+    with pytest.raises(PermissionError):
+        llm_mod._run_provider([str(not_executable)], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+
+
+def test_an_interrupt_before_the_readers_start_kills_the_provider_group(tmp_path, monkeypatch):
+    """Review of the guard: the reader threads started before the cleanup was
+    in place, so an interrupt there left the CLI running past its timeout in a
+    caller that caught the interrupt."""
+    pidfile = tmp_path / "provider.pid"
+
+    def interrupted_start(self):
+        stop = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < stop:
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading.Thread, "start", interrupted_start)
+    confirmed_gone = False
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            llm_mod._run_provider(["/bin/sh", "-c", f"echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; sleep 30"],
+                                  timeout=30, env=dict(os.environ), cwd=str(tmp_path),
+                                  stdin=subprocess.DEVNULL)
+        monkeypatch.undo()
+        provider = int(pidfile.read_text())
+        assert _pid_gone(provider), "the provider survived an interrupt before the readers started"
+        confirmed_gone = True
+    finally:
+        monkeypatch.undo()
+        if pidfile.exists() and not confirmed_gone:
+            try:
+                os.killpg(os.getpgid(int(pidfile.read_text())), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_a_guard_that_cannot_start_is_not_the_clis_spawn_error(tmp_path, monkeypatch):
+    """Review of the guard: a missing interpreter was reported as the CLI's
+    FileNotFoundError, so _invoke would record a spawn_error for the CLI."""
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "missing-python"))
+    with pytest.raises(llm_mod.ProviderGuardError, match="could not start"):
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0"], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)
+
+
+def test_a_missing_cwd_is_still_a_spawn_error(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0"], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path / "no-such-dir"), stdin=subprocess.DEVNULL)
+
+
+def test_a_failed_guard_is_a_named_error_with_its_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_mod, "_GUARD_SOURCE",
+                        "import sys\nsys.stderr.write('guard broke')\nsys.exit(3)\n")
+    with pytest.raises(llm_mod.ProviderGuardError, match="status 3.*guard broke"):
+        llm_mod._run_provider(["/bin/sh", "-c", "exit 0"], timeout=10, env=dict(os.environ),
+                              cwd=str(tmp_path), stdin=subprocess.DEVNULL)

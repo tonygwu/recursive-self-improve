@@ -255,7 +255,12 @@ def test_diagnosis_revisions_change_with_policy_and_history_even_when_source_sea
     from self_improve.dashboard import evidence_data as e
     from self_improve.execution_policy import set_class_policy
     p=proposal(store,tmp_path/'eligible.md',status='gated_pass')
-    store.update('proposals','id',p['id'],{'created_at':'2030-01-02T00:00:00Z'});store.commit()
+    # Automatic delivery belongs to the live run that created the proposal.
+    # This test process is its recorded live owner (run_liveness).
+    from tests.test_run_liveness import live_run_stats
+    store.insert('runs',{'id':'live-run','started':'2030-01-02T00:00:00Z','status':'running',
+                         'stats_json':live_run_stats()})
+    store.update('proposals','id',p['id'],{'created_at':'2030-01-02T00:00:00Z','run_id':'live-run'});store.commit()
     set_class_policy(store,'global',False,now='2029-01-01T00:00:00Z')
     before=e.detail(store,cfg,kind='proposal',source_id=p['id'])
     set_class_policy(store,'global',True,now='2030-01-01T00:00:00Z')
@@ -280,6 +285,24 @@ def test_current_and_historical_instruction_text_and_corruption(cfg,store,tmp_pa
     store.update('instruction_text_archives','id',row['id'],{'record_json':'[]'});store.commit()
     with pytest.raises(e.EvidenceError,match=row['id']) as corrupt:e.search(store,cfg,query='')
     assert corrupt.value.code=='EvidenceDataError'
+
+
+def test_an_unversioned_archive_stays_searchable_after_the_redaction_rules_change(cfg,store,tmp_path):
+    """BACKLOG BL-35: one retained text that the current rules would redact
+    made every evidence search raise. The archive keeps its own rules."""
+    from self_improve.dashboard import evidence_data as e
+    from self_improve import redact_legacy
+    from tests.test_rule_availability import known_copy
+    from self_improve.rule_availability import collect_availability
+    from tests.test_instruction_text import FIGMA_SHAPED,_UNVERSIONED,_rewritten,_store_directly,archives
+    repo=init_git_repo(tmp_path/'observed','AGENTS.md',FIGMA_SHAPED);known_copy(store,repo)
+    collect_availability(store,cfg,observed_at='2030-01-01T00:00:00Z')
+    legacy=_rewritten(archives(store)[0],FIGMA_SHAPED,redact_legacy.redact_text,_UNVERSIONED)
+    _store_directly(store,legacy)
+    rows=e.search(store,cfg,query='MyDesignSystem',kinds=['instruction'])['rows']
+    assert len(rows)==1
+    source=e.detail(store,cfg,kind='instruction',source_id=rows[0]['source_id'])['source']
+    assert source['id']==legacy['id'] and source['file']['text']==FIGMA_SHAPED
 
 
 def test_missing_detail_invalid_inputs_redacted_sources_and_hostile_html(cfg,store,tmp_path):

@@ -1,8 +1,10 @@
 """Exercise built wheel contents and imports outside the editable checkout."""
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
+import tomllib
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -43,13 +45,39 @@ def test_wheel_preserves_every_public_runtime_asset(wheel):
                 assert archive.read(member) == source.read_bytes(), member
 
 
+#: An anonymous pin: https (never ssh or a token URL) at a full 40-hex commit.
+#: A branch or tag here would make an installed wheel's router version depend on
+#: when it was built.
+_ANONYMOUS_PIN = re.compile(
+    r"^git\+https://github\.com/tonygwu/llm-quota-router@[0-9a-f]{40}$"
+)
+
+
 def test_wheel_retains_the_anonymous_pinned_router_dependency(wheel):
+    """The wheel must carry the pin pyproject declares, in anonymous form.
+
+    The expected commit is READ from pyproject rather than written here. A
+    literal second copy is not a stronger check -- it is the same fact twice,
+    and it fails on every legitimate bump, which trains people to edit the
+    constant without looking at what changed. The properties worth asserting
+    are that the wheel agrees with the source, and that the pin is an
+    anonymous immutable commit.
+    """
+    declared = [
+        dep for dep in
+        tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+        if dep.startswith("llm-quota-router")
+    ]
+    assert len(declared) == 1, declared
+    url = declared[0].split("@", 1)[1].strip()
+    assert _ANONYMOUS_PIN.match(url), url
+
     with zipfile.ZipFile(wheel) as archive:
         metadata = BytesParser().parsebytes(archive.read(
             next(n for n in archive.namelist() if n.endswith("/METADATA"))))
     router = [r for r in metadata.get_all("Requires-Dist") if r.startswith("llm-quota-router")]
     assert len(router) == 1
-    assert "git+https://github.com/tonygwu/llm-quota-router@ce138e1467127d07fa5974d64eaa337b0e913f1b" in router[0]
+    assert url in router[0], (url, router[0])
 
 
 def test_wheel_runs_without_checkout_or_personal_history(wheel, tmp_path):

@@ -89,21 +89,45 @@ fi
 /bin/mkdir -p "${STATE_DIR}/logs"
 
 # --- 1. single-instance lock -------------------------------------------------
+# ps prints lstart in the caller's locale and time zone. The nightly and the
+# deploy job may run under different ones, so both write and compare it in one
+# fixed format.
+start_time_of() {
+    LC_ALL=C TZ=UTC /bin/ps -o lstart= -p "$1" 2>/dev/null
+}
+
 acquire_lock() {
     if /bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
         echo "$$" > "${LOCK_DIR}/pid"
+        # The start time tells a reused PID from the process that took the lock.
+        start_time_of "$$" > "${LOCK_DIR}/started"
         return 0
     fi
     return 1
 }
 
+# True when the recorded PID is alive AND is still the process that took the
+# lock. A lock written before start times were recorded trusts the PID alone.
+lock_holder_live() {
+    local pid="$1" recorded current
+    [ -n "${pid}" ] && /bin/kill -0 "${pid}" 2>/dev/null || return 1
+    recorded="$(/bin/cat "${LOCK_DIR}/started" 2>/dev/null)"
+    [ -z "${recorded}" ] && return 0
+    current="$(start_time_of "${pid}")"
+    [ "${recorded}" = "${current}" ] && return 0
+    # A lock taken by the previous script recorded the writer's local format.
+    # Respect it rather than remove a live holder's lock on the first run.
+    current="$(/bin/ps -o lstart= -p "${pid}" 2>/dev/null)"
+    [ "${recorded}" = "${current}" ]
+}
+
 if ! acquire_lock; then
     HOLDER_PID="$(/bin/cat "${LOCK_DIR}/pid" 2>/dev/null)"
-    if [ -n "${HOLDER_PID}" ] && /bin/kill -0 "${HOLDER_PID}" 2>/dev/null; then
+    if lock_holder_live "${HOLDER_PID}"; then
         echo "skip night: lock held by live PID ${HOLDER_PID} (${LOCK_DIR})"
         exit 0
     fi
-    echo "removing stale lock ${LOCK_DIR} (recorded PID '${HOLDER_PID}' not running)"
+    echo "removing stale lock ${LOCK_DIR} (recorded PID '${HOLDER_PID}' not running, or reused by another process)"
     /bin/rm -rf "${LOCK_DIR}"
     if ! acquire_lock; then
         echo "skip night: lost lock race after stale removal (${LOCK_DIR})"
@@ -210,7 +234,7 @@ else
     echo "       and the mine stage's wall-clock deadline is what bounds it"
 fi
 
-${CAFFEINATE[@]+"${CAFFEINATE[@]}"} "${UV}" run --project "${PROJECT}" selfimprove run "$@" 2>&1
+${CAFFEINATE[@]+"${CAFFEINATE[@]}"} "${UV}" run --locked --project "${PROJECT}" selfimprove run "$@" 2>&1
 RUN_RC=$?
 
 # --- 4. propagate the pipeline's exit code -----------------------------------

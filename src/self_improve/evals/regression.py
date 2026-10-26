@@ -14,7 +14,9 @@ directory outside checkouts and installed packages.
   threshold is not met the verdict is ``ungated``. An entirely uninformative
   without-rule arm returns ``error``.
 - with-rule arm: :func:`with_arm_verdict` checks clean passes and uninformative
-  failures before deciding ``gated_pass``, ``ungated``, or ``gated_fail``.
+  failures before deciding ``gated_pass``, ``error``, or ``gated_fail``. An arm
+  dominated by uninformative failures never tested the rule, so it returns the
+  same non-voting ``error`` as an uninformative without-rule arm.
 
 The majority gate combines scenario outcomes. Execution permission belongs to
 the separate shared policy; ``ungated`` does not authorize automatic writes.
@@ -242,6 +244,7 @@ def gate(
     )
     detected = without.errors.get("graded_fail", 0)
     with_: object | None = None
+    served: list | None = None  # known identities; None when not checked
     # An arm in which EVERY trial was uninformative tested nothing, and must
     # not produce a verdict about the rule.
     #
@@ -280,6 +283,13 @@ def gate(
             cfg=cfg,
             with_errors=dict(with_.errors or {}),
         )
+        # A pass-count comparison means nothing when different models served
+        # the trials. `error` never votes, so the scenario cannot gate a rule.
+        if history is not None:
+            from ..eval_history import served_identities
+            served = served_identities(history.store, history.id, scenario)
+            if len(served) > 1:
+                verdict = "error"
 
     without_stats = dataclasses.asdict(without)
     with_stats = dataclasses.asdict(with_) if with_ is not None else None
@@ -316,6 +326,8 @@ def gate(
                         "without": without_stats,
                         "with": with_stats,
                         "detected_failures_without_rule": detected,
+                        **({"served_models": [{"provider": p, "model": m} for p, m in served]}
+                           if served is not None else {}),
                         "eval_trials": cfg.eval_trials,
                         "gate_without_min_failures": cfg.gate_without_min_failures,
                         "gate_with_min_passes": cfg.gate_with_min_passes,
@@ -362,7 +374,8 @@ def majority_verdict(tally: dict) -> str:
     Pure function of the counts so the decision is testable without running a
     single trial, and so the decision table can be read in one place:
 
-        gated_pass    >= GATE_PASS_VOTES passes AND zero fails
+        gated_pass    a majority of all tallied scenarios, and at least
+                      GATE_PASS_VOTES, pass AND zero fails
         gated_fail    >= GATE_FAIL_VOTES fails
         ungated       nothing reproduced anywhere, but scenarios DID run
         inconclusive  everything else, including "no scenario ran at all"
@@ -376,9 +389,14 @@ def majority_verdict(tally: dict) -> str:
     n_pass = int(tally.get("gated_pass", 0))
     n_fail = int(tally.get("gated_fail", 0))
     n_ungated = int(tally.get("ungated", 0))
+    # `eval_scenarios` is a cost knob, so it must not move the bar: two passes
+    # out of five scenarios are not a majority. The tally holds one outcome per
+    # configured scenario, errors included.
+    scenarios = sum(int(tally.get(k, 0)) for k in SCENARIO_OUTCOMES)
+    pass_votes = max(GATE_PASS_VOTES, scenarios // 2 + 1)
     if n_fail >= GATE_FAIL_VOTES:
         return "gated_fail"
-    if n_pass >= GATE_PASS_VOTES and n_fail == 0:
+    if n_pass >= pass_votes and n_fail == 0:
         return "gated_pass"
     if n_pass == 0 and n_fail == 0:
         return "ungated" if n_ungated else "inconclusive"
@@ -451,11 +469,15 @@ def gate_majority(generate, run_gate, *, scenarios: int) -> dict:
         raise last_exc if last_exc else RuntimeError("no eval spec was generated")
 
     verdict = majority_verdict(tally)
-    # The deciding scenario is the first that actually reproduced the mistake,
-    # since an `ungated` scenario tested nothing. `ab.rerun_applied` later
-    # re-tests this rule from one spec, and it should be one that bites.
+    # The deciding scenario is the evidence a proposal links to, so it must be
+    # one that supports the verdict: the first scenario with that verdict, then
+    # any scenario that tested the rule. An `ungated` scenario reproduced
+    # nothing and an `error` scenario tested nothing. `ab.rerun_applied` later
+    # re-tests this rule from that one spec, and it should be one that bites.
     deciding = next(
-        (r for r in results if r.get("verdict") != "ungated"), results[0]
+        (r for r in results if r.get("verdict") == verdict),
+        next((r for r in results if r.get("verdict") in ("gated_pass", "gated_fail")),
+             next((r for r in results if r.get("verdict") != "error"), results[0])),
     )
     return {
         **deciding,
@@ -478,8 +500,9 @@ def with_arm_verdict(with_stats: dict, *, min_passes: int) -> str:
 
     A rule is only condemned when the arm actually failed ON THE TASK. Failures
     where the agent asked a human, or where the runner or grader broke, never
-    tested the rule at all, so an arm dominated by them returns ``ungated``
-    rather than ``gated_fail``.
+    tested the rule at all, so an arm dominated by them returns ``error``, the
+    same non-voting outcome as an uninformative without-rule arm. ``ungated``
+    is reserved for "the mistake did not reproduce", which is not this case.
     """
     passes = int(with_stats.get("succeeded", 0))
     if passes >= min_passes:
@@ -488,5 +511,5 @@ def with_arm_verdict(with_stats: dict, *, min_passes: int) -> str:
     uninformative = sum(int(errors.get(k, 0)) for k in UNINFORMATIVE_FAILURES)
     failed = int(with_stats.get("attempted", 0)) - passes
     if failed and uninformative * 2 >= failed:
-        return "ungated"
+        return "error"
     return "gated_fail"

@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix='si-rules-read-browser-') as temp, sync_
             # Initial shared read owns its error and exposes complete request details.
             fail('**/api/rules/browse*');page.reload();page.wait_for_load_state('networkidle')
             banner=page.locator('#global-error')
-            expect(banner).to_contain_text('Could not read 1 of 4 endpoints')
+            expect(banner).to_contain_text('Could not read 1 of 3 endpoints')
             assert 'GET /api/' not in banner.inner_text()
             keys.activate(banner.get_by_text('Request details',exact=True))
             expect(banner.get_by_role('region',name='Complete request diagnostic')).to_contain_text(DETAIL)

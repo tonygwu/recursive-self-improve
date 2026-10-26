@@ -13,7 +13,7 @@ from self_improve.store import Store
 from tests.test_delivery_worker import env, approve, propose
 from tests.test_apply import cfg, store, insert_proposal
 from tests.test_model_jobs import env as evaluation_env, request as evaluation_request
-from tests.test_rebuild import _session, _incident
+from tests.test_rebuild import _session, _incident, _produced
 
 
 def dump(store):
@@ -71,7 +71,7 @@ def test_history_keeps_linked_live_transcript_while_unrelated_live_rows_go(env, 
     other = tmp_path/'other.jsonl'; other.write_text('{}\n')
     _session(store, str(kept), 'kept'); _session(store, str(other), 'other')
     incident = _incident(store, str(kept), 'kept', [{'text': 'invented retained evidence'}])
-    _incident(store, str(other), 'other', [])
+    _produced(store, str(other), _incident(store, str(other), 'other', []))
     store.link_incident_learning(incident, p['learning_id']); store.commit()
     result = rebuild_state(store, export_path=tmp_path/'backup')
     assert [r['file_path'] for r in store.query('SELECT * FROM sessions')] == [str(kept)]
@@ -248,7 +248,7 @@ def test_known_table_changes_refuse_before_export(env,tmp_path,alter):
 
 def test_ignored_deletion_is_not_reported_as_success(env,tmp_path):
     cfg,store,target=env;path=tmp_path/'live.jsonl';path.write_text('{}\n')
-    _session(store,str(path),'live');_incident(store,str(path),'live',[])
+    _session(store,str(path),'live');_produced(store,str(path),_incident(store,str(path),'live',[]))
     store.conn.execute("CREATE TRIGGER ignored BEFORE DELETE ON sessions BEGIN SELECT RAISE(IGNORE); END")
     store.commit();before=dump(store)
     with pytest.raises(ValueError,match='count.*sessions'):
@@ -267,7 +267,7 @@ def test_directory_in_place_of_transcript_preserves_only_surviving_window(env,tm
 def test_source_removed_while_backup_is_written_refuses_deletion(env,tmp_path,monkeypatch):
     from self_improve import rebuild
     cfg,store,target=env;path=tmp_path/'live.jsonl';path.write_text('{}\n')
-    _session(store,str(path),'live');_incident(store,str(path),'live',[{'text':'fixture'}]);store.commit()
+    _session(store,str(path),'live');_produced(store,str(path),_incident(store,str(path),'live',[{'text':'fixture'}]));store.commit()
     before=dump(store);backup=rebuild.backup_rebuild_rows
     def remove(payload,destination):
         result=backup(payload,destination);path.unlink();return result

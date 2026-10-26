@@ -60,6 +60,27 @@ def test_api_errors_stale_pages_and_missing_sources_are_named(cfg,store,tmp_path
         assert broken.status_code==500 and broken.json()['error']=='EvidenceDataError' and 'i05' in broken.json()['detail']
 
 
+def test_a_corrupt_running_run_reaches_evidence_detail_as_a_policy_error(cfg,store,tmp_path):
+    """BL-55 review: a running row with a corrupt process identity made proposal
+    and learning detail a 500 EvidenceDataError labelled "retained evidence",
+    although the run row is what is corrupt. The PolicyError handler answers,
+    and it names the run."""
+    seed(store,tmp_path)
+    store.insert('runs',{'id':'run-corrupt','started':'2030-01-01T00:00:00Z','finished':'','status':'running',
+        'stats_json':json.dumps({'process':{'pid':2**31,'started':'2030-01-01T00:00:00Z'}}),'report_path':''})
+    store.commit()
+    with TestClient(create_app(cfg,db_path=store.db_path),raise_server_exceptions=False) as client:
+        for url in ('/api/evidence/proposal/p00','/api/evidence/learning/l00'):
+            response=client.get(url)
+            assert response.status_code==500,(url,response.text)
+            body=response.json()
+            assert body['error']=='PolicyError',(url,body)
+            assert 'run run-corrupt: invalid recorded process identity' in body['detail'],(url,body)
+            assert 'retained evidence' not in body['detail'],(url,body)
+        # A source whose diagnosis needs no Review membership still reads.
+        assert client.get('/api/evidence/incident/unmined').status_code==200
+
+
 def test_coverage_rendering_distinguishes_archived_metadata_only_and_missing_schema():
     import subprocess
     from pathlib import Path

@@ -92,6 +92,30 @@ def test_connection_is_readonly(cfg):
     conn.close()
 
 
+@pytest.mark.parametrize("name", ["st#ate", "st?ate", "st%41ate"])
+def test_readonly_search_escapes_its_state_path(tmp_path, cfg, name):
+    """BL-48: f"file:{path}?mode=ro" let # or ? cut the path and drop mode=ro,
+    so SQLite opened or created a different database beside the state dir. A
+    %XX sequence was decoded into another path."""
+    state = tmp_path / name
+    cfg = dataclasses.replace(cfg, state_dir=str(state))
+    store = Store(cfg.state_path("state.db"))
+    store.insert("runs", {"id": "r1", "started": "2026-10-12T00:00:00Z"})
+    store.commit()
+    store.close()
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    conn = open_store_readonly(cfg)
+    try:
+        assert [r["id"] for r in conn.execute("SELECT id FROM runs")] == ["r1"]
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO runs (id, started) VALUES ('r2', 'now')")
+    finally:
+        conn.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == before, "nothing new beside the state dir"
+    assert {p.name for p in state.iterdir()} <= {"state.db", "state.db-wal", "state.db-shm"}
+
+
 def test_uses_cached_vectors_when_present(cfg):
     # A cached vector row for a learning must be used as-is (no re-encode):
     # plant a deliberately WRONG cached vector and observe it dominate.

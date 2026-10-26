@@ -42,7 +42,14 @@ def validated_delivery(checkpoint, diff, *, inverse_source=None):
             if not isinstance(content, str) or hashlib.sha256(content.encode('utf-8')).hexdigest() != delivery[name + '_hash']:
                 raise ValueError(name + ' content fingerprint changed')
         if inverse_source is None:
-            expected = apply_unified_diff(delivery['before_content'], diff)
+            # Opt out of the line-ending refusal. This recomputes the record's
+            # retained after_content from its own retained before_content, so
+            # it chooses no new bytes. A record made before the refusal existed
+            # can hold CRLF content or content without a final newline.
+            # Refusing it here would make that delivery unreadable and block
+            # its rollback. New edits are refused when
+            # they are previewed and when they are prepared.
+            expected = apply_unified_diff(delivery['before_content'], diff, refuse_rewritten_boundaries=False)
         else:
             from .rollback import reverse_applied_change
             expected = reverse_applied_change(inverse_source['before'], inverse_source['applied'], delivery['before_content'])

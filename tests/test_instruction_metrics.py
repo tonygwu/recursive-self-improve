@@ -216,3 +216,21 @@ def test_nested_cwd_walks_repository_root_and_excludes_nested_repositories(cfg,s
     assert other['totals']['bytes']==len('parent report')
     assert other['root']==str(repo)
     assert any(x['cause']=='nested_repository' for x in other['exclusions'])
+
+
+def test_oversized_files_do_not_spend_the_total_budget(cfg, store, tmp_path, monkeypatch):
+    """BL-44: used_bytes grew before the per-file size check, so files that
+    failed the 1 MiB cap still used the 16 MiB budget, and small files were
+    then omitted as total_byte_limit."""
+    from self_improve import instruction_metrics as metrics
+    repo = init_git_repo(tmp_path/'project', 'AGENTS.md', 'é\n'); key = known_copy(store, repo)
+    for i in range(6):
+        (repo/f'big-{i}.md').write_text('x' * 50)
+    (repo/'z-small.md').write_text('small')
+    monkeypatch.setattr(metrics, 'MAX_FILE_BYTES', 20)
+    monkeypatch.setattr(metrics, 'MAX_TOTAL_BYTES', 100)
+    collect(store, cfg, 1)
+    other = inventory.project_inventory(store, project_key=key)['records'][0]['measurements']['other_markdown']
+    assert [Path(f['path']).name for f in other['files']] == ['z-small.md'], other['files']
+    causes = [i['cause'] for i in other['issues']]
+    assert causes.count('file_byte_limit') == 6 and 'total_byte_limit' not in causes, causes

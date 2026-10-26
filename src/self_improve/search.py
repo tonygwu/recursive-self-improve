@@ -27,7 +27,7 @@ def open_store_readonly(cfg: Config) -> sqlite3.Connection:
     db_path = cfg.state_path("state.db")
     if not db_path.exists():
         raise SearchError(f"state DB does not exist: {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -96,6 +96,8 @@ def search_learnings(
         conn.close()
 
     want_in_force = (not statuses) if include_in_force is None else include_in_force
+    from .instruction_exclusions import included
+    project_paths = included(cfg, project_paths)
     units = list(_in_force_rule_units(cfg, project_paths)) if want_in_force else []
     return _rank(embedder, rows, cached, units, query, top_k, with_meta)
 

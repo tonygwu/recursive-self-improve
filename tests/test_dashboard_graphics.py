@@ -62,8 +62,8 @@ for (const calls of [{recorded:0,tokens_in:0,tokens_out:0},
 }
 assert.match(m.renderRunUsage({calls:{recorded:0}}),/Pipeline budget not recorded/);
 assert.match(usage([{pool:'<script>',used:1,limit:2}]),/&lt;script&gt;/);
-for (const [state,label] of Object.entries({refused:'Budget refused',unaccounted:'Accounting gap',
- interrupted:'Interrupted',limited:'Work omitted',budget_exhausted:'Budget exhausted',
+for (const [state,label] of Object.entries({refused:'Waiting on budget',unaccounted:'Accounting gap',
+ interrupted:'Interrupted',limited:'Work omitted',budget_exhausted:'Waiting on budget',
  unreadable:'Record unreadable',unknown_status:'Outcome unknown',ok:'Succeeded'})) {
  const labelHTML=m.renderRunStageState(state);
  assert.match(labelHTML,/class="run-stage-state"/);assert.ok(labelHTML.includes(label));

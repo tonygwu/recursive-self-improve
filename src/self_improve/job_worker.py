@@ -143,11 +143,29 @@ def run_once(store,cfg,*,_llm_factory=None):
                 store.update('commands','id',cid,{'state':'blocked','error_code':'JobRuntimeChanged','error_detail':'Execution code changed. Inspect and request a fresh job.','updated_at':utc_now_iso()})
                 return jobs.status(store,store.query_one('SELECT * FROM commands WHERE id=?',(cid,)))
             run_id=saved['run_id'] or new_id()
+            # This worker process becomes the run's live owner (run_liveness).
+            # A resumed run keeps its earlier stats and records the new owner.
+            from .run_liveness import recording_stats
             if not saved['run_id']:
-                store.insert('runs',{'id':run_id,'started':utc_now_iso(),'status':'running'})
+                store.insert('runs',{'id':run_id,'started':utc_now_iso(),'status':'running',
+                    'stats_json':_json(recording_stats({}))})
                 store.update('incident_jobs' if saved['action']=='mine_incident' else 'recovery_jobs' if saved['action']=='propose_recovery' else 'model_jobs','command_id',cid,{'run_id':run_id})
             else:
-                store.update('runs','id',run_id,{'status':'running','finished':''})
+                row=store.query_one('SELECT stats_json FROM runs WHERE id=?',(run_id,));problem=''
+                if row is None:problem=f'run {run_id} of job {cid} is missing'
+                else:
+                    try:previous=json.loads(row['stats_json'])
+                    except (TypeError,ValueError):problem=f'run {run_id} of job {cid}: unreadable stats_json'
+                    else:
+                        if not isinstance(previous,dict):problem=f'run {run_id} of job {cid}: stats_json is not an object'
+                if problem:
+                    # Blocked by name, as JobRuntimeChanged is. A raise here made
+                    # `serve` exit, and launchd restarted it on this same command
+                    # forever with nothing recorded. The run row stays as it is.
+                    store.update('commands','id',cid,{'state':'blocked','error_code':'JobRunUnreadable',
+                        'error_detail':problem+'. Repair the run row and retry, or request a fresh job.','updated_at':utc_now_iso()})
+                    return jobs.status(store,store.query_one('SELECT * FROM commands WHERE id=?',(cid,)))
+                store.update('runs','id',run_id,{'status':'running','finished':'','stats_json':_json(recording_stats(previous))})
             store.update('commands','id',cid,{'state':'running','updated_at':utc_now_iso()})
         saved={**saved,'run_id':run_id}
         evaluation_history = None

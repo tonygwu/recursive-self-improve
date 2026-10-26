@@ -42,6 +42,16 @@ The demo uses invented records in a temporary database. The regular pipeline's
 `run --dry-run` command writes operational state and is unsuitable as a test
 rehearsal. Do not point tests or demo decisions at a live database.
 
+## Backlog references
+
+Some comments and test names cite items such as `BL-65`, mention `BACKLOG.md`,
+or name commit IDs such as `930e04f`. These identify entries and commits in the
+maintainer's private repository, which is not published. They are kept so that
+copied source stays identical to the code it came from; the surrounding comment
+states the reason. For example, the redaction rules that tests compare against
+`930e04f:src/self_improve/redact.py` are the same file as
+`src/self_improve/redact.py` in this repository's 0.1.2 release commit `cf86dd0`.
+
 ## Browser checks
 
 `tests/browser/` holds disposable fixture servers and their verifiers. A fixture
@@ -99,6 +109,22 @@ Linux with Python 3.12 and macOS with Python 3.14, installs the dashboard extra,
 runs the full suite and boundary acceptance command, and builds and installs a
 wheel for the synthetic demo outside the checkout. Linux also scans the current
 tracked source with checksum-verified Gitleaks 8.30.1.
+
+CI runs the full suite in parallel with `pytest-xdist`:
+`uv run pytest -q -ra -n auto --dist loadgroup`. `-n auto` starts one worker per
+vCPU. That is 3 workers on macos-14, and on ubuntu-24.04 it is 4 for a public
+repository or 2 for a private one. Run that command locally before relying on
+CI. On a machine with many cores, replace `-n auto` with a small count such as
+`-n 3`. Keep `--dist loadgroup`: the default `--dist load` ignores the groups
+described below.
+
+Because tests run at the same time, a test cannot depend on another test's side
+effects or on a shared resource, such as a fixed port, a file outside its
+temporary directory, or a listing of the shared system temporary directory. If
+tests must share such a resource, give them one `pytest.mark.xdist_group` name
+so that one worker runs them in turn. `tests/test_deploy_prod.py` is an example.
+A group only orders the tests of one pytest run. It cannot stop another process
+on the same machine, such as a second checkout's suite, from using the resource.
 
 The workflow uses a read-only repository token for checkout, does not persist
 Git credentials, and needs no repository secrets. Actions use verified full

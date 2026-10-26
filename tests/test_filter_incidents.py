@@ -755,3 +755,58 @@ def test_the_boundary_test_is_actually_exercising_the_boundary():
         "the secret does not span the truncation limit; the test is vacuous"
     )
     assert len(text) > limit, "text is not long enough to truncate at all"
+
+
+_SHORTEST_CHECKED_PREFIX = 6
+
+
+def _assert_no_key_prefix(secret: str, text: str, where: str) -> None:
+    for cut in range(_SHORTEST_CHECKED_PREFIX, len(secret) + 1):
+        assert secret[:cut] not in text, (
+            f"a {cut}-char prefix of the key survived in {where}: "
+            "redaction must run before the length cap"
+        )
+
+
+def _assert_key_straddles_the_cap(text: str, secret: str) -> None:
+    """Guard the guard: a cut that keeps fewer characters of the key than the
+    shortest prefix the helper checks cannot fail on a reverted fix."""
+    from self_improve.filter_incidents import _MATCHED_TEXT_MAX
+
+    start = text.index(secret)
+    kept = _MATCHED_TEXT_MAX - start
+    assert _SHORTEST_CHECKED_PREFIX <= kept < len(secret), (
+        f"the cap at {_MATCHED_TEXT_MAX} keeps {kept} characters of the key; "
+        "the test is vacuous"
+    )
+
+
+def test_detector_snippets_redact_before_the_length_cap():
+    """BL-04: matched_text and sample_text were cut to 200 characters and then
+    redacted, so a key straddling the cut kept its head in clear text."""
+    secret = "AKIAABCDEFGHIJKLMNOP"
+    prefix = "from now on always use this key for the staging bucket "
+    prefix = (prefix + "x " * 100)[:193] + " "
+    _assert_key_straddles_the_cap(prefix + secret, secret)
+    result = detect([ev(ROLE_HUMAN, prefix + secret + " ok")], CFG)
+    standing = [i for i in result.incidents if i.signal_type == SIGNAL_STANDING_INSTRUCTION]
+    assert standing, "fixture must produce a standing-instruction incident"
+    for incident in standing:
+        _assert_no_key_prefix(secret, incident.matched_text, "matched_text")
+
+    # The key starts at index 193, so the old cut at 200 kept "AKIAABC".
+    error = "Error: AccessDenied " + "y " * 86 + " " + secret + " for bucket"
+    _assert_key_straddles_the_cap(error, secret)
+    events = [
+        ev(ROLE_TOOL_RESULT, error, kind=KIND_TOOL_RESULT, is_error=True,
+           ts=f"2026-08-10T10:0{k}:00Z")
+        for k in range(3)
+    ]
+    result = detect(events, CFG)
+    assert result.fingerprints and any(
+        i.signal_type == SIGNAL_REPEATED_ERROR for i in result.incidents
+    ), "fixture must produce a repeated-error fingerprint and incident"
+    for fp in result.fingerprints:
+        _assert_no_key_prefix(secret, fp.sample_text, "sample_text")
+    for incident in result.incidents:
+        _assert_no_key_prefix(secret, incident.matched_text, "matched_text")

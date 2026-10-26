@@ -73,3 +73,78 @@ def test_evidence_response_rejects_negative_counts_and_inherited_source_kinds():
 def test_palette_contains_every_routed_top_level_view():
     result=node('''console.log(JSON.stringify({views:app.VIEWS,pages:n.NAVIGATION_PAGES.filter(x=>!x.href.includes('?')).map(x=>x.href.slice(2))}));''')
     assert set(result['views'])==set(result['pages'])
+
+
+def test_an_open_palette_keeps_plain_review_keys_from_deciding():
+    """BL-49: wire() must ask the palette first. The SPA page model had no
+    showModal, so the palette never initialized under test, and the existing
+    check sent only repeated keys, which Review ignores anyway. Removing the
+    guard in app.js passed every test while plain `a` approved a lesson."""
+    result=node(r'''
+const listeners = {};
+const stub = (id) => ({ id, style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+  addEventListener(type, fn) { (this._l ||= {})[type] = fn; }, setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+  querySelector() { return null; }, querySelectorAll() { return []; }, focus() {}, scrollIntoView() {}, closest() { return null; }, contains() { return false; },
+  innerHTML: '', textContent: '', hidden: false, value: '' });
+const elements = new Map();
+const d = {
+  documentElement: stub('html'), body: stub('body'), activeElement: null, visibilityState: 'visible',
+  getElementById(id) { if (!elements.has(id)) elements.set(id, stub(id)); return elements.get(id); },
+  querySelector() { return null; }, querySelectorAll() { return []; },
+  addEventListener(type, fn) { (listeners[type] ||= []).push(fn); }, removeEventListener() {},
+};
+const dialog = d.getElementById('navigation-dialog');
+Object.assign(dialog, { open: false, showModal() { this.open = true; }, close() { this.open = false; } });
+globalThis.document = d;
+globalThis.window = { addEventListener() {}, localStorage: { getItem: () => null, setItem() {} } };
+globalThis.location = { hash: '#/review' };
+const requests = [];
+globalThis.fetch = (url, options) => { requests.push({ url, options }); return new Promise(() => {}); };
+app.wire();
+const family = { learning_id: 'invented-palette-lesson', proposals: [{ id: 'p', revision: 'r', reason_code: 'pending' }], target_rows: [] };
+app.state.route = 'review'; app.state.review = { families: [family] }; app.state.selectedFamily = family.learning_id;
+app.state.characterShortcuts = { enabled: true, notice: '' };
+app.state.reviewPreviews[family.learning_id] = { signature: JSON.stringify([['p', 'r']]),
+  data: { ready: true, revision: 'combined', targets: [], members: [{ proposal_id: 'p', revision: 'auth' }] } };
+const key = (k, extra = {}) => { const ev = { key: k, target: { tagName: 'BUTTON' }, defaultPrevented: false,
+  preventDefault() { this.defaultPrevented = true; }, ...extra }; (listeners.keydown || []).forEach(fn => fn(ev)); return ev; };
+const posts = () => requests.filter(r => r.options && r.options.method === 'POST').length;
+key('k', { ctrlKey: true });
+const opened = dialog.open;
+for (const k of ['a', 'r', 'j', 'k', 'o']) key(k);
+key('R', { shiftKey: true });
+await new Promise(r => setImmediate(r));
+const whileOpen = posts();
+const selectedWhileOpen = app.state.selectedFamily;
+dialog.close();
+key('a');
+await new Promise(r => setImmediate(r));
+console.log(JSON.stringify({ keydownListeners: (listeners.keydown || []).length, opened, whileOpen, selectedWhileOpen, afterClose: posts() }));
+''')
+    assert result["keydownListeners"] == 1 and result["opened"] is True
+    assert result["whileOpen"] == 0, "a Review key decided while the palette was open"
+    assert result["selectedWhileOpen"] == "invented-palette-lesson"
+    assert result["afterClose"] == 1, "control: the same key must decide once the palette closes"
+
+
+def test_a_recovery_link_must_name_a_lesson_and_a_mode():
+    """BL-46: #/review/recovery/null parsed as JSON null, openRecoveryJob threw
+    inside an async function, and the previous job's panel stayed on screen."""
+    result=node(r'''
+      const answers=[];
+      for(const text of ['null','123','[]','{"mode":"hook"}','{"learning_id":"L1","mode":""}','{"learning_id":"L1","mode":"bogus"}',
+                         '{"learning_id":"L1","mode":"hook"}','{"learning_id":"L2","mode":"correct_target"}','{"learning_id":"L3","mode":"regenerate_patch"}']){
+        try{answers.push(app.recoverySelectionFromLink(text).learning_id);}catch(error){answers.push('refused');}
+      }
+      console.log(JSON.stringify(answers));
+    ''')
+    assert result==['refused']*6+['L1','L2','L3']
+
+
+def test_the_spa_recovery_modes_are_the_server_modes():
+    """BL-46 review: a bogus mode opened an empty destination list with no
+    error. The SPA checks modes against its own list, so it must equal the
+    set the server accepts."""
+    from self_improve.recovery_jobs import MODES
+    result=node('console.log(JSON.stringify(app.RECOVERY_MODES));')
+    assert sorted(result)==sorted(MODES) and len(result)==len(MODES)

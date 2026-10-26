@@ -20,8 +20,8 @@ Progress is always attempted/succeeded/failed with an error taxonomy
 from __future__ import annotations
 
 import json
+import locale
 import re
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -223,6 +223,14 @@ def _final_state_summary(sandbox: Path, agent_output: str) -> str:
     return "\n".join(parts)
 
 
+def _as_text(data: bytes) -> str:
+    """Decode grader output as ``subprocess.run(text=True)`` did: the locale's
+    preferred encoding, strict errors and universal newlines. A decode error
+    is still a grader crash."""
+    text = data.decode(locale.getpreferredencoding(False))
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _grade(
     spec: EvalSpec,
     sandbox: Path,
@@ -233,18 +241,22 @@ def _grade(
     """Run the spec's grader. Returns (passed, detail). Raising here is a
     grader crash, which `run_trials` counts as 'grader_error'."""
     if spec.grader["type"] == GRADER_CODE:
-        proc = subprocess.run(
-            spec.grader["check"],
-            shell=True,
-            cwd=sandbox,
-            capture_output=True,
-            text=True,
+        # The check is model-written shell. Run it like a provider CLI: in its
+        # own process group, killed as a whole on timeout and after it exits,
+        # so a background child can neither outlive the grade nor hold the
+        # output pipes open until the timeout.
+        proc = _run_provider(
+            ["/bin/sh", "-c", spec.grader["check"]],
+            cwd=str(sandbox),
             timeout=grader_timeout_seconds,
         )
         detail = {
             "returncode": proc.returncode,
-            "stdout": _truncate_marked(proc.stdout, _SUMMARY_MAX_CHARS_PER_FILE),
-            "stderr": _truncate_marked(proc.stderr, _SUMMARY_MAX_CHARS_PER_FILE),
+            "stdout": _truncate_marked(_as_text(proc.stdout), _SUMMARY_MAX_CHARS_PER_FILE),
+            "stderr": _truncate_marked(_as_text(proc.stderr), _SUMMARY_MAX_CHARS_PER_FILE),
+            # Pipes a process outside the group still held when grading stopped
+            # reading (llm.HELD_OUTPUT_CONDITION); that process kept running.
+            "held_streams": list(proc.held_streams),
         }
         return proc.returncode == 0, detail
     # model grader (presence of model_grader is validated before any trial runs)
@@ -258,7 +270,7 @@ def _grade(
     return verdict, {"summary_chars": len(summary)}
 
 
-from ..llm import BudgetExhausted  # noqa: E402  (module-level import kept near use)
+from ..llm import BudgetExhausted, _run_provider  # noqa: E402  (module-level import kept near use)
 
 
 def run_trials(
@@ -285,7 +297,7 @@ def run_trials(
     ``transcripts_dir``.
 
     ``work_dir`` overrides the artifact root (default: fresh mkdtemp);
-    ``grader_timeout_seconds`` bounds the code grader's subprocess.
+    ``grader_timeout_seconds`` bounds the code grader's process group.
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")

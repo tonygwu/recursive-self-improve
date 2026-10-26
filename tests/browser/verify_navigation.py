@@ -124,6 +124,14 @@ with sync_playwright() as p:
         page.get_by_role('button',name='Save current page',exact=True).focus()
         for key in ('r','a','j','k'):
             page.get_by_role('button',name='Save current page',exact=True).dispatch_event('keydown',{'key':key,'repeat':True,'bubbles':True})
+        # Plain, non-repeated keys too: Review ignores repeated keys on its own,
+        # so only these prove the open palette owns the keyboard (BL-49).
+        posts_before=sum(1 for method,_ in requests if method=='POST')
+        for key in ('a','r','j','k','o'):
+            page.get_by_role('button',name='Save current page',exact=True).dispatch_event('keydown',{'key':key,'bubbles':True})
+        page.get_by_role('button',name='Save current page',exact=True).dispatch_event('keydown',{'key':'R','shiftKey':True,'bubbles':True})
+        page.wait_for_timeout(300)
+        assert sum(1 for method,_ in requests if method=='POST')==posts_before, 'a Review key decided while the palette was open'
         assert page.evaluate('import("/app.js").then(m=>m.state.selectedFamily)')==before
         page.keyboard.press('Escape')
         # Storage refusal is explicit, while the modal remains usable.
