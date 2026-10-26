@@ -26,6 +26,22 @@ class AvailabilityError(ValueError):
     """A recorded revision, observation, or collection cannot be trusted."""
 
 
+class SourceChanged(AvailabilityError):
+    """A plugin configuration source changed while one copy was inspected.
+
+    Only that copy's observation is untrustworthy: collect_availability
+    refuses it like an identity change and keeps collecting the others.
+    """
+
+
+#: Causes for which a copy's surface was refused before discovery: the
+#: retained inventory carries no files and unchecked discovery states.
+REFUSED_SURFACE_CAUSES = frozenset({
+    'working_copy_identity_changed', 'working_copy_missing', 'working_copy_not_git',
+    'source_changed_during_observation',
+})
+
+
 def timestamp(value, owner):
     normalized = normalize_timestamp(value)
     if normalized is None:
@@ -137,11 +153,15 @@ def capture_revision(store, cfg, event, *, captured_at, cache):
     units = [u for u in marked_units(source['applied']) if u['learning_id'] == learning_id]
     if len(units) != 1 or not units[0]['recognized']:
         raise AvailabilityError(f"application {event['id']}: no unique retained marked rule unit")
-    kind = 'file' if proposal['target_kind'] in {'rule_file', 'skill'} else 'bullet'
+    # A rule file or a newly created skill is one rule; an edit inside an
+    # existing skill is a marked bullet among human text, like any other file.
+    kind = 'file' if proposal['target_kind'] == 'rule_file' or (
+        proposal['target_kind'] == 'skill' and not source['before_exists']) else 'bullet'
     content = source['applied'] if kind == 'file' else delivered_bullet(source['before'], source['applied'], learning_id)
-    global_target = proposal['target_kind'] in {'global_claude_md', 'codex_global'}
+    global_target = proposal['target_kind'] in {'global_claude_md', 'codex_global', 'global_private'}
     if proposal['target_kind'] == 'skill':
-        global_target = Path(destination['target_path']).is_relative_to(Path(cfg.skills_dir).resolve())
+        global_target = any(Path(destination['target_path']).is_relative_to(Path(root).resolve())
+                            for root in (cfg.skills_dir, cfg.delivery_path('skill')))
     project = None if global_target else resolve_project(destination['repo_root'] or str(Path(destination['target_path']).parent), cache)
     if project is not None and project.method not in {'gh_repo_id', 'remote_url', 'git_root'}:
         raise AvailabilityError(f"application {event['id']}: project identity is not a verified repository")

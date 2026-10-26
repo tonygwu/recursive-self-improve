@@ -444,3 +444,131 @@ printf '%s\\n' "$PWD" "$@"
     result = subprocess.run(['/bin/bash', str(Path(cfg.production_repo_path) / 'ops' / script_name), '--check'], env=dict(redirects, PATH='/usr/bin:/bin', SI_UV=str(fake), SI_CONFIG=str(config), SI_PATH_EXTRA=str(tmp_path)), capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [cfg.production_repo_path, 'run', '--no-sync', '--frozen', 'selfimprove', '--config', str(config), 'worker' if script_name == 'run-worker.sh' else 'jobs', '--check']
+
+
+class DelayedRemovalCommands(FakeServiceCommands):
+    """A bootout acknowledgement precedes actual removal; no native processes."""
+    def __init__(self):
+        super().__init__()
+        self.pending_removal = {}
+        self.removal_polls = 2
+        self.partial_bootstrap_failure = False
+        self.fail_cleanup = False
+        self.unknown_after_bootout = False
+        self.removals = 0
+
+    def __call__(self, cmd, *, env=None):
+        if cmd[0] == '/bin/launchctl':
+            op = cmd[1]
+            if op == 'print' and cmd[2] in self.pending_removal:
+                self.calls.append(cmd)
+                if self.unknown_after_bootout:
+                    return subprocess.CompletedProcess(cmd, 5, '', 'invented unknown registration')
+                left = self.pending_removal[cmd[2]]
+                if left == 0:
+                    del self.pending_removal[cmd[2]]
+                    self.registered.remove(cmd[2])
+                    return subprocess.CompletedProcess(cmd, 113, '', 'absent')
+                self.pending_removal[cmd[2]] = left - 1
+                return subprocess.CompletedProcess(cmd, 0, 'state = SIGTERMed', '')
+            if op == 'bootstrap':
+                data = plistlib.loads(Path(cmd[-1]).read_bytes())
+                target = cmd[2] + '/' + data['Label']
+                if target in self.registered:
+                    self.calls.append(cmd)
+                    return subprocess.CompletedProcess(cmd, 5, '', 'old registration still present')
+                if self.partial_bootstrap_failure:
+                    self.partial_bootstrap_failure = False
+                    self.calls.append(cmd)
+                    self.registered.add(target)
+                    return subprocess.CompletedProcess(cmd, 5, '', 'bootstrap registered but verification failed')
+        result = super().__call__(cmd, env=env)
+        if cmd[0] == '/bin/launchctl' and cmd[1] == 'bootout' and result.returncode == 0:
+            self.removals += 1
+            self.registered.add(cmd[2])
+            self.pending_removal[cmd[2]] = 10000 if self.fail_cleanup and self.removals > 1 else self.removal_polls
+        return result
+
+
+def delayed_env(service_env):
+    services, cfg, config, _, agents = service_env
+    return services, cfg, config, DelayedRemovalCommands(), agents
+
+
+@pytest.mark.parametrize('service', ['delivery', 'models'])
+def test_worker_replacement_waits_for_actual_removal(service_env, service):
+    env = delayed_env(service_env)
+    operate(env, service, 'install')
+    assert 'registration verified' in operate(env, service, 'install')
+    assert env[3].pending_removal == {} and len(env[3].registered) == 1
+
+
+@pytest.mark.parametrize('service', ['delivery', 'models'])
+def test_worker_uninstall_waits_before_removing_plist(service_env, service):
+    env = delayed_env(service_env)
+    operate(env, service, 'install')
+    assert 'removed' in operate(env, service, 'uninstall')
+    assert not env[3].registered and not (env[4] / (service + '.plist')).exists()
+
+
+@pytest.mark.parametrize('action', ['install', 'uninstall'])
+def test_worker_removal_timeout_preserves_prior_plist(service_env, monkeypatch, action):
+    env = delayed_env(service_env)
+    services, _, _, runner, agents = env
+    operate(env, 'delivery', 'install')
+    dst = agents / 'delivery.plist'
+    before = dst.read_bytes()
+    runner.removal_polls = 10000
+    monkeypatch.setattr(services, 'REMOVAL_TIMEOUT_SECONDS', 0, raising=False)
+    with pytest.raises(services.ServiceError, match='Timed out waiting for service removal'):
+        operate(env, 'delivery', action)
+    assert dst.read_bytes() == before and len(runner.registered) == 1
+    assert len([c for c in runner.calls if c[0] == '/bin/launchctl' and c[1] == 'bootstrap']) == 1
+
+
+def test_worker_unknown_removal_state_does_not_retry_or_bootstrap(service_env):
+    env = delayed_env(service_env)
+    services, _, _, runner, agents = env
+    operate(env, 'delivery', 'install')
+    before = (agents / 'delivery.plist').read_bytes()
+    runner.unknown_after_bootout = True
+    with pytest.raises(services.ServiceError, match='Registration cannot be determined'):
+        operate(env, 'delivery', 'install')
+    assert (agents / 'delivery.plist').read_bytes() == before
+    assert len([c for c in runner.calls if c[0] == '/bin/launchctl' and c[1] == 'bootstrap']) == 1
+
+
+@pytest.mark.parametrize('service', ['delivery', 'models'])
+def test_worker_failed_bootstrap_waits_for_cleanup_before_restoration(service_env, service):
+    env = delayed_env(service_env)
+    services, _, _, runner, agents = env
+    operate(env, service, 'install')
+    dst = agents / (service + '.plist')
+    before = dst.read_bytes()
+    runner.partial_bootstrap_failure = True
+    with pytest.raises(services.ServiceError, match='prior state restored'):
+        operate(env, service, 'install')
+    assert runner.pending_removal == {} and len(runner.registered) == 1
+    assert dst.read_bytes() == before
+
+
+@pytest.mark.parametrize('service', ['delivery', 'models'])
+def test_failed_replacement_cleanup_preserves_both_definitions(service_env, monkeypatch, service):
+    env = delayed_env(service_env)
+    services, _, _, runner, agents = env
+    operate(env, service, 'install')
+    dst = agents / (service + '.plist')
+    before = dst.read_bytes()
+    monkeypatch.setenv('SI_PATH_EXTRA', os.environ['SI_PATH_EXTRA'] + ':/invented/new-bin')
+    runner.removal_polls = 0
+    runner.partial_bootstrap_failure = True
+    runner.fail_cleanup = True
+    monkeypatch.setattr(services, 'REMOVAL_TIMEOUT_SECONDS', 0)
+    with pytest.raises(services.ServiceError, match='restoration incomplete') as error:
+        operate(env, service, 'install')
+    backups = list(agents.glob('.self-improve-prior-*.plist.backup'))
+    assert len(backups) == 1 and backups[0].read_bytes() == before
+    assert backups[0].stat().st_mode & 0o777 == 0o600
+    assert str(backups[0]) in str(error.value)
+    assert dst.read_bytes() != before and len(runner.registered) == 1
+    assert len([c for c in runner.calls if c[0] == '/bin/launchctl' and c[1] == 'bootstrap']) == 2

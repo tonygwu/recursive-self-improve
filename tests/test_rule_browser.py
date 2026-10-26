@@ -170,3 +170,83 @@ def test_known_generation_and_corrupt_history_have_named_api_results(env):
             assert response.status_code==500
             assert response.json()['error']=='MiningHistoryError'
             assert history['id'] in response.json()['detail']
+
+
+def _invented_target_paths(store):
+    """Proposal target paths are searched. The fixture puts them below
+    tmp_path, which names the operating-system user (pytest-of-<user>), so a
+    zero-match search for a common word would depend on the machine."""
+    for row in store.query('SELECT id,target_path FROM proposals'):
+        store.update('proposals','id',row['id'],{'target_path':'/invented/'+row['target_path'].rsplit('/',1)[1]})
+    assert {row['target_path'] for row in store.query('SELECT target_path FROM proposals')}=={'/invented/AGENTS.md','/invented/GLOBAL.md'}
+
+
+def test_rules_search_matches_decoded_evidence_text_not_json(env):
+    """BL-46: Rules search indexed the JSON-encoded window, so a literal quote
+    or backslash never matched and JSON keys such as "role" matched. BL-46
+    review: indexing every string value made each role value match instead,
+    so "user" or "assistant" found every rule with a trajectory window."""
+    store,_,_=env
+    _invented_target_paths(store)
+    store.insert('sessions',{'file_path':'missing-q','source':'codex','session_id':'session-q'})
+    store.insert('incidents',{'id':'inc-q','session_file':'missing-q','session_id':'session-q',
+        'created_at':'2030-01-01T00:00:00Z','project_key':'repo:one','signal_type':'correction','matched_text':'synthetic note',
+        'window_json':json.dumps([{'role':'user','text':'ran "pytest-quoted" in C:\\work\\winpath'},
+                                  {'role':'assistant','text':'invented reply'},
+                                  {'role':'tool_result','text':'invented output'}])})
+    store.link_incident_learning('inc-q','single-21')
+    store.commit()
+    assert browse(env,query='"pytest-quoted"')['counts']['members']==1
+    assert browse(env,query='C:\\work\\winpath')['counts']['members']==1
+    assert browse(env,query='invented reply')['counts']['members']==1
+    assert browse(env,query='{"role":')['counts']['members']==0
+    # A key name alone is not evidence text, and neither is a role value.
+    for query in ('role','user','assistant','tool_result'):
+        assert browse(env,query=query)['counts']['members']==0,query
+
+
+def test_rules_search_matches_every_decoded_window_value_but_no_key(env):
+    """BL-46 review: searching only event['text'] lost recall. A repeated-error
+    window keeps its locations in other fields, so a search for the clone or
+    the session that saw the error matched nothing. Every decoded string value
+    is searchable, at any depth; key names and non-string values are not.
+    The role and ts values of an entry label the archive and are not
+    searchable; a nested object has no defined fields, so its values are."""
+    store,_,_=env
+    _invented_target_paths(store)
+    store.insert('sessions',{'file_path':'missing-r','source':'claude','session_id':'session-r'})
+    store.insert('incidents',{'id':'inc-r','session_file':'missing-r','session_id':'session-r',
+        'created_at':'2030-01-01T00:00:00Z','project_key':'repo:two','signal_type':'repeated_error','matched_text':'fingerprint-r',
+        'window_json':json.dumps([{'session_file':'/transcripts/other-clone-session.jsonl','project_path':'/Code/widget/repo-7',
+                                   'count_in_session':31337,'ts':'2031-07-19T13:57:46Z','text':'invented error',
+                                   'tool':{'name':'deeply-nested-tool','role':'nested-role-value'}}])})
+    store.link_incident_learning('inc-r','single-20')
+    store.commit()
+    for query in ('repo-7','other-clone-session','deeply-nested-tool','/Code/widget/repo-7','nested-role-value'):
+        assert browse(env,query=query)['counts']['members']==1,query
+    for query in ('project_path','count_in_session','session_file','31337','2031','2031-07-19','13:57:46'):
+        assert browse(env,query=query)['counts']['members']==0,query
+
+
+def test_rules_search_for_user_matches_a_users_home_path(env):
+    """BL-46 review, documented and not fixed: Rules search is a casefolded
+    substring match over target paths and session paths too. Every macOS home
+    path starts with /Users/, so a search for "user" matches each rule whose
+    target or session lives in a home directory, though no evidence text holds
+    the word. The tests above use /invented/ paths, which hide this. This test
+    pins the current behavior, so a change to it is a decision someone makes."""
+    store,_,_=env
+    _invented_target_paths(store)
+    store.commit()
+    assert browse(env,query='user')['counts']['members']==0
+    store.update('proposals','id','p-single-01',{'target_path':'/Users/invented-person/Code/widget/AGENTS.md'})
+    session='/Users/invented-person/.claude/projects/widget/session-u.jsonl'
+    store.insert('sessions',{'file_path':session,'source':'claude','session_id':'session-u'})
+    store.insert('incidents',{'id':'inc-u','session_file':session,'session_id':'session-u',
+        'created_at':'2030-01-01T00:00:00Z','project_key':'repo:one','signal_type':'correction','matched_text':'synthetic note',
+        'window_json':json.dumps([{'role':'assistant','text':'invented reply'}])})
+    store.link_incident_learning('inc-u','single-02')
+    store.commit()
+    for query in ('user','USERS','/users/invented-person'):
+        rows=browse(env,query=query,grouping=False)['rows']
+        assert {row['rule']['id'] for row in rows}=={'single-01','single-02'},query

@@ -236,3 +236,80 @@ def test_incremental_scans_match_one_whole_file_scan(tmp_path):
     assert count(env.store, "SELECT id FROM incidents") == 1
     assert count(whole.store, "SELECT id FROM incidents") == 3
     assert json.loads(occurrences[0]["supporting_lines_json"])
+
+
+# ---------------------------------------------------------------------------
+# BL-06: a resumed Codex scan must carry the session state the prefix set.
+# ---------------------------------------------------------------------------
+
+def _exec_meta(when: str, cwd: str) -> dict:
+    return {"timestamp": when, "type": "session_meta", "payload": {
+        "id": SID, "session_id": SID, "cwd": cwd, "originator": "codex_exec", "source": "exec"}}
+
+
+def _turn_context(when: str, cwd: str) -> dict:
+    return {"timestamp": when, "type": "turn_context", "payload": {"cwd": cwd, "model": "m"}}
+
+
+def _agent(text: str, when: str) -> dict:
+    return {"timestamp": when, "type": "event_msg",
+            "payload": {"type": "agent_message", "message": text, "phase": "final"}}
+
+
+def _scan_whole_and_resumed(tmp_path, head_of, tail_of):
+    results = {}
+    for mode in ("whole", "resumed"):
+        (tmp_path / mode).mkdir()
+        env = make_env(tmp_path / mode)
+        head, tail = head_of(env, tmp_path / mode), tail_of(env, tmp_path / mode)
+        if mode == "whole":
+            write_codex(env, head + tail)
+            stats = scan(env, "scan-1")
+        else:
+            path = write_codex(env, head)
+            scan(env, "scan-1")
+            append(path, jsonl(tail))
+            stats = scan(env, "scan-2")
+        incidents = [(r["signal_type"], r["matched_text"]) for r in
+                     env.store.query("SELECT signal_type, matched_text FROM incidents ORDER BY ts")]
+        results[mode] = (incidents, stats.detector_taxonomy.get("headless_text_skipped", 0),
+                         stats.events_denylisted)
+        env.store.close()
+    return results
+
+
+def test_a_resumed_headless_codex_scan_stays_headless(tmp_path):
+    results = _scan_whole_and_resumed(
+        tmp_path,
+        lambda env, root: [_exec_meta(ts(0), env.repo), x_user("Do the task.", ts(1))],
+        lambda env, root: [x_call(ts(2), "c1"), x_output(ts(3), "c1", code=0),
+                           x_user("no, that's wrong", ts(4))],
+    )
+    assert results["whole"][0] == [] and results["resumed"][0] == []
+    assert results["resumed"][1] == 1, "the appended machine prompt must count as headless text"
+
+
+def test_a_resumed_codex_scan_keeps_a_denylisted_turn_cwd(tmp_path):
+    def head(env, root):
+        denied = str(root / "denied-tree" / "secret-project")
+        return [x_meta(ts(0), env.repo), _turn_context(ts(1), denied), x_user("look at it", ts(2))]
+
+    results = _scan_whole_and_resumed(
+        tmp_path, head,
+        lambda env, root: [x_call(ts(3), "c1"), x_output(ts(4), "c1", code=0),
+                           _agent("The root cause was a stale cache in the SECRET billing module.", ts(5))],
+    )
+    assert results["whole"][0] == [] and results["resumed"][0] == []
+    assert results["resumed"][2] == 3, "every appended event ran in the denied tree"
+
+
+def test_a_resumed_codex_parse_keeps_absolute_line_numbers(tmp_path):
+    from self_improve.sources.codex import CodexSource
+
+    env = make_env(tmp_path)
+    path = write_codex(env, [x_meta(ts(0), env.repo), x_user("first", ts(1))])
+    offset = path.stat().st_size
+    append(path, jsonl([x_user("second", ts(2))]))
+    events = list(CodexSource(env.cfg).parse(str(path), offset))
+    assert [e.line_no for e in events] == [3]
+    assert events[0].session_id == SID and events[0].project_path == env.repo

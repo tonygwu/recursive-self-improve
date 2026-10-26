@@ -2,6 +2,8 @@
 
 This archive does not assert runtime loading. Readers use only their supplied
 Store; neither missing historical text nor a stale observation triggers a file read.
+Each archive is validated against the redaction rules version it records, so a
+later change to the redaction rules cannot make retained archives unreadable.
 """
 from __future__ import annotations
 
@@ -10,8 +12,8 @@ from copy import deepcopy
 import json
 
 from . import instruction_inventory as inventory
+from . import redact, redact_legacy
 from .mining_history import digest, encoded
-from .redact import redact_text
 from .rule_revisions import AvailabilityError, read_record, retained_revisions, text_hash
 
 MIGRATION = '0033_instruction_text'
@@ -22,6 +24,14 @@ FILE_METADATA = ('path', 'real_path', 'aliases', 'bytes', 'lines', 'content_hash
 COVERAGE = ('profile', 'issues', 'limits', 'deduplicated', 'unobserved_sources',
             'scope_note', 'runtime_loading_verified')
 COLUMNS = ('id', 'inventory_id', 'project_key', 'working_copy_id', 'observed_at', 'run_id')
+# Each new archive records the redaction rules version that wrote it, and a
+# reader validates every file against the rules of that version. An archive
+# without this field was written before versioning existed, by the rules that
+# redact_legacy freezes. A recorded version missing from RULES is refused,
+# never validated with other rules. When redact.RULES_VERSION changes, keep
+# the old rules as a frozen module and register them here.
+RULES_FIELD = 'redaction_rules'
+RULES = {redact.RULES_VERSION: redact.redact_text}
 
 
 class TextArchiveError(AvailabilityError):
@@ -63,26 +73,38 @@ def build_archive(surface, inventory):
                     or text_hash(raw) != meta['content_hash'] or len(raw.encode()) != meta['bytes']
                     or len(raw.splitlines()) != meta['lines']):
                 raise ValueError('surface content differs from inventory: ' + meta['real_path'])
-            text = redact_text(raw)
+            text = redact.redact_text(raw)
             files.append({**{key: deepcopy(meta[key]) for key in FILE_METADATA},
                           'file_key': digest(meta['real_path']), 'text': text,
                           'redacted_hash': text_hash(text), 'redacted_bytes': len(text.encode()),
                           'redacted_lines': len(text.splitlines())})
-        record = {**_base(inventory), 'files': files}
+        record = {**_base(inventory), RULES_FIELD: redact.RULES_VERSION, 'files': files}
         record['id'] = digest(record)
         return record
     except (KeyError, TypeError, ValueError) as exc:
         raise TextArchiveError(owner + ': cannot bind observed text: ' + str(exc)) from exc
 
 
+def _rules(record):
+    """The redaction rules that wrote this archive; an unknown version raises."""
+    if RULES_FIELD not in record:
+        return redact_legacy.redact_text
+    version = record[RULES_FIELD]
+    if not isinstance(version, str) or version not in RULES:
+        raise ValueError('unknown redaction rules version: ' + json.dumps(version))
+    return RULES[version]
+
+
 def _validate(record, inv):
     owner = TABLE + '.' + str(record.get('id', '?')) if isinstance(record, dict) else TABLE
     try:
         base = _base(inv)
-        if (set(record) != set(base) | {'id', 'files'} or any(record[k] != v for k,v in base.items())
+        keys = set(base) | {'id', 'files'}
+        if (set(record) - {RULES_FIELD} != keys or any(record[k] != v for k,v in base.items())
                 or record['id'] != digest({k:v for k,v in record.items() if k != 'id'})
                 or not isinstance(record['files'], list) or len(record['files']) != len(inv['files'])):
             raise ValueError('invalid identity, profile or inventory binding')
+        redact_text = _rules(record)
         for file, meta in zip(record['files'], inv['files']):
             if (set(file) != set(FILE_METADATA) | {'file_key','text','redacted_hash','redacted_bytes','redacted_lines'}
                     or any(file[key] != meta[key] for key in FILE_METADATA)
@@ -139,6 +161,9 @@ def record_archives(store, records):
             if previous:
                 if _read(store, previous, revisions, inv) != record:
                     raise TextArchiveError('immutable text archive replay changed')
+            elif record.get(RULES_FIELD) != redact.RULES_VERSION:
+                raise TextArchiveError('a new archive must record the current redaction rules '
+                                       + redact.RULES_VERSION)
             else:
                 store.insert(TABLE, {**{k:record[k] for k in COLUMNS},
                                      'record_json': encoded(record), 'record_hash': digest(record)})

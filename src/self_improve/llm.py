@@ -50,8 +50,9 @@ in ``tests/fixtures/llm/``:
 - codex ``--json`` stdout: JSONL events ``thread.started`` {thread_id},
   ``turn.started``, ``item.completed`` {item.type=="agent_message", text},
   ``turn.completed`` {usage}. The stream carries NO model field, so identity
-  is read from the session rollout file (found by thread_id under
-  ``codex_sessions_dir``): the last ``turn_context`` record's
+  is read from the session rollout file (found by thread_id under the invoked
+  account's ``CODEX_HOME/sessions``, or ``codex_sessions_dir`` when no home
+  override is present): the last ``turn_context`` record's
   ``payload.model``. If that cannot be read, the call fails as
   ``model_mismatch`` — identity is never silently assumed.
 
@@ -105,19 +106,80 @@ Fail-loud policy notes (deliberate choices, surfaced here rather than buried):
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import selectors
+import signal
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import quota_router
 from quota_router import select_account
+
+#: Router features this module's routing correctness depends on, as
+#: ``submodule -> what breaks without it``.
+#:
+#: ``quota_router.reserve`` applies ``manual_rate_per_day`` from the operator's
+#: config, which holds part of an account's weekly pool back for interactive use.
+#: A router predating it does not error on the key -- it ignores it, returns a
+#: well-formed pick, and names the reserved account. Nothing downstream can tell
+#: that pick from a correct one, so the miner spends quota reserved for
+#: interactive use and no signal says so.
+#:
+#: This is asserted rather than trusted because the dependency is PINNED to a
+#: commit, and a pinned commit can predate the reserve.
+_REQUIRED_ROUTER_FEATURES: dict[str, str] = {
+    "reserve": (
+        "manual_rate_per_day is ignored, so a pick can name an account whose "
+        "weekly pool is reserved for the operator's interactive use"
+    ),
+}
+
+
+def assert_router_conformance(module=quota_router) -> None:
+    """Raise when the installed quota_router is too old to route correctly here.
+
+    Checked against the imported package rather than its version string: the
+    version is static across many commits, so it cannot answer this question.
+    """
+    import importlib.util
+
+    def absent(name: str) -> bool:
+        # find_spec RAISES ModuleNotFoundError when the PARENT package is gone,
+        # and returns None only when the parent imports and the child does not.
+        # Both mean the feature is unavailable here, so both are absent.
+        try:
+            return importlib.util.find_spec(f"{module.__name__}.{name}") is None
+        except ImportError:
+            return True
+
+    missing = [
+        f"quota_router.{name} ({why})"
+        for name, why in _REQUIRED_ROUTER_FEATURES.items()
+        if absent(name)
+    ]
+    if not missing:
+        return
+    raise RuntimeError(
+        "installed quota_router is missing "
+        + "; ".join(missing)
+        + f". Loaded from {getattr(module, '__file__', '?')}. Bump the "
+        "llm-quota-router pin in pyproject.toml and re-run `uv sync`."
+    )
+
+
+assert_router_conformance()
 
 from .config import Config
 from .store import Store, new_id, utc_now_iso, LLM_SUCCESS_OUTCOMES
@@ -127,6 +189,436 @@ logger = logging.getLogger(__name__)
 # Source installs run adapters from their checkout. Installed wheels use the
 # caller's working directory unless the invocation supplies an explicit cwd.
 from .resources import SOURCE_ROOT as REPO_ROOT
+
+
+# How long an exited provider CLI may leave descendants holding its output
+# pipes before the whole process group is killed.
+_DESCENDANT_GRACE_SECONDS = 5.0
+
+# How often the provider guard checks that the caller is still alive. If the
+# caller dies without cleanup (SIGKILL, for example launchd killing a job's
+# process group), the provider group outlives it by at most about this long
+# plus _TERM_GRACE_SECONDS (below), about 2.2 s in all.
+_GUARD_POLL_SECONDS = 0.2
+
+# How long a CLI that is still running has to exit after SIGTERM to its group,
+# before SIGKILL. This applies at a timeout, at an interrupt or SIGTERM/SIGHUP
+# to the caller, and in the guard when the caller dies. The real CLIs start
+# their tool commands outside the group: claude starts its Bash tool shell and
+# its hooks with setsid, and codex runs tools in process groups of their own.
+# Only the CLI's own SIGTERM shutdown ends those, so SIGKILL alone left an eval
+# agent's command running and writing into the sandbox. The wait ends when the
+# guard reports the CLI's exit, so a CLI that exits promptly costs almost
+# nothing. A CLI that ignores SIGTERM costs the full 2 s. That covers a Node
+# CLI's handler on a loaded machine (it runs on the next event-loop turn), and
+# it keeps the whole cleanup of a stopped caller (this wait, then the drain and
+# reap waits below) near 4 s, so a service manager's own SIGKILL deadline is
+# unlikely to cut it short. A CLI that needs longer is still killed at 2 s:
+# claude 2.1.302 allows its own shutdown 5 s or more (session-end hooks and
+# flushes), so its later steps can be cut short.
+_TERM_GRACE_SECONDS = 2.0
+
+# How long a call waits to reap the guard after SIGKILL to its group.
+_REAP_SECONDS = 1.0
+
+# After the group is killed, how long the output readers together may take to
+# reach end of file. A reader still blocked after this names a pipe that a
+# process outside the group (one that called setsid) still holds.
+_DRAIN_SECONDS = 1.0
+
+# The condition logged, and named in ProviderResult.held_streams, when that
+# happens. The escaped process keeps running and its later output is lost.
+HELD_OUTPUT_CONDITION = "output held open by a process outside the provider group"
+
+# Signals that end the caller but do not reach the provider, because the
+# provider runs in its own session. While a call runs in the main thread, each
+# one becomes SystemExit(128 + signal), so the cleanup kills the provider group.
+_CALLER_END_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+class ProviderGuardError(RuntimeError):
+    """The process that supervises a provider CLI failed, so the CLI's outcome
+    is unknown. This is an infrastructure failure, never a model outcome."""
+
+
+class ProviderResult(subprocess.CompletedProcess):
+    """A finished provider call. ``held_streams`` names each output pipe
+    ("stdout", "stderr") that a process outside the provider group still held
+    when the call stopped reading (``HELD_OUTPUT_CONDITION``). The group kill
+    cannot reach that process, so it keeps running, and anything it writes to
+    the pipe later is not captured. The tuple is empty in the normal case."""
+
+    def __init__(self, args, returncode, stdout, stderr, held_streams: tuple[str, ...]):
+        super().__init__(args, returncode, stdout, stderr)
+        self.held_streams = held_streams
+
+
+# The provider guard is the leader of the provider's session and process group.
+# It starts the CLI as its child in the same group, reports the CLI's exit
+# status on the status pipe, and stays alive until the caller kills the group.
+# It polls for the caller's death (its parent pid changes) and then ends its
+# own group: SIGTERM, up to _TERM_GRACE_SECONDS for the CLI to exit, then
+# SIGKILL. So a caller that dies without cleanup cannot leave the provider
+# running. It runs with ``-I -S`` and imports only the standard library.
+# The CLI shares its group, so a CLI that signals its own group (a shell's
+# `trap 'kill 0' EXIT`) also signals the guard. The guard catches each signal
+# in _GUARD_SURVIVES with a no-op Python handler, and Python itself ignores
+# SIGPIPE and SIGXFSZ. A caught signal resets to its default in the CLI at
+# exec, so the CLI's signal dispositions are the ones it had before the guard
+# existed. A signal the caller ignores stays ignored, as before.
+# Every other signal whose default action ends a process also ends the guard
+# when the CLI sends it to its own group: SIGKILL; the fault signals SIGSEGV,
+# SIGBUS, SIGILL and SIGFPE, which a no-op handler must not catch because a
+# real fault would repeat forever; SIGABRT, SIGTRAP, SIGSYS and, on macOS,
+# SIGEMT; and on Linux also SIGIO (SIGPOLL), SIGPWR, SIGSTKFLT and the
+# real-time signals. The guard then usually dies before it reports the CLI's
+# exit, so the call raises ProviderGuardError where a direct Popen returned
+# the CLI's status, and a code-grader check that runs `kill -ABRT 0` is a
+# grader_error instead of a graded fail. Now and then the guard's watch thread
+# reports the CLI's status first (up to about 8 in 100 runs of `kill -KILL 0`
+# from /bin/sh on a loaded Mac), and the call returns that status.
+_GUARD_SURVIVES = ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2",
+                   "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGTSTP")
+
+# Errors from starting the guard that mean the interpreter itself cannot run.
+# Any other error (E2BIG for an argv over the OS limit, ENOMEM, EAGAIN) is
+# about this spawn, so it stays the OSError that _invoke records as
+# spawn_error.
+_GUARD_UNUSABLE_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.EPERM, errno.ENOEXEC, errno.ELOOP}
+)
+_GUARD_SOURCE = """\
+import json, os, signal, subprocess, sys, threading, time
+status, caller = int(sys.argv[1]), int(sys.argv[2])
+poll, grace = float(sys.argv[3]), float(sys.argv[4])
+for name in sys.argv[5].split(","):
+    signum = getattr(signal, name)
+    if signal.getsignal(signum) is not signal.SIG_IGN:
+        signal.signal(signum, lambda signum, frame: None)
+def report(**event):
+    os.write(status, json.dumps(event).encode() + b"\\n")
+if os.getppid() != caller:
+    os.killpg(0, signal.SIGKILL)
+try:
+    cli = subprocess.Popen(sys.argv[6:])
+except OSError as exc:
+    report(event="spawn_error", errno=exc.errno, strerror=exc.strerror, filename=exc.filename)
+    sys.exit(0)
+null = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(null, fd)
+exited = threading.Event()
+def watch():
+    returncode = cli.wait()
+    exited.set()
+    report(event="exited", returncode=returncode)
+threading.Thread(target=watch, daemon=True).start()
+while os.getppid() == caller:
+    time.sleep(poll)
+os.killpg(0, signal.SIGTERM)
+exited.wait(grace)
+os.killpg(0, signal.SIGKILL)
+"""
+
+
+def _signal_group(proc: subprocess.Popen, signum: int) -> None:
+    """Signal the guard's group. Callers do this only while the guard is
+    unreaped: after that, its pid and so the group id can be reused."""
+    try:
+        os.killpg(proc.pid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _end_group(proc: subprocess.Popen, status_r: int, cli_may_run: bool) -> None:
+    """Kill the provider group. While the CLI may still run, send SIGTERM
+    first, so the CLI can end the tool commands it started in other sessions,
+    and wait up to ``_TERM_GRACE_SECONDS`` for it to exit. Then SIGKILL, also
+    when a second signal interrupts that wait.
+
+    The wait ends when the status pipe turns readable: the guard writes the
+    CLI's exit report there, and the pipe reaches end of file when the guard
+    has died. The wait reads nothing, so it cannot fail on a report. After a
+    CLI exit or a spawn error, nothing waits: the CLI is gone. A lost guard
+    (one that died before it reported) has closed the pipe, so SIGKILL
+    follows SIGTERM at once and a CLI that outlived its guard gets no grace."""
+    try:
+        if cli_may_run:
+            _signal_group(proc, signal.SIGTERM)
+            with selectors.DefaultSelector() as selector:
+                selector.register(status_r, selectors.EVENT_READ)
+                selector.select(_TERM_GRACE_SECONDS)
+    finally:
+        _signal_group(proc, signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def _caller_signals_end_the_call():
+    """Turn each signal in ``_CALLER_END_SIGNALS`` into SystemExit for the
+    duration of a call, then restore the previous handlers.
+
+    Signal handlers can only be set from the main thread; a call from another
+    thread relies on the guard alone. A signal the process ignores stays
+    ignored, so a run under ``nohup`` still survives a hangup. A handler that
+    was not set from Python (``getsignal`` returns None) cannot be restored,
+    so it is left in place."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    previous: dict[int, object] = {}
+    try:
+        for signum in _CALLER_END_SIGNALS:
+            current = signal.getsignal(signum)
+            if current is signal.SIG_IGN or current is None:
+                continue
+            previous[signum] = signal.signal(signum, _terminate)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _await_guard(status_r: int, deadline: float) -> tuple[str, int | OSError | None]:
+    """Wait for the guard's report of the CLI's exit.
+
+    Returns ``("exited", returncode)``, ``("spawn_error", OSError)`` when the
+    CLI could not start, ``("timeout", None)`` at the deadline, or
+    ``("lost", None)`` when the guard ended without a report."""
+    pending = b""
+    with selectors.DefaultSelector() as selector:
+        selector.register(status_r, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                return "timeout", None
+            data = os.read(status_r, 4096)
+            if not data:
+                return "lost", None
+            pending += data
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                try:
+                    event = json.loads(line)
+                    kind = event["event"]
+                    if kind == "exited":
+                        return "exited", int(event["returncode"])
+                    if kind == "spawn_error":
+                        # The same exception subprocess.Popen raises itself.
+                        return "spawn_error", OSError(
+                            event["errno"], event["strerror"], event["filename"]
+                        )
+                    raise ValueError(f"unknown event {kind!r}")
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise ProviderGuardError(
+                        f"unreadable provider guard report {line!r}: {exc}"
+                    ) from None
+
+
+def _run_provider(
+    argv: list[str],
+    *,
+    timeout: float,
+    env: dict | None = None,
+    cwd: str | None = None,
+    input: bytes | None = None,
+    stdin=None,
+    capture_output: bool = True,
+    grace_seconds: float = _DESCENDANT_GRACE_SECONDS,
+) -> ProviderResult:
+    """``subprocess.run`` for provider CLIs, bounded at the process-group level.
+
+    ``subprocess.run`` kills only its direct child on timeout, so an agent's
+    descendants (an srt or npx wrapper's CLI, a dev server it started) kept
+    running and spending quota. It also waits for every holder of the output
+    pipes, so a background child turned a finished call into a timeout. The
+    CLI runs in its own session under a guard process (``_GUARD_SOURCE``);
+    when it exits or times out, the whole group is killed. SIGTERM, SIGHUP or
+    an interrupt during the call also kill the group, and the guard kills it
+    when the caller dies without cleanup. Each of these paths (a timeout,
+    SIGTERM, SIGHUP, an interrupt, the caller's death) sends SIGTERM first and
+    waits up to ``_TERM_GRACE_SECONDS`` for the CLI to exit, so the CLI can end
+    the tool commands it started in other sessions. That can add up to that
+    long to the call. After the CLI exits, both output
+    pipes share one grace period (``grace_seconds``) and, after the group
+    kill, one drain wait (``_DRAIN_SECONDS``). A pipe still held after that is
+    named in ``ProviderResult.held_streams`` and logged as
+    ``HELD_OUTPUT_CONDITION``. Raises ``subprocess.TimeoutExpired`` with the
+    output so far, ``OSError`` when the CLI cannot start, and
+    ``ProviderGuardError`` when the guard fails.
+    """
+    if not capture_output:
+        raise ValueError("provider calls always capture output")
+    if input is not None and stdin is not None:
+        raise ValueError("stdin and input arguments may not both be used")
+    if not argv:
+        raise ValueError("a provider call needs a command")
+    if not sys.executable:
+        raise ProviderGuardError("sys.executable is empty, so the provider guard cannot start")
+    deadline = time.monotonic() + timeout
+    # Install the handlers before the spawn, so no signal can arrive while the
+    # provider runs and the handlers are not yet in place.
+    with _caller_signals_end_the_call():
+        status_r, status_w = os.pipe()
+        try:
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", _GUARD_SOURCE,
+                     str(status_w), str(os.getpid()), str(_GUARD_POLL_SECONDS),
+                     str(_TERM_GRACE_SECONDS), ",".join(_GUARD_SURVIVES), *argv],
+                    stdin=subprocess.PIPE if input is not None else stdin,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    cwd=cwd,
+                    start_new_session=True,
+                    pass_fds=(status_w,),
+                )
+            except OSError as exc:
+                # Popen names the executable it could not run, or the cwd it
+                # could not enter. Only an unusable interpreter is a guard
+                # failure; a missing cwd or an argv over the OS limit stays
+                # the spawn error it always was.
+                if exc.filename == sys.executable and exc.errno in _GUARD_UNUSABLE_ERRNOS:
+                    raise ProviderGuardError(
+                        f"the provider guard could not start {sys.executable}: {exc}"
+                    ) from exc
+                raise
+            finally:
+                os.close(status_w)
+            try:
+                return _supervise(proc, argv, status_r, deadline, timeout, input, grace_seconds)
+            except BaseException:
+                # For an interrupt that lands before _supervise's own cleanup
+                # is in place. Once the guard is reaped its pid, and so the
+                # group id, can be reused, so never signal it after that.
+                if proc.returncode is None:
+                    try:
+                        _end_group(proc, status_r, cli_may_run=True)
+                    except BaseException:  # noqa: BLE001 - the original error wins
+                        pass
+                    try:
+                        proc.wait(timeout=_REAP_SECONDS)
+                    except BaseException:  # noqa: BLE001 - the original error wins
+                        pass
+                raise
+        finally:
+            os.close(status_r)
+
+
+def _supervise(
+    proc: subprocess.Popen,
+    argv: list[str],
+    status_r: int,
+    deadline: float,
+    timeout: float,
+    input: bytes | None,
+    grace_seconds: float,
+) -> ProviderResult:
+    chunks: dict[str, list[bytes]] = {"out": [], "err": []}
+
+    def drain(stream, key: str) -> None:
+        try:
+            for data in iter(lambda: stream.read1(65536), b""):
+                chunks[key].append(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            # At end of file, also after an interrupt that skipped collect().
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=drain, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    if input is not None:
+        def feed() -> None:
+            try:
+                proc.stdin.write(input)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=feed, daemon=True).start()
+
+    def collect() -> tuple[bytes, bytes, tuple[str, ...]]:
+        # One drain deadline for both pipes, so two held pipes cost one wait.
+        drain_deadline = time.monotonic() + _DRAIN_SECONDS
+        held = []
+        for name, reader, stream in zip(("stdout", "stderr"), readers, (proc.stdout, proc.stderr)):
+            reader.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+            # A descendant that left the group with setsid can still hold the
+            # pipe. Closing it would wait for the blocked reader's lock, i.e.
+            # for that descendant; leave it to the daemon thread instead.
+            if reader.is_alive():
+                held.append(name)
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+        # Copy each list first: a reader of a held pipe can still append.
+        return b"".join(list(chunks["out"])), b"".join(list(chunks["err"])), tuple(held)
+
+    def reap() -> None:
+        try:
+            proc.wait(timeout=_REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise ProviderGuardError(
+                f"provider guard {proc.pid} was still running {_REAP_SECONDS} s "
+                "after SIGKILL to its group"
+            ) from None
+
+    outcome = None
+    try:
+        try:
+            outcome, result = _await_guard(status_r, deadline)
+            if outcome == "exited":
+                # One grace deadline for both pipes, never past the call's deadline.
+                grace_deadline = min(time.monotonic() + grace_seconds, deadline)
+                for reader in readers:
+                    reader.join(timeout=max(0.0, grace_deadline - time.monotonic()))
+        finally:
+            # Every path: exit, timeout, interrupt, SIGTERM/SIGHUP, guard failure.
+            # Only an exit report or a spawn error shows that the CLI is gone.
+            _end_group(proc, status_r, cli_may_run=outcome not in ("exited", "spawn_error"))
+    except BaseException:
+        try:
+            reap()  # so no zombie outlives the call
+        except BaseException:  # noqa: BLE001 - the original error wins
+            pass
+        raise
+    reap()
+    out, err, held = collect()
+    if held:
+        logger.warning(
+            "%s: %s: %s still open %.1f s after the group was killed (%s). "
+            "That process keeps running, and its later output is not captured.",
+            argv[0], HELD_OUTPUT_CONDITION, " and ".join(held), _DRAIN_SECONDS,
+            f"exit status {result}" if outcome == "exited" else outcome,
+        )
+    if outcome == "spawn_error":
+        raise result
+    if outcome == "timeout":
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    if outcome == "lost":
+        raise ProviderGuardError(
+            f"the provider guard for {argv[0]!r} ended with status {proc.returncode} "
+            f"before it reported the CLI's exit; stderr: {_clip(_decode(err))}"
+        )
+    return ProviderResult(argv, result, out, err, held)
 
 # Model-class -> per-provider concrete model/alias handed to the CLI. The
 # reported model must CONTAIN this token or the call fails as model_mismatch.
@@ -676,6 +1168,12 @@ class LLMRunner:
                         f"failed: {pick_err}"
                     ),
                 )
+            if sandbox_dir:
+                pick, pick_err, pick_no = self._repick_until_sandbox_capable(
+                    call_id, model_class, pick, pick_no
+                )
+                if pick is None:
+                    return _ExecResult.fail("sandbox_incapable_fleet", error=pick_err)
             if not pick.fits:
                 return _ExecResult.fail(
                     "quota_exhausted",
@@ -739,6 +1237,21 @@ class LLMRunner:
                     error=f"quota failure on {failed_account}; re-pick failed: {pick2_err}",
                     provider_attempts=attempt_no,
                 )
+            if sandbox_dir:
+                pick2, pick2_err, pick_no = self._repick_until_sandbox_capable(
+                    call_id, model_class, pick2, pick_no, exclude=[failed_account]
+                )
+                if pick2 is None:
+                    return _ExecResult.fail(
+                        "quota_exhausted",
+                        provider=pick.provider,
+                        account=pick.account,
+                        error=(
+                            f"quota failure on {failed_account}; no sandbox-capable "
+                            f"re-pick: {pick2_err}"
+                        ),
+                        provider_attempts=attempt_no,
+                    )
             # This path exists to recover a failed call FAST, so a
             # not-meets-policy re-pick is treated like no capacity — no sleep.
             if (
@@ -885,7 +1398,12 @@ class LLMRunner:
     # ------------------------------------------------------------------
 
     def _repick_until_sandbox_capable(
-        self, call_id: str, model_class: str, pick: "_Pick", pick_no: int
+        self,
+        call_id: str,
+        model_class: str,
+        pick: "_Pick",
+        pick_no: int,
+        exclude: Sequence[str] = (),
     ) -> "tuple[_Pick | None, str, int]":
         """Keep re-picking until the account's provider can run a sandboxed
         trial, or the fleet is exhausted.
@@ -899,6 +1417,11 @@ class LLMRunner:
         account or runs out. The extra `+ 2` on the cap is slack for the
         library returning an account we did not ask for; it is a backstop, not
         the mechanism.
+
+        Every pick of a sandboxed call goes through here, including the fresh
+        pick after a policy wait and the re-pick after a quota failure.
+        ``exclude`` carries accounts that must stay excluded on every re-pick,
+        such as the account that just ran out of quota.
         """
         banned = {p.lower() for p in self.cfg.sandbox_incompatible_providers}
         if not banned:
@@ -921,7 +1444,7 @@ class LLMRunner:
             )
             pick_no += 1
             pick, err = self._pick(
-                call_id, model_class, pick_no=pick_no, exclude=rejected
+                call_id, model_class, pick_no=pick_no, exclude=[*exclude, *rejected]
             )
             if pick is None:
                 return (
@@ -1065,6 +1588,7 @@ class LLMRunner:
         """
         model = PROVIDER_MODEL_MAP[pick.provider][model_class]
         env = {**os.environ, **pick.env}
+        invocation_cwd = cwd or str(REPO_ROOT or Path.cwd())
         if pick.provider == "claude":
             argv = [
                 self.cfg.claude_path,
@@ -1105,19 +1629,19 @@ class LLMRunner:
             from .sandbox import agent_config_dir, policy_for_trial, wrap_argv, write_settings
 
             policy = policy_for_trial(
-                sandbox_dir, self.cfg, config_dir=agent_config_dir()
+                sandbox_dir, self.cfg, config_dir=agent_config_dir(env)
             )
             settings = write_settings(
                 policy, Path(sandbox_dir).parent / "srt-settings.json"
             )
             argv = wrap_argv(argv, settings, self.cfg)
         try:
-            proc = subprocess.run(
+            proc = _run_provider(
                 argv,
                 capture_output=True,
                 timeout=self.cfg.llm_timeout_seconds,
                 env=env,
-                cwd=cwd or str(REPO_ROOT or Path.cwd()),
+                cwd=invocation_cwd,
                 **run_kwargs,
             )
         except subprocess.TimeoutExpired as exc:
@@ -1133,7 +1657,20 @@ class LLMRunner:
         self._retain_attempt(call_id, attempt_no, pick.provider, proc.stdout, proc.stderr)
         if pick.provider == "claude":
             return self._parse_claude(proc.returncode, proc.stdout, proc.stderr, model)
-        return self._parse_codex(proc.returncode, proc.stdout, proc.stderr, model)
+        # Bind the receipt lookup to THIS subprocess's effective account home.
+        # A quota re-pick can change it within the same logical call. Never
+        # fall back to another account's receipt when this one is missing.
+        codex_home = env.get("CODEX_HOME")
+        if codex_home:
+            home = Path(codex_home)
+            if not home.is_absolute():
+                home = Path(invocation_cwd).absolute() / home
+            sessions_dir = home / "sessions"
+        else:
+            sessions_dir = Path(self.cfg.codex_sessions_dir)
+        return self._parse_codex(
+            proc.returncode, proc.stdout, proc.stderr, model, sessions_dir=sessions_dir
+        )
 
     def _parse_claude(
         self, returncode: int, stdout: bytes, stderr: bytes, expected_token: str
@@ -1196,13 +1733,14 @@ class LLMRunner:
         )
 
     def _parse_codex(
-        self, returncode: int, stdout: bytes, stderr: bytes, expected_token: str
+        self, returncode: int, stdout: bytes, stderr: bytes, expected_token: str,
+        *, sessions_dir: Path,
     ) -> _Attempt:
         """Parse codex exec --json JSONL and verify identity via the rollout.
 
         The JSONL stream has no model field; the reported model is the last
         ``turn_context.payload.model`` in the rollout file matching the
-        stream's thread_id under cfg.codex_sessions_dir. No rollout / no
+        stream's thread_id under this invocation's sessions_dir. No rollout / no
         model there -> identity unverifiable -> model_mismatch (never
         silently accepted).
         """
@@ -1254,7 +1792,7 @@ class LLMRunner:
                 status="parse_error",
                 error="codex JSONL: no item.completed agent_message event",
             )
-        model_reported, id_err = self._codex_reported_model(thread_id)
+        model_reported, id_err = self._codex_reported_model(thread_id, sessions_dir)
         identity_ok = bool(model_reported) and expected_token in model_reported
         return _Attempt(
             status="ok",
@@ -1271,7 +1809,7 @@ class LLMRunner:
             ),
         )
 
-    def _codex_reported_model(self, thread_id: str) -> tuple[str, str]:
+    def _codex_reported_model(self, thread_id: str, sessions_dir: Path) -> tuple[str, str]:
         """Read the served model out of the rollout DATA (never mtime).
 
         Returns (model, "") or ("", why-not). Malformed rollout lines are
@@ -1280,7 +1818,7 @@ class LLMRunner:
         """
         if not thread_id:
             return "", "codex JSONL had no thread.started thread_id"
-        root = Path(self.cfg.codex_sessions_dir)
+        root = sessions_dir
         matches = sorted(root.glob(f"**/rollout-*{thread_id}.jsonl"))
         if not matches:
             return "", f"no rollout file for thread {thread_id} under {root}"

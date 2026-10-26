@@ -9,7 +9,7 @@ import json
 from .. import mining_history, rule_families
 from . import queries, evidence_identity as identity
 
-TARGETS = {'all': None, 'global': {'global_claude_md','codex_global'},
+TARGETS = {'all': None, 'global': {'global_claude_md','codex_global','global_private'},
            'project': {'project_agents_md','project_claude_md','rule_file'},
            'skill': {'skill'}, 'hook': {'hook'}, 'none': set()}
 SORTS = {'evidence','recent','title','state'}
@@ -64,6 +64,34 @@ def _page(rows, *, limit, cursor, revision, selection):
     return selected, {'next_cursor':next_cursor,'offset':offset,'count':len(rows),'limit':limit}
 
 
+def _decoded_strings(value):
+    """Every string value at any depth, without key names or other scalars."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, list):
+        return [text for item in value for text in _decoded_strings(item)]
+    return []
+
+
+# Window entry fields whose values label the archive, not the evidence. The
+# value of 'role' is a speaker label (human, assistant, tool_result, system),
+# so a search for "assistant" matched every rule with a trajectory window. The
+# value of 'ts' is a machine timestamp. No other field that Rules search reads
+# is a timestamp, and its digits matched tokens such as "2026" in every window.
+# incident_evidence.parse_window defines both fields on the entry itself. A
+# nested object has no defined fields, so its values all stay searchable.
+_WINDOW_LABEL_FIELDS = frozenset({'role', 'ts'})
+
+
+def _window_strings(window):
+    """Searchable decoded strings of a window: every string value at any
+    depth, except the role and ts values of each entry."""
+    return [text for entry in window for text in _decoded_strings(
+        {k: v for k, v in entry.items() if k not in _WINDOW_LABEL_FIELDS} if isinstance(entry, dict) else entry)]
+
+
 def _matches(store, rows, query, identities):
     if not query:
         return {row['id'] for row in rows}
@@ -81,7 +109,12 @@ def _matches(store, rows, query, identities):
             window = queries._json_arr(inc['window_json'], 'learning ' + inc['learning_id'] + ' incident ' + inc['id'] + ' window_json')
             attribution=identity.identity(identities,inc)
             texts[inc['learning_id']] += '\n' + _json(identity.search_values(attribution)).casefold()
-            texts[inc['learning_id']] += '\n' + (str(inc['matched_text']) + '\n' + _json(window) + '\n' + inc['session_id'] + '\n' + inc['signal_type'] + '\n' + inc['project_key']).casefold()
+            # Search decoded string values. A JSON encoding escapes quotes and
+            # backslashes and adds key names; event text alone drops the
+            # locations a repeated-error entry keeps in other fields. Entry
+            # labels (role, ts) are not evidence text.
+            window_text = '\n'.join(_window_strings(window))
+            texts[inc['learning_id']] += '\n' + (str(inc['matched_text']) + '\n' + window_text + '\n' + inc['session_id'] + '\n' + inc['signal_type'] + '\n' + inc['project_key']).casefold()
     return {lid for lid, text in texts.items() if all(token in text for token in tokens)}
 
 

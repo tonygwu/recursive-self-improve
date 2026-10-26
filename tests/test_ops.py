@@ -7,8 +7,10 @@ working-directory resolution, and the inherited PATH."""
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
+import shutil
 import re
 import subprocess
 import sys
@@ -522,3 +524,274 @@ def test_worker_script_runs_its_own_checkout_without_syncing_dependencies(tmp_pa
     result=subprocess.run(['/bin/bash',str(script),'--once'],env={'PATH':'/usr/bin:/bin','SI_PATH_EXTRA':str(tmp_path),'SI_UV':str(fake)},capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     assert result.stdout.splitlines()==[str(project),'run','--no-sync','--frozen','selfimprove','worker','--once']
+
+
+INSPECT_GATE = REPO / "ops" / "inspect-gate-verdicts.sh"
+GATE_0023_APPLIED = "2026-09-15T00:00:00.000000Z"
+
+
+def _gate_state(state_dir):
+    """Invented runs and eval_results with each kind of run link.
+
+    nightly-1 links res-one-1 through an eval attempt and res-hist-3 only
+    through proposal_eval_history. nightly-2 links res-two-2. nightly-0 has
+    only res-old-0, which carries no link, like a result from before 0023.
+    Migration 0023 is recorded as applied at GATE_0023_APPLIED, after
+    nightly-0 started and before nightly-1 started, rather than at the
+    wall-clock time the fixture ran.
+    """
+    import sqlite3
+    from self_improve.store import Store
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(state_dir / "state.db")
+    store.conn.execute("UPDATE schema_migrations SET applied_at=? WHERE name='0023_eval_attempts'",
+                       (GATE_0023_APPLIED,))
+    assert store.conn.execute("SELECT changes()").fetchone()[0] == 1
+    for run, started in (("nightly-0", "2026-09-01T02:30:00Z"), ("nightly-1", "2026-10-01T02:30:00Z"),
+                         ("nightly-2", "2026-10-02T02:30:00Z")):
+        store.insert("runs", {"id": run, "started": started, "status": "ok"})
+    for result, started in (("res-old-0", "2026-09-01T03:00:00Z"), ("res-one-1", "2026-10-01T03:00:00Z"),
+                            ("res-two-2", "2026-10-02T03:00:00Z"), ("res-hist-3", "2026-10-01T04:00:00Z")):
+        store.insert("eval_results", {"id": result, "kind": "regression", "started": started, "verdict": "gated_pass"})
+    for result, run, started in (("res-one-1", "nightly-1", "2026-10-01T03:00:00Z"),
+                                 ("res-two-2", "nightly-2", "2026-10-02T03:00:00Z")):
+        attempt = "att-" + result
+        store.conn.execute("INSERT INTO eval_attempts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (attempt, "gate", "p", "l", run, "", "s", started, "{}", "h"))
+        store.conn.execute("INSERT INTO eval_attempt_events VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           ("ev-" + result, attempt, "scenario:0:result", "scenario_result", 0, "", -1, started,
+                            json.dumps({"data": {"eval_result_id": result}}), "h"))
+    store.commit()
+    store.close()
+    # The history row names an invented proposal and revision; this plain
+    # connection leaves foreign keys off so no proposal fixture is needed.
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute("INSERT INTO proposal_eval_history VALUES (?,?,?,?,?,?,?)",
+                     ("hist-3", "invented-proposal", "invented-revision", "nightly-1", "res-hist-3",
+                      "gated_pass", "2026-10-01T04:00:00Z"))
+    conn.close()
+    return state_dir / "state.db"
+
+
+def _inspect_gate(state_dir, *args):
+    env = {**os.environ, "SI_STATE_DIR": str(state_dir)}
+    return subprocess.run(["bash", str(INSPECT_GATE), *args], capture_output=True, text=True, env=env)
+
+
+def test_gate_verdict_inspection_shows_only_results_linked_to_the_run(tmp_path):
+    """BL-47: the script joined eval_results to a run by start time with no
+    upper bound, so an older run showed every later verdict; it also opened
+    the live database read-write and put the run id into SQL text."""
+    _gate_state(tmp_path)
+    out = _inspect_gate(tmp_path, "nightly-1")
+    assert out.returncode == 0, out.stderr
+    assert "res-one-" in out.stdout and "res-two-" not in out.stdout, out.stdout
+    # A result linked only through proposal_eval_history belongs to its run.
+    assert "res-hist" in out.stdout and "res-old-" not in out.stdout, out.stdout
+    bad = _inspect_gate(tmp_path, "x' or '1'='1")
+    assert bad.returncode != 0 and "invalid run id" in bad.stderr
+
+
+PRE_0023_HINT = ("1 result(s) in this database have no eval attempt and no run\n"
+                 "  history. Results recorded before migration 0023 can lack both, so\n"
+                 "  this run may have produced some of them.")
+
+
+def test_gate_verdict_inspection_names_a_run_without_linked_results(tmp_path):
+    """BL-47 review: a run whose results all predate eval attempts printed an
+    empty section, which reads as "this run produced no results". The note
+    must say only what the query found; the pre-0023 cause is a possibility
+    the script offers when some result has no eval attempt and no history."""
+    import sqlite3
+
+    db = _gate_state(tmp_path)
+    # An event with no result id. NOT IN against its NULL would match no
+    # row and hide res-old-0, which no run claims.
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO eval_attempt_events VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     ("ev-no-result", "att-res-one-1", "scenario:1:result", "scenario_result", 1, "", -1,
+                      "2026-10-01T03:30:00Z", json.dumps({"data": {}}), "h"))
+    conn.close()
+    out = _inspect_gate(tmp_path, "nightly-0")
+    assert out.returncode == 0, out.stderr
+    assert "  no results are linked to this run\n  " + PRE_0023_HINT + "\n" in out.stdout, out.stdout
+    assert "res-" not in out.stdout, out.stdout
+
+
+def _unlinked_run(db, run, started):
+    """Add a run that no result links to. res-old-0 stays unlinked."""
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO runs (id, started, status) VALUES (?,?,?)", (run, started, "ok"))
+    conn.close()
+
+
+def test_gate_verdict_inspection_offers_no_pre_0023_cause_after_0023(tmp_path):
+    """BL-47 review: the pre-0023 hint ("this run may have produced some of
+    them") appeared for a run that started after migration 0023 was applied.
+    Such a run cannot have produced a pre-0023 result, so the hint is only
+    printed when the run started before schema_migrations says 0023 was
+    applied."""
+    db = _gate_state(tmp_path)
+    _unlinked_run(db, "nightly-4", "2026-10-05T02:30:00Z")
+    out = _inspect_gate(tmp_path, "nightly-4")
+    assert out.returncode == 0, out.stderr
+    assert "  no results are linked to this run\n\n" in out.stdout, out.stdout
+    assert "0023" not in out.stdout and "may have produced" not in out.stdout, out.stdout
+    # One millisecond before the recorded time is still before it. A finer
+    # margin is not portable: older SQLite (the Linux CI runner's) rounds
+    # julianday() to whole milliseconds, so 23:59:59.999999 reads as midnight.
+    _unlinked_run(db, "nightly-5", "2026-09-14T23:59:59.999Z")
+    before = _inspect_gate(tmp_path, "nightly-5")
+    assert before.returncode == 0, before.stderr
+    assert "  no results are linked to this run\n  " + PRE_0023_HINT + "\n" in before.stdout, before.stdout
+
+
+@pytest.mark.parametrize("started,applied", [
+    ("not a time", GATE_0023_APPLIED), ("2026-09-01T02:30:00Z", None)])
+def test_gate_verdict_inspection_names_an_unknown_order_against_0023(tmp_path, started, applied):
+    """When the run's start or the migration's applied time cannot be read,
+    the script says the order is unknown. It neither offers the cause nor
+    hides the unlinked results."""
+    import sqlite3
+
+    db = _gate_state(tmp_path)
+    _unlinked_run(db, "nightly-6", started)
+    if applied is None:
+        with sqlite3.connect(db) as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE name='0023_eval_attempts'")
+        conn.close()
+    out = _inspect_gate(tmp_path, "nightly-6")
+    assert out.returncode == 0, out.stderr
+    assert ("  no results are linked to this run\n"
+            "  1 result(s) in this database have no eval attempt and no run\n"
+            "  history. Results recorded before migration 0023 can lack both. This\n"
+            "  run's start cannot be compared with the time 0023 was applied, so\n"
+            "  whether this run produced some of them is unknown.\n") in out.stdout, out.stdout
+    assert "may have produced" not in out.stdout, out.stdout
+
+
+def test_gate_verdict_inspection_of_a_run_that_gated_nothing_names_no_cause(tmp_path):
+    """BL-47 review: a new run that gated nothing printed "pre-0023 results
+    carry no run link", a cause the script never checked. With every result
+    linked to an eval attempt or a history row, that cause is impossible, so
+    no cause is printed. A model job owns an attempt with no run; its result
+    was recorded after 0023 and is not counted."""
+    import sqlite3
+
+    db = _gate_state(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM eval_results WHERE id='res-old-0'")
+        conn.execute("INSERT INTO runs (id, started, status) VALUES (?,?,?)",
+                     ("nightly-3", "2026-10-05T02:30:00Z", "ok"))
+        conn.execute("INSERT INTO eval_results (id, kind, started, verdict) VALUES (?,?,?,?)",
+                     ("res-job-4", "regression", "2026-10-04T03:00:00Z", "gated_pass"))
+        conn.execute("INSERT INTO eval_attempts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     ("att-job-4", "gate", "p", "l", "", "cmd-4", "s", "2026-10-04T03:00:00Z", "{}", "h"))
+        conn.execute("INSERT INTO eval_attempt_events VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     ("ev-job-4", "att-job-4", "scenario:0:result", "scenario_result", 0, "", -1,
+                      "2026-10-04T03:00:00Z", json.dumps({"data": {"eval_result_id": "res-job-4"}}), "h"))
+    conn.close()
+    out = _inspect_gate(tmp_path, "nightly-3")
+    assert out.returncode == 0, out.stderr
+    assert "  no results are linked to this run\n" in out.stdout, out.stdout
+    assert "0023" not in out.stdout and "res-" not in out.stdout, out.stdout
+
+
+def test_gate_verdict_inspection_names_corrupt_run_stats(tmp_path):
+    """A failed stats read printed "(no gate block)" and exited 0, which
+    claims the run recorded no gate stats when they are unreadable."""
+    import sqlite3
+
+    db = _gate_state(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO runs (id, started, status, stats_json) VALUES (?,?,?,?)",
+                     ("nightly-bad", "2026-10-03T02:30:00Z", "ok", "{not json"))
+    conn.close()
+    out = _inspect_gate(tmp_path, "nightly-bad")
+    assert out.returncode == 1, out.stdout
+    assert "malformed JSON" in out.stderr, out.stderr
+    assert "(no gate block)" not in out.stdout, out.stdout
+    # Valid stats with a gate block still print it.
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE runs SET stats_json=? WHERE id=?", (json.dumps({"gate": {"invented_count": 7}}), "nightly-bad"))
+    conn.close()
+    good = _inspect_gate(tmp_path, "nightly-bad")
+    assert good.returncode == 0, good.stderr
+    assert '"invented_count": 7' in good.stdout and "  (none)" in good.stdout, good.stdout
+
+
+@pytest.mark.parametrize("args", [(), ("nightly-1",)])
+def test_gate_verdict_inspection_of_a_missing_database_creates_nothing(tmp_path, args):
+    """BL-47 review: the sqlite3 CLI created an empty state.db and then said
+    "no runs in …", so a wrong SI_STATE_DIR looked like an empty history."""
+    state = tmp_path / "empty"
+    state.mkdir()
+    out = _inspect_gate(state, *args)
+    assert out.returncode != 0, out.stdout
+    assert f"no database file at {state / 'state.db'}" in out.stderr, out.stderr
+    assert "no runs in" not in out.stderr, out.stderr
+    assert list(state.iterdir()) == []
+
+
+def test_gate_verdict_inspection_never_writes_the_database(tmp_path):
+    """BL-47 review: inspection must open read-only. '#', '?' and '%' in the
+    state path are escaped in the URI; unescaped, they cut the path, drop
+    mode=ro and make SQLite create a different database file."""
+    import hashlib
+
+    state = tmp_path / "state #1?mode=rwc%41"
+    db = _gate_state(state)
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    outside = sorted(p.name for p in tmp_path.iterdir())
+    out = _inspect_gate(state, "nightly-1")
+    assert out.returncode == 0, out.stderr
+    assert "res-one-" in out.stdout, out.stdout
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == outside
+    # SQLite's WAL read protocol may add sidecars; no write may reach them.
+    assert {p.name for p in state.iterdir()} <= {"state.db", "state.db-wal", "state.db-shm"}
+    wal = state / "state.db-wal"
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
+def test_gate_verdict_inspection_leaves_an_uncheckpointed_wal_alone(tmp_path):
+    """BL-47 review: no test failed when mode=ro was removed, because a
+    read-write open that runs only SELECTs leaves a checkpointed database
+    unchanged. A WAL database whose -wal still holds committed frames, with
+    no process holding it open, shows the difference: the last read-write
+    connection to close checkpoints the frames into the database file and
+    deletes the -wal. A mode=ro connection must leave both files as they are."""
+    import hashlib
+    import sqlite3
+
+    src = _gate_state(tmp_path / "src")
+    writer = sqlite3.connect(src)
+    assert writer.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("INSERT INTO runs (id, started, status) VALUES (?,?,?)",
+                   ("nightly-wal", "2026-10-04T02:30:00Z", "ok"))
+    writer.commit()
+    # Copy while the writer is open, so the copy keeps committed frames in its
+    # -wal and no connection holds it. Closing the writer would checkpoint.
+    state = tmp_path / "state"
+    state.mkdir()
+    for name in ("state.db", "state.db-wal"):
+        shutil.copy2(src.parent / name, state / name)
+    writer.close()
+    db, wal = state / "state.db", state / "state.db-wal"
+    assert wal.stat().st_size > 0
+    before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)}
+
+    out = _inspect_gate(state, "nightly-wal")
+
+    assert out.returncode == 0, out.stderr
+    # The run exists only in the -wal frames, so finding it proves the read
+    # went through the WAL rather than around it.
+    assert "run: nightly-wal" in out.stdout, out.stdout
+    assert wal.exists(), "the -wal was checkpointed and deleted"
+    assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (db, wal)} == before
+    assert {p.name for p in state.iterdir()} <= {"state.db", "state.db-wal", "state.db-shm"}

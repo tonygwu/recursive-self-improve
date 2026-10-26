@@ -116,11 +116,31 @@ export const STATE_MEANING = Object.freeze({
 const GRID_LABELS = Object.freeze({
   ok:"Succeeded", partial:"Ran with failures", failed:"Stage failed", error:"Run error",
   running:"Completion unknown", skipped:"Did not run", degraded:"No output",
-  interrupted:"Interrupted", abandoned:"Abandoned", budget_exhausted:"Budget exhausted",
-  refused:"Budget refused", unaccounted:"Accounting gap", limited:"Work omitted", info:"Note",
+  interrupted:"Interrupted", abandoned:"Abandoned", budget_exhausted:"Waiting on budget",
+  refused:"Waiting on budget", unaccounted:"Accounting gap", limited:"Work omitted", info:"Note",
 });
 
 const EM_DASH = "—";
+
+// Display instants in Pacific time, independent of the browser's zone. API
+// storage, aggregate day keys and raw evidence remain UTC. Never assume a zone
+// for a timestamp that does not carry one.
+const PACIFIC = "America/Los_Angeles";
+const pacificTime = new Intl.DateTimeFormat("en-US", {timeZone:PACIFIC,
+  year:"numeric",month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
+const pacificDate = new Intl.DateTimeFormat("en-US", {timeZone:PACIFIC,
+  year:"numeric",month:"short",day:"numeric"});
+function recordedInstant(value) {
+  const text = String(value || "");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}.*(?:Z|[+-]\d{2}:\d{2})$/.test(text)) return null;
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+export function displayTime(value) {
+  if (!value) return "Time not recorded";
+  const date = recordedInstant(value);
+  return date ? pacificTime.format(date) : `${value} (time zone unknown)`;
+}
 
 /* ---------------------------------------------------------------------------
    Text helpers. Everything that reaches the page goes through esc().
@@ -364,7 +384,7 @@ export function renderBanner(freshness) {
       `<div><div class="banner__title">${esc(freshness.banner)}</div>` +
       `<div class="banner__body">Incident arrivals use the last dated transcript coverage, not today. Mining throughput has a separate execution window. ` +
       `Days beyond the observed data are not measured zeroes. ` +
-      `Reference day ${esc(freshness.reference_day)} (UTC); newest incident ${esc(freshness.last_incident_ts || EM_DASH)}.</div></div>`,
+      `Reference day ${esc(freshness.reference_day)} (UTC); newest incident ${esc(displayTime(freshness.last_incident_ts))}.</div></div>`,
     show: true,
     state: stale >= 2 ? "partial" : "info",
   };
@@ -432,7 +452,7 @@ export function renderOverviewDeliveries(delivery) {
   if(delivery?.manual_targets==null)return '<p class="caption">Reviewed delivery history unavailable.</p><a href="#/review">Open Review history</a>';
   const rows=delivery.recent || [];
   if(!rows.length)return '<p class="caption">No completed reviewed target writes are retained. Approval alone is not delivery.</p><a href="#/review">Open Review history</a>';
-  return rows.map(row=>`<article class="overview-delivery"><a class="overview-delivery__title" href="#/review/command/${encodeURIComponent(row.command_id)}">${esc(row.title)}${row.title_cut?'…':''}</a><p class="caption overview-delivery__target"><span>${esc(row.destination.target_path.split(/[\\/]/).pop())}</span><span title="${esc(row.destination.target_path)}">${esc(row.destination.target_path)}</span></p><p class="caption">${num(row.member_count)} proposal${row.member_count===1?'':'s'} · delivered ${esc(row.completed_at)} · <a href="#/review/command/${encodeURIComponent(row.command_id)}">Inspect delivery →</a></p></article>`).join('')+
+  return rows.map(row=>`<article class="overview-delivery"><a class="overview-delivery__title" href="#/review/command/${encodeURIComponent(row.command_id)}">${esc(row.title)}${row.title_cut?'…':''}</a><p class="caption overview-delivery__target"><span>${esc(row.destination.target_path.split(/[\\/]/).pop())}</span><span title="${esc(row.destination.target_path)}">${esc(row.destination.target_path)}</span></p><p class="caption">${num(row.member_count)} proposal${row.member_count===1?'':'s'} · delivered ${esc(displayTime(row.completed_at))} · <a href="#/review/command/${encodeURIComponent(row.command_id)}">Inspect delivery →</a></p></article>`).join('')+
     `<p class="caption overview-delivery__foot">Latest ${num(rows.length)} of ${num(delivery.manual_targets)} reviewed target writes. Titles are shortened; open the command for all reviewed members, exact snapshots and rollback review. Present use is unverified.</p>`;
 }
 export function renderOverviewQueue(review) {
@@ -441,7 +461,7 @@ export function renderOverviewQueue(review) {
   return `<p class="caption">${num(review.count)} items waiting on you · ${num(count)} lessons. Open Review to inspect and select complete members.</p>`+
     (review.auto_apply_pending?`<p class="caption">${num(review.auto_apply_pending)} passing proposals await automatic delivery.</p>`:"")+
     Object.entries(review.unknown_statuses || {}).map(([status,count])=>`<p>${badge("Unknown status: "+status,{state:"unknown_status"})} ${num(count)} proposals outside the known queue policy.</p>`).join("")+
-    shown.map(f=>{const title=String(f.title || f.learning_id || "");const size=f.size ?? f.proposals?.length;return `<article class="overview-family"><a href="#/review/proposal/${encodeURIComponent(f.proposal_id || f.proposals?.[0]?.id || "")}">${esc(title.slice(0,120))}${f.title_cut || title.length>120?"…":""}</a><p class="caption">${num(size)} proposal${size===1?"":"s"}</p></article>`;}).join("")+
+    shown.map(f=>{const title=String(f.title || f.rule_text || "Instruction text unavailable").replace(/\*\*/g, "").replace(/`/g, "");const size=f.size ?? f.proposals?.length;return `<article class="overview-family"><a href="#/review/proposal/${encodeURIComponent(f.proposal_id || f.proposals?.[0]?.id || "")}">${esc(title.slice(0,120))}${f.title_cut || title.length>120?"…":""}</a><p class="caption">${num(size)} proposal${size===1?"":"s"}</p></article>`;}).join("")+
     (count>shown.length?`<p class="caption">${num(count-shown.length)} more lessons in Review.</p>`:"")+
     (!review.count?'<p>Nothing needs a decision. Delivery and paid jobs have their own recorded progress.</p>':"")+
     `<a class="btn btn--primary" href="#/review">Open review queue</a>`;
@@ -449,12 +469,21 @@ export function renderOverviewQueue(review) {
 export function renderOverviewRunSummary(latest) {
   if(!latest)return '<p>No retained run. A blank history is not a successful run.</p>';
   const run=latest.run;
-  return `<p class="caption">Latest recorded run · <a href="${esc(runHref("run",run.id))}">${esc(run.started)} · ${esc(run.id)}</a> · ${esc(run.status)}${latest.review_only===true?" · review-only run":""}${run.finished?"":" · completion not recorded"}</p>`+
+  return `<p class="caption">Latest recorded run · <a href="${esc(runHref("run",run.id))}">${esc(displayTime(run.started))} · ${esc(run.id)}</a> · ${esc(run.status)}${latest.review_only===true?" · review-only run":""}${run.finished?"":" · completion not recorded"}</p>`+
     `<dl class="overview-latest">`+latest.stages.map(stage=>{
       const payload=stage.payload || {},cell=stage.cell || {};
-      const counters=Object.entries(payload).filter(([,v])=>typeof v==="number").slice(0,4).map(([k,v])=>`${k.replaceAll("_"," ")}: ${num(v)}`).join(" · ");
+      const counters=Object.keys(stage.outcomes || {}).length
+        ? Object.entries(stage.outcomes).map(([label,value])=>`${num(value)} ${label}`).join(" · ")
+        : Object.entries(payload).filter(([,v])=>typeof v==="number").slice(0,4).map(([k,v])=>`${k.replaceAll("_"," ")}: ${num(v)}`).join(" · ");
       return `<dt><a href="${esc(runHref("run",run.id,stage.name))}">${esc(stage.name)}</a></dt><dd>${stage.recorded?esc(counters || "No numeric counters retained"):"Not recorded"}${stage.recorded && cell.state!=="ok"?" · "+`<span class="overview-state" title="${esc(stateTitle(cell.state))}">${esc(GRID_LABELS[cell.state] || stateTitle(cell.state))}</span>`:""}</dd>`;
-    }).join("")+`</dl><p class="caption">Open a stage for complete evidence.</p>`;
+    }).join("")+`</dl>`;
+}
+// Sits under the stage grid, where the column has room, so the latest-run
+// column stays no taller than the grid and the lower panels keep their place.
+export function renderOverviewRunGuide(latest) {
+  if(!latest)return "";
+  return `<p class="caption">Open a stage for complete evidence.</p>`+
+    `<details class="overview-detail pipeline-guide"><summary>What do Mine and Gate do?</summary><p><strong>Mine</strong> reads detected incidents in your conversations and proposes lessons. A processed incident may produce a new lesson, match an existing one, or need no change.</p><p><strong>Gate</strong> evaluates a proposed instruction using test tasks with and without it. Passing a test, a processing error, and waiting on budget are separate outcomes.</p><p>Mining and evaluation have separate call limits. Gate waits when the remaining allowance cannot cover a complete evaluation, even if some calls remain. Waiting supplies no verdict on the instruction.</p></details>`;
 }
 function recentFailureClasses(failures) {
   return [...(failures?.regressed || []),...(failures?.open || [])].filter(row=>(row.recent || 0)>0);
@@ -462,7 +491,7 @@ function recentFailureClasses(failures) {
 export function renderOverviewFailures(failures) {
   if(!failures)return "";
   const active=recentFailureClasses(failures),shown=active.slice(0,3);
-  return `<p class="caption">Counts in the seven calendar days ending ${esc(failures.latest_run_day || EM_DASH)}; source entries may overlap.</p>`+(shown.length?shown.map(row=>`<article class="overview-failure"><div><strong>${esc(row.name)}</strong> ${infotip(row.class+": "+row.explanation)}<p class="caption">${esc(row.explanation || "No explanation retained")}</p>${row.last_seen?`<a class="caption" href="${esc(runHref("run",row.last_seen.run_id))}">Last recorded run · ${esc(row.last_seen.started)}</a>`:""}</div><span class="meter" aria-hidden="true"><span class="meter__fill" style="--pct: ${100*(row.recent ?? 0)/Math.max(...active.map(x=>x.recent ?? 0),1)}"></span></span><strong class="num">${num(row.recent ?? 0)}</strong></article>`).join(""):'<p>No recent failure class is retained. Inspect history for quiet, fixed and unlinked call outcomes.</p>')+
+  return `<p class="caption">Counts in the seven calendar days ending ${esc(failures.latest_run_day || EM_DASH)}; source entries may overlap.</p>`+(shown.length?shown.map(row=>`<article class="overview-failure"><div><strong>${esc(row.name)}</strong> ${infotip(row.class+": "+row.explanation)}<p class="caption">${esc(row.explanation || "No explanation retained")}</p>${row.last_seen?`<a class="caption" href="${esc(runHref("run",row.last_seen.run_id))}">Last recorded run · ${esc(displayTime(row.last_seen.started))}</a>`:""}</div><span class="meter" aria-hidden="true"><span class="meter__fill" style="--pct: ${100*(row.recent ?? 0)/Math.max(...active.map(x=>x.recent ?? 0),1)}"></span></span><strong class="num">${num(row.recent ?? 0)}</strong></article>`).join(""):'<p>No recent failure class is retained. Inspect history for quiet, fixed and unlinked call outcomes.</p>')+
     (active.length>shown.length?`<p class="caption">${num(active.length-shown.length)} more active failure classes in full history.</p>`:"")+
     `<details id="ov-failure-history" class="overview-detail"><summary>Full failure history and counting definitions</summary>${renderFailures(failures)}</details>`;
 }
@@ -2283,7 +2312,10 @@ export function whyClass(code) {
 export const EVAL_CLASS = Object.freeze({
   tested: "review-card__eval--tested",
   never_reproduced: "review-card__eval--never_reproduced",
+  with_arm_skipped: "review-card__eval--with_arm_skipped",
   both_arms_failed: "review-card__eval--both_arms_failed",
+  mixed_models: "review-card__eval--mixed_models",
+  rule_failed: "review-card__eval--rule_failed",
   no_trial_ran: "review-card__eval--no_trial_ran",
   no_arms: "review-card__eval--no_arms",
   unknown_outcome: "review-card__eval--unknown_outcome",
@@ -2305,23 +2337,23 @@ export function sourceLabel(source) {
 }
 
 /**
- * The window the evidence actually spans, as ISO dates labelled UTC.
- *
- * Deliberately NOT converted to the reader's local zone. The stamps are
- * transcript time in UTC; `%Y-%m-%d` formatting of a UTC instant in local time
- * silently shifts a date by one day either side of midnight, which is the
- * logical-time trap AGENTS.md records twice. Labelling the zone costs four
- * characters and removes the ambiguity.
+ * Evidence dates come from transcript instants, displayed with an explicit
+ * Pacific zone. Date-only legacy values retain their UTC bucket semantics.
  */
 export function reviewWhen(prov) {
   const first = (prov && prov.first_seen) || "";
   const last = (prov && prov.last_seen) || "";
   if (!first && !last) return "";
-  const day = (s) => String(s).slice(0, 10);
-  if (first && last && day(first) !== day(last)) {
-    return `${day(first)} to ${day(last)} UTC`;
+  const dated = [first,last].filter(Boolean).every(s=>recordedInstant(s));
+  if (!dated && ![first,last].filter(Boolean).every(s=>/^\d{4}-\d{2}-\d{2}$/.test(s))) {
+    return [first,last].filter(Boolean).map(displayTime).join(" to ");
   }
-  return `${day(first || last)} UTC`;
+  const day = (s) => dated ? pacificDate.format(recordedInstant(s)) : String(s).slice(0, 10);
+  const zone = dated ? "PT" : "UTC";
+  if (first && last && day(first) !== day(last)) {
+    return `${day(first)} to ${day(last)} ${zone}`;
+  }
+  return `${day(first || last)} ${zone}`;
 }
 
 /** Describe the recorded frequency, time range, and transcript sources. */
@@ -2466,7 +2498,7 @@ export function renderIncidentExamples(family) {
       const cut = clamp(value.display_text, 240);
       return (
         `<li class="review-incident">` +
-        `<span class="review-incident__meta">${esc(String(ex.ts).slice(0, 19))} UTC ` +
+        `<span class="review-incident__meta">${esc(displayTime(ex.ts))} ` +
         `&middot; ${esc(ex.signal_type || "")} &middot; ` +
         `<code>${esc(ex.project_path || "")}</code></span>` +
         `<pre class="review-incident__text">${esc(cut.text)}</pre>` +
@@ -2706,7 +2738,7 @@ export function renderReviewDetail(family) {
   const evidenceBody = !members.length ? `<p>Evidence loads with a valid selected preview.</p>` :
     `<p class="caption">${num(evidence.length)} retained incidents in this selection. Excerpts are redacted retained text. Source labels come from retained index metadata, not model telemetry or runtime loading.</p>` +
     (preview.identityError ? `<p role="alert">${esc(preview.identityError)} Reload Review to refresh source labels.</p><button id="review-identity-reload" class="btn" data-reload-review="true">Reload Review</button>` : "") +
-    (evidence.length ? evidence.slice(page*3,page*3+3).map(e=>`<article class="review-detail-incident">${renderIncidentPrimary(e)}<p class="caption">${esc(e.signal_type)} · ${esc(e.ts || "Time unknown")} · session <code>${esc(e.session_id || "unknown")}</code> · <code>${esc(e.project_path || "Project unknown")}</code></p>${preview.identities?.[e.id] ? renderSourceIdentity(preview.identities[e.id],{prefix:"review-identity:"+e.id}) : `<p>Repository and source provider labels are unavailable for this selected preview.</p>`}<a id="review-incident-${esc(e.id)}" href="${esc(evidenceHref("incident",e.id))}">Inspect incident and source</a>${renderRetainedEvidence(e,"detail:")}</article>`).join("") : `<p>No incidents are linked to this selection.</p>`) +
+    (evidence.length ? evidence.slice(page*3,page*3+3).map(e=>`<article class="review-detail-incident">${renderIncidentPrimary(e)}<p class="caption">${esc(e.signal_type)} · ${esc(displayTime(e.ts))} · session <code>${esc(e.session_id || "unknown")}</code> · <code>${esc(e.project_path || "Project unknown")}</code></p>${preview.identities?.[e.id] ? renderSourceIdentity(preview.identities[e.id],{prefix:"review-identity:"+e.id}) : `<p>Repository and source provider labels are unavailable for this selected preview.</p>`}<a id="review-incident-${esc(e.id)}" href="${esc(evidenceHref("incident",e.id))}">Inspect incident and source</a>${renderRetainedEvidence(e,"detail:")}</article>`).join("") : `<p>No incidents are linked to this selection.</p>`) +
     (evidence.length>3 ? `<nav class="review-detail-pages" aria-label="Incident pages"><button id="review-evidence-prev" class="btn" data-review-evidence-page="${page-1}" ${page===0 ? "disabled" : ""}>Previous incidents</button><span id="review-evidence-page" tabindex="-1">${page*3+1}–${Math.min(page*3+3,evidence.length)} of ${evidence.length}</span><button id="review-evidence-next" class="btn" data-review-evidence-page="${page+1}" ${(page+1)*3>=evidence.length ? "disabled" : ""}>Next incidents</button></nav>` : "");
   const evalBody = (missing ? `<p>${missing} selected proposal${missing===1?" has":"s have"} no linked evaluation. No tested benefit is established.</p>` : "") +
     (evaluations.length ? `<p class="caption">${evaluations.length} evaluation result${evaluations.length === 1 ? "" : "s"} · selected proposal order. Verdicts are retained from the selected preview; expand each result for complete evidence.</p>` + evaluations.map((id,index)=>renderReviewEvaluation(id,members.filter(m=>m.snapshot.evaluation?.id===id),index,evaluations.length)).join("") : !members.length ? `<p>Evaluation sources load with a valid selected preview.</p>` : "");
@@ -2812,15 +2844,18 @@ export function renderReviewCard(family, options) {
   return (
     `<article class="review-card review-card--open review-card--selected" ` +
     `data-learning-id="${esc(family.learning_id)}" tabindex="-1">` +
+    `<div class="review-card__body">` +
+    `<p class="review-context-label">Proposed instruction</p>` +
+    `<h3 class="review-card__rule">${mdLite(family.rule_text)}</h3>` +
+    `<p class="review-card__evidence">${esc(reviewEvidence(family))}</p>` +
+    `<h4 class="review-context-label">Why it was proposed</h4>` +
+    (family.incident_summary
+      ? `<p class="review-card__summary">${esc(family.incident_summary)}</p>`
+      : `<p class="review-card__summary">No explanation was retained. Inspect the original incidents below before deciding.</p>`) +
     `<p class="review-card__why ${whyClass(family.proposals[0].reason_code)}">` +
     `<span class="review-card__why-label">Why this needs you:</span> ` +
     `${esc(family.lead_reason)}</p>` +
-    `<div class="review-card__body">` +
-    `<h3 class="review-card__rule">${mdLite(family.rule_text)}</h3>` +
-    `<p class="review-card__evidence">${esc(reviewEvidence(family))}</p>` +
-    (family.incident_summary
-      ? `<p class="review-card__summary">${esc(family.incident_summary)}</p>`
-      : "") +
+    `<h4 class="review-context-label">Evaluation evidence</h4>` +
     renderEvalStory(family) +
     (state.reviewPreviews[family.learning_id]?.data ? "" : renderTargetRows(family)) +
     renderProposalBreakdown(family, opts) +
@@ -3009,6 +3044,14 @@ export function handleReviewKeydown(event) {
     const preview = state.reviewPreviews[state.selectedFamily];
     if (!preview || preview.loading || preview.error || !preview.data?.ready) return "";
   }
+  if (key === "r") {
+    // Same guard as the "Reject at selected targets" button: never reject at
+    // targets the operator has not seen in a loaded preview.
+    const family = state.review.families.find(f => f.learning_id === state.selectedFamily);
+    const preview = state.reviewPreviews[state.selectedFamily];
+    if (!family || state.deciding[state.selectedFamily] || !selectedReviewProposals(family).length ||
+        !preview || preview.loading || preview.error || !preview.data) return "";
+  }
   if (typeof event.preventDefault === "function") event.preventDefault();
 
   if (key === "j" || key === "k") {
@@ -3131,7 +3174,7 @@ export function renderDeliveryHistory(delivery) {
       const members = detail && detail.data && detail.data.members || [];
       const suppressed = (result.suppressed_proposal_ids || []).length;
       return `<article class="delivery-command" id="delivery-command-${esc(id)}" tabindex="-1"><header><h3>${lesson ? "Lesson rejected everywhere" : "Targets rejected"}</h3>${deliveryBadge(command)}</header>` +
-        `<p class="footnote">${esc(command.created_at)} · Command <span class="mono">${esc(id)}</span></p>` +
+        `<p class="footnote">${esc(displayTime(command.created_at))} · Command <span class="mono">${esc(id)}</span></p>` +
         `<p>${lesson ? "Future proposals for this lesson are suppressed at every target." : "Future proposals for this lesson are suppressed at the selected canonical files. Other targets remain available."} Existing applied edits remain.</p>` +
         `<p>${num(suppressed)} unapplied proposal${suppressed === 1 ? "" : "s"} suppressed.</p>` +
         `<details data-delivery-key="${esc(id)}" ${state.deliveryDisclosures[id] ? "open" : ""}><summary>Recorded decision and scope</summary>` +
@@ -3164,11 +3207,11 @@ export function renderDeliveryHistory(delivery) {
       reviewed += detail.data.members.filter((member) => detail.data.targets.some((target) => target.id === member.target_id && target.state === "completed"))
         .map((member) => `<p><a class="review-link" href="#/review/rollback/${encodeURIComponent(member.proposal_id)}">Review rollback · ${esc(member.proposal_id)}</a></p>`).join("");
       const history = detail.data.control_history || [];
-      if (history.length) reviewed += `<h4>Control history</h4>` + history.map((event) => `<p>${esc(event.action === "retry_delivery" ? "Retry requested" : "Cancellation requested")} · ${esc(event.created_at)} · ${esc(event.actor)}</p>` + fullRecord(event.before)).join("");
+      if (history.length) reviewed += `<h4>Control history</h4>` + history.map((event) => `<p>${esc(event.action === "retry_delivery" ? "Retry requested" : "Cancellation requested")} · ${esc(displayTime(event.created_at))} · ${esc(event.actor)}</p>` + fullRecord(event.before)).join("");
     }
     return `<article class="delivery-command" id="delivery-command-${esc(id)}" tabindex="-1">` +
       `<header><h3>Approval · ${num(memberCount)} proposal${memberCount === 1 ? "" : "s"}</h3>${deliveryBadge(command)}</header>` +
-      `<p class="footnote">${esc(command.created_at || "Time unknown")} · Command <span class="mono">${esc(id)}</span></p>` +
+      `<p class="footnote">${esc(command.created_at ? displayTime(command.created_at) : "Time unknown")} · Command <span class="mono">${esc(id)}</span></p>` +
       `<p>${completed} of ${targets.length} target${targets.length === 1 ? "" : "s"} delivered${cancelled ? ` · ${cancelled} cancelled` : ""}.</p>` +
       `<details data-delivery-key="${esc(id)}" ${state.deliveryDisclosures[id] ? "open" : ""}><summary>Targets and results (${targets.length})</summary><ul class="delivery-targets">${rows}</ul>` +
       `<button id="delivery-inspect-${esc(id)}" class="btn" data-delivery-inspect="${esc(id)}">View reviewed edits and control history</button>${reviewed}</details>` +
@@ -3334,7 +3377,7 @@ export function renderOperation(operation, { compact = false } = {}) {
     (result.branch_commit ? `<p class="footnote mono delivery-path">Commit ${esc(result.branch_commit)}</p>` : "") +
     (operation.cancel_requested && operation.state === "completed" ? `<p class="footnote">The write had already completed; cancellation preserved its recorded result.</p>` : "") +
     (compact ? "" : `<details data-operation-key="${esc(id)}" ${state.operationDisclosures[id] ? "open" : ""}><summary>Recorded change and history</summary>` +
-      `<p class="footnote">${esc(operation.created_at)} · <span class="id">${esc(id)}</span></p>` +
+      `<p class="footnote">${esc(displayTime(operation.created_at))} · <span class="id">${esc(id)}</span></p>` +
       `<button id="operation-inspect-${esc(id)}" class="btn" data-operation-inspect="${esc(id)}">Load recorded change</button>${contents}</details>`) +
     `<div class="delivery-actions">${compact ? "" : operationControls(operation)}` +
     (!compact && operation.kind === "auto_apply" && operation.state === "completed" ? `<a class="btn" href="#/review/rollback/${encodeURIComponent(operation.proposal_id)}">Review rollback</a>` : "") +
@@ -3621,6 +3664,17 @@ function paintRecoveryJob(job) {
     (job.selection.target_id ? `<button class="btn" data-recovery-refresh="true" ${job.busy ? "disabled" : ""}>${job.commandId ? "Preview a new recovery attempt…" : "Refresh recovery preview"}</button>` : ""));
 }
 
+/** The server's recovery modes (recovery_jobs.MODES); a test keeps them equal. */
+export const RECOVERY_MODES = Object.freeze(["hook", "correct_target", "regenerate_patch"]);
+
+/** Parse a recovery link's JSON and refuse anything but a lesson and a known mode. */
+export function recoverySelectionFromLink(text) {
+  const value=JSON.parse(text);
+  if (!value || typeof value!=="object" || Array.isArray(value) || typeof value.learning_id!=="string" || !value.learning_id || !RECOVERY_MODES.includes(value.mode))
+    throw new Error(`the link does not name a lesson and a recovery mode (${RECOVERY_MODES.join(", ")})`);
+  return value;
+}
+
 export async function openRecoveryJob(selection,{newAttempt=false}={}) {
   if (state.evalJob.busy) return;
   const entry={action:"propose_recovery",selection,preview:null,options:null,loading:true,busy:false,error:"",commandId:""};
@@ -3840,7 +3894,10 @@ export function showRoute(route) {
     const recoveryId=route.id.startsWith("recovery/") ? route.id.slice("recovery/".length) : "";
     setVisible(byId("review-eval"), Boolean(evalId || recoveryId));
     if (recoveryId) {
-      try {openRecoveryJob(JSON.parse(recoveryId));} catch(error) {showError("Invalid recovery link",String(error.message || error));}
+      let selection=null;
+      try {selection=recoverySelectionFromLink(recoveryId);}
+      catch(error) {setVisible(byId("review-eval"), Boolean(evalId));showError("Invalid recovery link",String(error.message || error));}
+      if (selection) Promise.resolve(openRecoveryJob(selection)).catch(error=>showError("Invalid recovery link",String(error.message || error)));
     }
     if (evalId) openEvalJob(evalId,{action:resolutionId ? "resolve_rollback" : reapplyId ? "request_reapplication" : mineId ? "mine_incident" : "regenerate_eval"});
   }
@@ -4063,7 +4120,7 @@ function renderRelatedRunDelivery(record, entry) {
   const titles = record.members.filter(member=>member.observation_ids.length).map(member=>member.snapshot.learning.title || member.snapshot.learning.rule_text);
   return `<article class="run-record">`+
     `<h3><span class="badge" data-state="ok">Delivered</span><a href="#/review/command/${encodeURIComponent(record.command_id)}">${esc(titles.join(" · ") || "Reviewed command "+record.command_id)}</a></h3>`+
-    `<p class="caption">Command <span class="mono">${esc(record.command_id)}</span> · delivered ${esc(record.completed_at)} · current command state: ${esc(record.command_state)}</p>`+
+    `<p class="caption">Command <span class="mono">${esc(record.command_id)}</span> · delivered ${esc(displayTime(record.completed_at))} · current command state: ${esc(record.command_state)}</p>`+
     `<p class="mono">${esc(record.target.destination.target_path)}</p>`+
     `<pre class="review-card__diff" id="run-earlier-diff-${esc(record.id)}" tabindex="0" role="region" aria-label="Complete combined delivered diff">${renderUnifiedDiff(record.target.diff_unified)}</pre>`+
     `<p class="footnote">Snapshot before: <span class="mono">${esc(record.snapshot_before)}</span><br>Snapshot after: <span class="mono">${esc(record.snapshot_after)}</span></p>`+
@@ -4171,17 +4228,17 @@ export function renderRunDetail(entry) {
   if (entry.error) return html + runReadFailure(entry,{key:"run:"+entry.id,title:entry.kind === "night" ? "Could not read runs for this day." : "Could not read this run.",guidance:"Use Retry below."})+`<button class="btn" data-run-refresh="true">Retry</button>`;
   if (entry.kind === "night") {
     html += `<h1 class="view__title" id="run-title" tabindex="-1">Runs on ${esc(entry.id)} UTC</h1><p>Select the exact run. Times can be identical; IDs are distinct.</p><ul class="run-choices">`;
-    entry.night.records.forEach((run) => { html += `<li><a href="${esc(runHref("run", run.id, entry.stage))}">${esc(run.started)} · ${esc(run.status)} · <span class="mono">${esc(run.id)}</span></a></li>`; });
+    entry.night.records.forEach((run) => { html += `<li><a href="${esc(runHref("run", run.id, entry.stage))}">${esc(displayTime(run.started))} · ${esc(run.status)} · <span class="mono">${esc(run.id)}</span></a></li>`; });
     return html + `</ul>` + (entry.night.count ? "" : `<p>No run was recorded for this UTC day.</p>`);
   }
   const data = entry.data, run = data.run;
   const elapsed = run.finished ? Date.parse(run.finished) - Date.parse(run.started) : NaN;
   const duration = Number.isFinite(elapsed) && elapsed >= 0 ? `${num(Math.round(elapsed / 1000))} seconds wall time` : "duration not recorded";
-  html += `<header class="view__head run-heading"><div class="run-heading__summary"><h1 class="view__title" id="run-title" tabindex="-1">Run · ${esc(run.started.slice(0, 10))}</h1>`;
-  html += `<p class="mono">${esc(run.id)}</p><p class="view__desc">${esc(run.started)} → ${esc(run.finished || "completion not recorded")} · ${esc(duration)}</p>`;
+  html += `<header class="view__head run-heading"><div class="run-heading__summary"><h1 class="view__title" id="run-title" tabindex="-1">Run · ${esc(reviewWhen({first_seen:run.started}))}</h1>`;
+  html += `<p class="mono">${esc(run.id)}</p><p class="view__desc">${esc(displayTime(run.started))} → ${esc(run.finished ? displayTime(run.finished) : "completion not recorded")} · ${esc(duration)}</p>`;
   html += `<p class="view__desc">Status: ${esc(run.status)}${data.stats.review_only === true ? " · review only" : ""}${data.stats.dry_run === true ? " · dry run" : ""}</p></div>`;
   html += `<div class="run-heading__meta"><label for="run-selector">Run on this UTC day</label><select id="run-selector">`;
-  data.night_runs.forEach((other) => { html += `<option value="${esc(other.id)}"${other.id === run.id ? " selected" : ""}>${esc(other.id)} · ${esc(other.started)} · ${esc(other.status)}</option>`; });
+  data.night_runs.forEach((other) => { html += `<option value="${esc(other.id)}"${other.id === run.id ? " selected" : ""}>${esc(other.id)} · ${esc(displayTime(other.started))} · ${esc(other.status)}</option>`; });
   html += `</select><button class="btn btn--quiet" id="run-refresh" data-run-refresh="true">Refresh run</button></div></header>`;
   html += `<section class="panel"><header class="panel__head"><h2 class="panel__title">Pipeline stages</h2><span class="panel__meta">Recorded outcomes in each stage’s own unit</span></header><div class="scroll-x" id="run-stage-scroll" tabindex="0" role="region" aria-label="Stage counts and complete records"><table class="run-stage-table"><thead><tr><th scope="col">Stage</th><th scope="col">Input units</th><th scope="col">Completed</th><th scope="col">Failures</th><th scope="col">Held / other</th><th scope="col">What happened</th></tr></thead><tbody>`;
   data.stages.forEach((stage) => {
@@ -4286,7 +4343,7 @@ export function renderMiningHistory(row) {
       guidance:(history.loaded ? "Showing the previous mining history. " : "")+"Use the mining history button to retry."}) : "") +
     (history.loaded && !history.records.length ? `<p>No mining history was recorded for this learning. Its historical generation remains unknown.</p>` : "") +
     history.records.map(r=>`<article class="delivery-command"><h4>${esc(r.kind === "new" ? "Created content" : r.kind === "cluster_merge" ? "Merged content" : r.kind.startsWith("amend") ? "Amended content" : "Linked evidence")}</h4>` +
-      `<p>${esc(r.generation || "Generation not recorded")} · ${esc(r.created_at)}</p>` +
+      `<p>${esc(r.generation || "Generation not recorded")} · ${esc(displayTime(r.created_at))}</p>` +
       `<p>Run: <span class="id">${esc(r.run_id || "not recorded")}</span><br>Reported model: ${esc(r.call && r.call.model_reported || "not recorded")}</p>` +
       `<details ${reviewDisclosure("mining-history:"+r.id)}><summary>Complete content, source evidence, and call record</summary>${fullRecord(r)}</details></article>`).join("") +
     (history.nextCursor ? `<button id="mining-history-older-${esc(row.id)}" class="btn" data-mining-history="${esc(row.id)}" data-mining-history-older="true" aria-disabled="${Boolean(history.loading)}">Load older mining history</button>` : "");
@@ -4554,7 +4611,7 @@ export function renderRecurrence(key = "", scope = recurrenceScope()) {
     const outcome=row.computable?`${row.comparison === "lower"?"Lower":row.comparison === "higher"?"Higher":"Unchanged"} observed recurrence${row.relative_change_pct==null?" · relative change unavailable from a zero baseline":" · "+rate(row.relative_change_pct)+"%"}`:"Comparison unavailable · "+row.reason.replaceAll("_"," ");
     html+=`<article class="run-record"><p><strong>${esc(outcome)}</strong></p><p><a href="#/rules/${encodeURIComponent(row.learning_id)}?tab=why">Rule ${esc(row.learning_id)}</a> · <a href="#/projects/${encodeURIComponent(row.project_key)}?tab=recurrence">${esc(row.project_key)}</a></p>`+
       field("Before",esc(side(row.before)))+field("After",esc(side(row.after)))+
-      `<p class="caption">Detector ${esc(row.compatibility_key.slice(0,16)||"unknown")} · revision ${esc(row.rule_revision_id.slice(0,12))} · recorded ${esc(row.observed_at.slice(0,19).replace("T"," "))} UTC</p>`;
+      `<p class="caption">Detector ${esc(row.compatibility_key.slice(0,16)||"unknown")} · revision ${esc(row.rule_revision_id.slice(0,12))} · recorded ${esc(displayTime(row.observed_at))}</p>`;
     if(detail.error) html+=`<p role="alert">${esc(detail.error)}</p>`;
     html+=`<button id="recurrence-detail-${scope}-${esc(row.id)}" class="btn" data-measurement-id="${esc(row.id)}" aria-disabled="${Boolean(detail.loading||detail.data)}">${detail.loading?"Reading measurement…":detail.data?"Measurement loaded":"Inspect measurement and matching evidence"}</button>`;
     if(detail.data) html+=runDisclosure("recurrence-detail:"+scope+":"+row.id,"Complete windows, availability, workload, exclusions and matching sources",detail.data);
@@ -4592,7 +4649,7 @@ export async function loadProjectNativeEvents(projectKey, query = "", {refresh=f
 export function renderProjectNativeEvents(key) {
   const entry=state.projectNativeEvents[projectNativeEventsUrl(key,state.projectExposureParams)]||{};
   const selected=new URLSearchParams(state.projectExposureParams);
-  let body=`<p>Native reports retain Claude file-load and session events, and Codex session lifecycle events. Codex reports do not identify loaded instruction files. Times below are when this receiver heard the report, in UTC. Neither adapter supplies loaded bytes or original event time.</p>`+
+  let body=`<p>Native reports retain Claude file-load and session events, and Codex session lifecycle events. Codex reports do not identify loaded instruction files. Times below are when this receiver heard the report, in Pacific time (PST/PDT). Neither adapter supplies loaded bytes or original event time.</p>`+
     `<p class="footnote">Exact rule revision, continuous context and collection completeness remain unknown. Repeated loads are separate reports; these counts do not measure instructions in force or rule benefit.</p>`;
   if(selected.get("logical_session_key") || selected.get("working_copy_id")) body+=`<p>Filtered loading reports · <a href="#/projects/${encodeURIComponent(key)}?tab=loads">Show all project reports</a></p>`;
   if(entry.error) body+=`<p role="alert" class="error-state">${esc(entry.error)}</p>`;
@@ -4603,7 +4660,7 @@ export function renderProjectNativeEvents(key) {
   for(const row of entry.records||[]) {
     const p=row.payload;
     const label={InstructionsLoaded:"Instruction loaded",SessionStart:"Session opened",PreCompact:"Compaction started",PostCompact:"Context compacted",SubagentStart:"Subagent started",SubagentStop:"Subagent stopped",Interrupt:"Turn interrupted",CwdChanged:"Working directory changed",SessionEnd:"Session ended"}[row.event_name] || row.event_name;
-    body+=`<article class="run-record session-record"><details ${reviewDisclosure("native-load:"+row.id)}><summary>${esc(row.source === "codex" ? "Codex" : "Claude")} · ${esc(label)}${p.file_path ? " · " + esc(p.file_path.split("/").pop()) : ""} · session ${esc(p.session_id)} · received ${esc(row.received_at.slice(0,19).replace("T"," "))}</summary>`+
+    body+=`<article class="run-record session-record"><details ${reviewDisclosure("native-load:"+row.id)}><summary>${esc(row.source === "codex" ? "Codex" : "Claude")} · ${esc(label)}${p.file_path ? " · " + esc(p.file_path.split("/").pop()) : ""} · session ${esc(p.session_id)} · received ${esc(displayTime(row.received_at))}</summary>`+
       field("Provider",esc(row.source === "codex" ? "Codex" : "Claude"))+
       field("Reported file",esc(p.file_path||"Not a file-load event"))+
       field("Load reason / scope",esc([p.load_reason,p.memory_type].filter(Boolean).join(" · ")||p.source||p.trigger||p.reason||p.agent_type||(row.event_name === "Interrupt" ? "Interrupted turn" : "Directory change")))+
@@ -4647,9 +4704,9 @@ export function renderProjectSessions(key) {
   const entry = state.projectSessions[projectSessionsUrl(key, state.projectExposureParams)] || {};
   const params = new URLSearchParams(state.projectExposureParams);
   const choices = (entry.version_groups || []).map(v => `<option value="${esc(v.compatibility_key)}" ${v.compatibility_key === (params.get("compatibility_key") || entry.compatibility_key) ? "selected" : ""}>${esc(v.compatibility_key.slice(0, 16))} · ${num(v.observations)} scans${v.identifiable ? "" : " · unidentifiable"}</option>`).join("");
-  const revisions = (entry.rule_revisions || []).map(r => `<option value="${esc(r.id)}" ${r.id === params.get("rule_revision_id") ? "selected" : ""}>Rule ${esc(r.learning_id.slice(0, 8))} · ${esc(r.applied_at.slice(0, 10))} · ${esc(r.id.slice(0, 8))}</option>`).join("");
+  const revisions = (entry.rule_revisions || []).map(r => `<option value="${esc(r.id)}" ${r.id === params.get("rule_revision_id") ? "selected" : ""}>Rule ${esc(r.learning_id.slice(0, 8))} · ${esc(displayTime(r.applied_at))} · ${esc(r.id.slice(0, 8))}</option>`).join("");
   const copies = (state.projectDetails[key]?.data?.observed_working_copies || []).map(c => `<option value="${esc(c.id)}" ${c.id === params.get("working_copy_id") ? "selected" : ""}>${esc(c.normalized_path)}</option>`).join("");
-  let body = `<p>Inspect native session metadata beside actual working-copy checks. Rollout creation is not proof that a session received a rule. All times are UTC.</p>` +
+  let body = `<p>Inspect native session metadata beside actual working-copy checks. Rollout creation is not proof that a session received a rule. Times are shown in Pacific time (PST/PDT).</p>` +
     `<form id="project-sessions-form" class="session-filters"><div class="session-filter"><label for="sessions-version">Detector / parser version</label><select id="sessions-version" name="compatibility_key"><option value="">Choose a version</option>${choices}</select></div><div class="session-filter"><label for="sessions-revision">Delivered revision</label><select id="sessions-revision" name="rule_revision_id"><option value="">All session evidence</option>${revisions}</select></div><div class="session-filter"><label for="sessions-copy">Working copy</label><select id="sessions-copy" name="working_copy_id"><option value="">All observed copies</option>${copies}</select></div><button id="sessions-submit" type="submit" class="btn">Inspect sessions</button></form>`;
   if (entry.error) body += `<p role="alert" class="error-state">${esc(entry.error)}</p>`;
   if (entry.loading) body += `<p role="status">Reading retained session evidence…</p>`;
@@ -4664,7 +4721,7 @@ export function renderProjectSessions(key) {
   body += `<p id="sessions-status" class="caption" tabindex="-1" aria-live="polite">${entry.loaded ? `${num(entry.records.length)}${entry.count == null ? "" : " of " + num(entry.count)} session/copy records shown` : "No session records loaded yet"}</p>`;
   for (const row of entry.records || []) {
     const q = row.qualification;
-    body += `<article class="run-record session-record"><details ${reviewDisclosure("session-record:" + row.id)}><summary>${esc(row.source)} · ${esc(row.working_copy_path.split("/").pop() || "Copy unknown")} · session ${esc(row.logical_session_key.slice(0, 8))} · ${row.reported_started_at ? "creation " + esc(row.reported_started_at.slice(0, 19).replace("T", " ")) : "creation unknown"}</summary>` +
+    body += `<article class="run-record session-record"><details ${reviewDisclosure("session-record:" + row.id)}><summary>${esc(row.source)} · ${esc(row.working_copy_path.split("/").pop() || "Copy unknown")} · session ${esc(row.logical_session_key.slice(0, 8))} · ${row.reported_started_at ? "creation " + esc(displayTime(row.reported_started_at)) : "creation unknown"}</summary>` +
       field("Logical session", `<span class="mono">${esc(row.logical_session_key)}</span>`) +
       (["claude","codex"].includes(row.source) ? `<p><a href="#/projects/${encodeURIComponent(key)}?tab=loads&logical_session_key=${encodeURIComponent(row.logical_session_key)}">Inspect native loading reports</a></p>` : "") +
       field("Working copy", `<span class="mono">${esc(row.working_copy_path || "Unknown")}</span>`) +
@@ -4800,7 +4857,7 @@ export function renderProjectRuleSummary(key) {
     const preview=text.length>140?text.slice(0,140)+"…":text;
     body+=`<article class="project-summary-rule"><div class="project-summary-rule__headline"><span class="project-summary-rule__state">${esc(lifetimes[row.lifetime.state])} · ${esc(row.origin)}</span>`+
       `<a id="project-summary-title-${esc(revision.id)}" class="project-summary-rule__title" href="#/rules/${encodeURIComponent(revision.learning_id)}">${esc(preview)}</a></div>`+
-      `<details ${reviewDisclosure("project-summary-revision:"+key+":"+data.working_copy_id+":"+revision.id)}><summary id="project-summary-evidence-${esc(revision.id)}">${check?`${esc(labels[check.status] || "Observation unknown")} · ${esc(check.observed_at.slice(0,19).replace("T"," "))} UTC`:"No check for this exact revision and copy"} · evidence</summary>`+
+      `<details ${reviewDisclosure("project-summary-revision:"+key+":"+data.working_copy_id+":"+revision.id)}><summary id="project-summary-evidence-${esc(revision.id)}">${check?`${esc(labels[check.status] || "Observation unknown")} · ${esc(displayTime(check.observed_at))}`:"No check for this exact revision and copy"} · evidence</summary>`+
       `<p class="caption">${scopes.map(esc).join("; ") || "Provider scope unknown"}.</p><p class="mono">${esc(revision.destination.target_path)}</p><pre class="review-card__diff">${esc(revision.content)}</pre>`+
       runDisclosure("project-summary-record:"+revision.id+":"+data.working_copy_id,"Application, observations and lifecycle",row)+`</details></article>`;
   }
@@ -5232,6 +5289,7 @@ export function paintOverview() {
   setHTML("ov-loop-coverage",renderOverviewLoopCoverage(data.audit?.loop));
   setHTML("ov-deliveries",renderOverviewDeliveries(data.audit?.loop?.delivery));
   setHTML("ov-latest",renderOverviewRunSummary(data.audit?.latest_run));
+  setHTML("ov-run-guide",renderOverviewRunGuide(data.audit?.latest_run));
   setHTML("ov-statusline-sub", renderStatusSub(data.status_line, data.freshness));
   setHTML("ov-tiles", renderTiles(data));
 
@@ -5241,7 +5299,7 @@ export function paintOverview() {
   setHTML("ov-grid-foot", renderGridFoot(grid) + `<ul class="legend legend--definitions">${renderGridLegend(grid)}</ul>`);
   setText(
     "ov-grid-meta",
-    `${num(grid.runs_total)} runs · ${(grid.nights || []).length} nights drawn · times are UTC`
+    `${num(grid.runs_total)} runs · ${(grid.nights || []).length} UTC day groups · timestamps in Pacific time (PST/PDT)`
   );
 
   setHTML("ov-backlog", renderBacklog(data.backlog,data.audit?.mining));
@@ -5592,7 +5650,7 @@ export async function loadRuleMembers({refresh=false,focus=false}={}) {
     }
   }
 }
-const RULE_TARGET_LABELS={global_claude_md:"Global CLAUDE.md",codex_global:"Global AGENTS.md",project_agents_md:"AGENTS.md",project_claude_md:"CLAUDE.md",rule_file:"Rule file",skill:"Skill",hook:"Hook"};
+const RULE_TARGET_LABELS={global_claude_md:"Global CLAUDE.md",codex_global:"Global AGENTS.md",global_private:"Personal rules",project_agents_md:"AGENTS.md",project_claude_md:"CLAUDE.md",rule_file:"Rule file",skill:"Skill",hook:"Hook"};
 function rulePathLabel(path) {
   return path.split("/").map((part,index,all)=>`<span>${esc(part)}${index<all.length-1 ? "/" : ""}</span>`).join("");
 }
@@ -5863,7 +5921,7 @@ export function renderEvaluationHistory(entry = {}) {
   html += `<p id="evaluation-page-status" tabindex="-1" aria-live="polite">${num(data.records.length)} shown · ${data.count == null ? "history count unknown" : `${num(data.count)} ${kind === "unlinked" ? "unlinked results" : "recorded attempts"}`}</p><p class="caption">${esc(data.reason)}</p>`;
   if (!data.records.length) html += `<p>${data.computable ? "No records match this selection." : "Complete attempt history is unavailable for this database."}</p>`;
   html += `<div class="eval-cards" tabindex="0" role="region" aria-label="Evaluation history records">`;
-  html += data.records.map(row => `<article class="eval-card"><p class="caption"><time>${esc(row.created_at || "Time not recorded")}</time> · ${esc(row.state)}</p><h3>${esc(row.rule_text || "Historical evaluation · " + row.subject_id)}</h3>` +
+  html += data.records.map(row => `<article class="eval-card"><p class="caption"><time>${esc(row.created_at ? displayTime(row.created_at) : "Time not recorded")}</time> · ${esc(row.state)}</p><h3>${esc(row.rule_text || "Historical evaluation · " + row.subject_id)}</h3>` +
     `<p><strong>${esc(row.outcome.label)}</strong></p>` +
     (row.kind === "attempt" ? `<p class="caption">${num(row.completed_scenarios)} of ${num(row.scenarios)} scenario results · ${num(row.paired_scenarios)} comparable pairs<br>${num(row.calls_recorded)} results / ${num(row.calls_started)} logical call starts</p>` : `<p class="caption">Exact source revision and model calls unknown.</p>`) +
     (row.observed_arms ? `<dl class="eval-card-arms">${["with", "without"].map(arm => { const a = row.observed_arms[arm]; return `<div><dt>${arm === "with" ? "With" : "Without"} the rule</dt><dd>${a.completed ? `${num(a.observed_passes)} / ${num(a.completed)} passed` : "No completed trials"}</dd></div>`; }).join("")}</dl>` : "") +
@@ -5952,7 +6010,7 @@ export function renderEvaluationDetail(entry) {
   if (entry.loading) return html + `<p role="status">Reading retained evaluation evidence…</p>`;
   if (entry.error) return html + `<p class="error-state" role="alert">${esc(entry.error)}</p><button id="evaluation-detail-retry" class="btn" data-evaluation-detail-refresh="true">Retry evaluation</button>`;
   const data = entry.data, summary = data.summary;
-  html += `<header class="view__head"><div><h1 id="evaluation-title" class="view__title" tabindex="-1">${entry.kind === "unlinked" ? "Historical evaluation" : "Evaluation attempt"}</h1><p class="mono">${esc(summary.id)}</p><p>${esc(summary.created_at || "Time not recorded")} · ${esc(summary.state)} · recorded verdict: ${esc(summary.verdict || "none")}</p></div><button id="evaluation-detail-refresh" class="btn" data-evaluation-detail-refresh="true">Refresh evidence</button></header>` + evaluationNotice(summary.outcome);
+  html += `<header class="view__head"><div><h1 id="evaluation-title" class="view__title" tabindex="-1">${entry.kind === "unlinked" ? "Historical evaluation" : "Evaluation attempt"}</h1><p class="mono">${esc(summary.id)}</p><p>${esc(summary.created_at ? displayTime(summary.created_at) : "Time not recorded")} · ${esc(summary.state)} · recorded verdict: ${esc(summary.verdict || "none")}</p></div><button id="evaluation-detail-refresh" class="btn" data-evaluation-detail-refresh="true">Refresh evidence</button></header>` + evaluationNotice(summary.outcome);
   if (entry.kind === "unlinked") {
     if (data.attempt_links?.length) html += projectPanel("Exact attempt records are available", data.attempt_links.map(link => `<p><a href="${esc(evaluationHref("attempt", link.attempt_id, entry.query))}">Inspect scenario ${link.scenario + 1} in its retained attempt</a></p>`).join(""));
     html += projectPanel("Retained historical result", `<p>Subject ID: <span class="mono">${esc(summary.subject_id)}</span>. This does not identify an exact rule revision.</p><p>Reported trial outcomes: ${num(summary.story.succeeded)} passed / ${num(summary.story.attempted)} attempted; ${num(summary.story.failed)} failed. Infrastructure failures may be included in those historical counts.</p><p>Comparison validity, exact source and producing model calls are unknown. No paired change is calculated.</p>` + runDisclosure("legacy-eval:" + summary.id, "Complete historical arms, metrics and failure taxonomy", data.record));
@@ -6525,9 +6583,10 @@ export async function load() {
   // Projects has an independent retry and error surface; do not leave its old
   // failure in the shared banner after that retry succeeds.
   const sharedFailures = failures.filter(result => result.entry.key !== "projects");
+  const sharedWanted = wanted.filter(entry => entry.key !== "projects");
   if (sharedFailures.length) {
     showError(
-      `Could not read ${sharedFailures.length} of ${wanted.length} endpoints`,
+      `Could not read ${sharedFailures.length} of ${sharedWanted.length} endpoints`,
       sharedFailures.map(f=>{const cause=String(f.error?.readDetail || f.error?.message || f.error);return cause.length>240 ? cause.slice(0,240)+"…" : cause;}).join(" · "),
       {owner:"dashboard-read",retry:true,diagnostic:sharedFailures.map(f=>String(f.error?.message || f.error)).join("\n"),
         diagnosticLabel:"Request details",diagnosticRegion:"Complete request diagnostic"}
@@ -6622,7 +6681,7 @@ export function renderQualitySamples(entry = {}) {
   if(entry.error) html+=`<p role="alert" class="error-state">${esc(entry.error)}</p>`;
   else if(entry.data) {
     html+=`<p id="quality-history-status" tabindex="-1">${num(entry.data.records.length)} samples shown · ${num(entry.data.count)} retained</p><div class="quality-sample-list">`;
-    html+=entry.data.records.map(r=>`<article><a href="${esc(qualityHref(r.id))}">${QUALITY_LABELS[r.target_class]} · ${esc(r.created_at)}</a><p>${num(r.counts.reviewed)} / ${num(r.counts.selected)} reviewed · ${esc(qualityFraction(r.counts))}</p><p class="caption">Seed ${esc(r.seed)}</p></article>`).join("")+`</div>`;
+    html+=entry.data.records.map(r=>`<article><a href="${esc(qualityHref(r.id))}">${QUALITY_LABELS[r.target_class]} · ${esc(displayTime(r.created_at))}</a><p>${num(r.counts.reviewed)} / ${num(r.counts.selected)} reviewed · ${esc(qualityFraction(r.counts))}</p><p class="caption">Seed ${esc(r.seed)}</p></article>`).join("")+`</div>`;
     if(!entry.data.records.length) html+=`<p>No saved samples. Choose a class above to preview one.</p>`;
     if(entry.cursor) html+=`<button id="quality-first" class="btn" data-quality-page="first">Newest samples</button> `;
     if(entry.data.next_cursor) html+=`<button id="quality-older" class="btn" data-quality-page="older">Older samples</button> `;
@@ -6660,7 +6719,7 @@ export function renderQualityDetail(entry) {
   html+=(entry.isNew ? shown.selected : data.subjects).map((item,index)=>{
     const id=item.source.id, current=item.judgment, draft=entry.drafts?.[id] || {judgment:current?.judgment || "",note:current?.note || ""};
     let body=`<p class="mono">Revision ${esc(id)}</p><div class="quality-content"><section><h3>Before this change</h3><pre tabindex="0">${esc(item.source.before)}</pre></section><section><h3>Applied content</h3><pre tabindex="0">${esc(item.source.applied)}</pre></section></div>`+qualitySource(item,"quality-"+id);
-    if(!entry.isNew)body+=`<p class="caption">${current ? `Latest judgment: ${esc(current.judgment.replaceAll("_"," "))} · ${esc(current.created_at)} · local operator · revision ${current.sequence}` : "No human judgment recorded."}</p><form class="quality-judgment exposure-form" data-quality-subject="${id}"><label for="quality-judgment-${id}">Judgment for revision ${index+1}</label><select id="quality-judgment-${id}" name="judgment" required><option value="">Choose a judgment</option>${["useful","not_useful","uncertain"].map(v=>`<option value="${v}"${draft.judgment===v ? " selected" : ""}>${v==="not_useful" ? "Not useful" : v==="useful" ? "Useful" : "Uncertain"}</option>`).join("")}</select><label for="quality-note-${id}">Assessment note</label><textarea id="quality-note-${id}" name="note" rows="3">${esc(draft.note)}</textarea><button id="quality-save-${id}" type="submit" class="btn"${entry.busy ? " disabled" : ""}>${current ? "Revise judgment" : "Record judgment"}</button></form>`+runDisclosure("quality-"+id+"-judgments",`Complete judgment history (${item.history.length})`,item.history);
+    if(!entry.isNew)body+=`<p class="caption">${current ? `Latest judgment: ${esc(current.judgment.replaceAll("_"," "))} · ${esc(displayTime(current.created_at))} · local operator · revision ${current.sequence}` : "No human judgment recorded."}</p><form class="quality-judgment exposure-form" data-quality-subject="${id}"><label for="quality-judgment-${id}">Judgment for revision ${index+1}</label><select id="quality-judgment-${id}" name="judgment" required><option value="">Choose a judgment</option>${["useful","not_useful","uncertain"].map(v=>`<option value="${v}"${draft.judgment===v ? " selected" : ""}>${v==="not_useful" ? "Not useful" : v==="useful" ? "Useful" : "Uncertain"}</option>`).join("")}</select><label for="quality-note-${id}">Assessment note</label><textarea id="quality-note-${id}" name="note" rows="3">${esc(draft.note)}</textarea><button id="quality-save-${id}" type="submit" class="btn"${entry.busy ? " disabled" : ""}>${current ? "Revise judgment" : "Record judgment"}</button></form>`+runDisclosure("quality-"+id+"-judgments",`Complete judgment history (${item.history.length})`,item.history);
     return projectPanel(`Selected revision ${index+1}`,body);
   }).join("");
   return html+runDisclosure("quality-manifest-"+entry.id,"Complete frozen selection and excluded coverage",shown);

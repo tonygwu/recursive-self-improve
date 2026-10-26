@@ -528,11 +528,11 @@ def test_a_non_numeric_window_is_refused_not_coerced(tmp_path):
 
 
 def test_projects_uses_retained_context_and_ignores_legacy_walk_parameters(tmp_path, monkeypatch):
-    def forbidden(**kwargs):
-        raise AssertionError('Web reader attempted a live context walk')
-    monkeypatch.setattr(dashboard_app, '_context_weigher', forbidden)
+    from tests.walk_guard import forbid_live_walks
+
     _fixture_db(tmp_path)
     app = _app(tmp_path)
+    forbid_live_walks(monkeypatch)
     with TestClient(app) as client:
         payload = client.get("/api/projects").json()
     request = payload["request"]
@@ -568,6 +568,49 @@ def test_a_broken_row_becomes_a_named_500_not_a_zero(tmp_path):
     body = response.json()
     assert body["error"] == "DashboardDataError"
     assert "run-bad" in body["detail"]
+
+
+def test_a_corrupt_running_run_is_a_named_500_on_overview_review_and_decisions(tmp_path):
+    """BL-55 review: one running row with a corrupt process identity made
+    Overview, Review and both decision routes answer a bare "Internal Server
+    Error". Each must name the cause and the run, and record nothing."""
+    from uuid import uuid4
+
+    _fixture_db(tmp_path)
+    pid = _queued_proposal(tmp_path)
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        decision = _approval_body(client, pid)
+    command = {"request_key": str(uuid4()), "action": "approve", "note": "",
+               "members": [{"proposal_id": pid, "revision": decision["revision"]}],
+               "preview_revision": decision["preview_revision"]}
+    writable = Store(tmp_path / "state.db")
+    writable.insert(
+        "runs",
+        {"id": "run-corrupt", "started": "2026-08-25T09:00:00Z", "finished": "", "status": "running",
+         "stats_json": json.dumps({"process": {"pid": 2**31, "started": "2026-08-25T09:00:00Z"}}),
+         "report_path": ""},
+    )
+    writable.commit()
+    writable.close()
+    recorded = ("SELECT (SELECT COUNT(*) FROM commands) AS commands, "
+                "(SELECT COUNT(*) FROM proposal_events) AS events, "
+                "(SELECT status FROM proposals WHERE id = ?) AS status")
+    before = _rows(tmp_path, recorded, (pid,))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        responses = {
+            "overview": client.get("/api/overview"),
+            "review-queue": client.get("/api/review-queue"),
+            "command": client.post("/api/commands", json=command),
+            "decision": client.post(DECISION_PATH.format(pid), json=decision),
+        }
+    for route, response in responses.items():
+        assert response.status_code == 500, (route, response.text)
+        assert response.headers["content-type"] == "application/json", (route, response.text)
+        body = response.json()
+        assert body["error"] == "PolicyError", route
+        assert "run run-corrupt: invalid recorded process identity" in body["detail"], route
+    assert _rows(tmp_path, recorded, (pid,)) == before
 
 
 # ---------------------------------------------------------------------------
@@ -1305,3 +1348,18 @@ def test_default_off_cards_can_be_decided_until_review_is_empty(tmp_path, status
             for proposal in family["proposals"]:
                 assert client.post(DECISION_PATH.format(proposal["id"]), json=_approval_body(client, proposal["id"], note='')).status_code == 200
         assert client.get("/api/review-queue").json()["count"] == 0
+
+
+@pytest.mark.parametrize("path,params", [
+    ("/api/overview", {"window_days": "0"}),
+    ("/api/overview", {"window_days": "-1"}),
+    ("/api/overview", {"window_days": str(10**8)}),
+    ("/api/rules", {"evidence_sample": "-1"}),
+])
+def test_out_of_range_numeric_parameters_are_request_errors(tmp_path, path, params):
+    """BL-46: window_days=0 returned 500 calling the state database corrupt,
+    10**8 raised an unhandled OverflowError, and evidence_sample=-1 reported
+    "capped at -1"."""
+    _fixture_db(tmp_path)
+    with TestClient(_app(tmp_path)) as client:
+        assert client.get(path, params=params).status_code == 422

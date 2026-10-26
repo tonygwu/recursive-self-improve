@@ -13,15 +13,33 @@ NOT_FAILURE_TAXONOMY = {'propose_TargetRejected': 'a prior target rejection supp
  'gate_budget_exhausted': "a proposal held because the gate's budget was gone before it was "
                           'asked',
  'wall_deadline_reached': 'incidents left unmined because the run reached its wall-clock '
-                          'deadline; not attempted'}
+                          'deadline; not attempted',
+ 'prune_rule_outside_marker_line': 'a re-run found the rule prunable, but it lives in a skill, '
+                                   'rule file or hook, where removing its marker line would '
+                                   'not remove the rule; no delete proposal was created and '
+                                   'no instruction file changed'}
 
-FAILURE_COPY = {'MineParseFailure': {'name': 'No answer we could read',
+FAILURE_COPY = {'MinerError': {'name': 'Could not process the incident',
+                      'explanation': 'The miner could not prepare or validate this incident. '
+                                     'This category includes missing transcript references and invalid retained input; '
+                                     'the category alone does not identify the exact cause or a failed model call.'},
+ 'MineParseFailure': {'name': 'No answer we could read',
                       'explanation': 'The mining output could not be parsed as the required '
                                      'JSON. This differs from a call that produced no '
                                      'output.'},
+ 'merge_invalid_scope': {'name': 'Merge answer named a scope it may not use',
+                         'explanation': 'The merge model answered with a scope outside the '
+                                        'merge prompt\'s allowed set. The rules were kept '
+                                        'unmerged; no scope was stored.'},
  'call_failed': {'name': 'The call never produced an answer',
                  'explanation': 'The provider call did not yield an accepted answer. The '
                                 'retained suffix identifies its recorded outcome.'},
+ 'gate_call_failed': {'name': 'The eval-generation call never produced an answer',
+                      'explanation': 'No scenario produced an evaluation spec, and the last '
+                                     "scenario's generation call did not yield an accepted "
+                                     'answer. No trial ran, so the event supplies no verdict '
+                                     'about the rule. The retained suffix identifies the '
+                                     "call's recorded outcome."},
  'gate_sandbox_unverified': {'name': 'Sandbox containment was not verified',
                              'explanation': 'The sandbox verification did not establish '
                                             'containment. This evaluation trial was not run; '
@@ -72,6 +90,12 @@ FAILURE_COPY = {'MineParseFailure': {'name': 'No answer we could read',
                                             'available providers could not satisfy its '
                                             'sandbox requirements. This is a preflight '
                                             'refusal, not a failed rule evaluation.'},
+ 'prune_learning_missing': {'name': 'The pruned rule had no learning record',
+                            'explanation': 'The A/B rerun found the applied rule prunable, '
+                                           'but its learning record was gone before a '
+                                           'delete proposal could be built. No delete '
+                                           'proposal was created and no instruction file '
+                                           'changed.'},
  'other': {'name': 'Unclassified failure',
            'explanation': 'A failure was recorded without a more specific cause.'}}
 
@@ -102,7 +126,8 @@ def failure_copy(cls: str) -> dict | None:
     family, sep, detail = cls.partition(':')
     if sep and family in FAILURE_COPY:
         result = dict(FAILURE_COPY[family])
-        if family == 'call_failed':
+        # Both families carry a call outcome as the suffix, not an exception class.
+        if family in ('call_failed', 'gate_call_failed'):
             specific = FAILURE_COPY.get(detail)
             if specific:
                 result['explanation'] += ' ' + specific['explanation']

@@ -347,3 +347,35 @@ def test_unknown_scope_is_reported_instead_of_guessing_a_suppression(store,cfg,t
     store.commit()
     with pytest.raises(CommandError) as error: context(store)
     assert error.value.code=='RejectionDataError'
+
+
+def test_target_identity_ignores_github_owner_and_name_case():
+    """BL-42: GitHub owner and repository names are case-insensitive, so a
+    rejection in one clone must apply to a clone spelled with other case."""
+    from self_improve.rejections import same_target
+
+    a = {'mode': 'project', 'project_key': 'remote:github.com/Example/Demo-Service',
+         'remote': 'github.com/Example/Demo-Service', 'path': 'AGENTS.md'}
+    b = {'mode': 'project', 'project_key': 'remote:github.com/example/demo-service',
+         'remote': 'github.com/example/demo-service', 'path': 'AGENTS.md'}
+    assert same_target(a, b)
+    other_host = dict(a, remote='gitlab.example.com/Example/Demo-Service', project_key='remote:x')
+    assert not same_target(other_host, dict(b, remote='gitlab.example.com/example/demo-service', project_key='remote:y'))
+
+
+def test_a_target_rejection_of_a_proposal_that_is_not_waiting_is_refused(store, cfg, tmp_path):
+    """A passing proposal of a still-running run belongs to that run's
+    automatic delivery, so Review does not hold it. reject_target must
+    refuse it by name and record nothing; this refusal had no test."""
+    from tests.test_run_liveness import live_run_stats
+    # This test process is the run's recorded live owner (run_liveness).
+    store.insert('runs', {'id': 'live-run', 'started': '2026-10-12T00:00:00Z', 'status': 'running',
+                          'stats_json': live_run_stats()})
+    a = proposal(store, tmp_path/'a.md', status='gated_pass')
+    store.update('proposals', 'id', a['id'], {'run_id': 'live-run'}); store.commit()
+    assert a['id'] not in waiting(store, cfg)
+    with pytest.raises(CommandError) as refused:
+        submit_command(store, cfg, decision(store, cfg, 'reject_target', [a]))
+    assert (refused.value.code, refused.value.status_code) == ('NotWaiting', 409)
+    assert store.query('SELECT * FROM commands') == []
+    assert store.query_one('SELECT status FROM proposals WHERE id=?', (a['id'],))['status'] == 'gated_pass'

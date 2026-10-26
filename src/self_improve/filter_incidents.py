@@ -35,8 +35,8 @@ Detectors and their documented scoring (all scores in [0, 1]):
   redacted head of the edit content.
 - ``self_observation`` — an ASSISTANT text message matching self-discovery
   language ("root cause was", "silently dropped", "never actually ran",
-  "reading the wrong file", ...) with >= 1 tool_result in the prior 10
-  events (discovery follows evidence). This covers agent-discovered mistakes
+  "reading the wrong file", "the counts above are not valid", ...) with
+  >= 1 tool_result in the prior 10 events (discovery follows evidence). This covers agent-discovered mistakes
   that lack human pushback or visible tool errors.
   Scored like ``correction`` (0.5-0.7 pattern weights + multi-match bonus).
 
@@ -156,6 +156,20 @@ _SELF_OBSERVATION_PATTERNS: list[tuple[str, re.Pattern[str], float]] = [
         0.7,
     ),
     ("stale", re.compile(r"\bstale\s+(?:cache|copy|data|state|value)\b", re.IGNORECASE), 0.5),
+    (
+        # Retracting numbers the agent already produced, e.g. "the counts
+        # above are not valid" after a tool quietly misbehaved.
+        "invalidated_result",
+        re.compile(
+            r"\b(?:counts?|results?|numbers?|figures?|totals?|scores?|"
+            r"measurements?|stats|statistics|metrics?)"
+            r"(?:\s+(?:above|so far|from (?:that|this|the) (?:run|command)))?"
+            r"\s+(?:are|were|is|was)\s+"
+            r"(?:not\s+valid|invalid|wrong|meaningless|bogus|garbage)\b",
+            re.IGNORECASE,
+        ),
+        0.6,
+    ),
 ]
 
 # Assistant messages longer than this are prose/reports, not discovery moments.
@@ -542,7 +556,9 @@ def _snippet_for(text: str, match_start: int) -> str:
     line_end = text.find("\n", match_start)
     if line_end == -1:
         line_end = len(text)
-    return redact_text(text[line_start:line_end].strip()[:_MATCHED_TEXT_MAX])
+    # Redact before the cap: a secret straddling the cut would otherwise keep
+    # a prefix too short for any pattern to recognize.
+    return redact_text(text[line_start:line_end].strip())[:_MATCHED_TEXT_MAX]
 
 
 def _match_patterns(
@@ -726,7 +742,7 @@ def _detect_repeated_error(
             ErrorFingerprint(
                 fingerprint=fp,
                 count=len(idxs),
-                sample_text=redact_text(first.text[:_MATCHED_TEXT_MAX]),
+                sample_text=redact_text(first.text)[:_MATCHED_TEXT_MAX],
                 first_ts=first.ts_utc,
             )
         )
@@ -736,7 +752,7 @@ def _detect_repeated_error(
                 CandidateIncident(
                     signal_type=SIGNAL_REPEATED_ERROR,
                     event_index=crossing_index,
-                    matched_text=redact_text(first.text[:_MATCHED_TEXT_MAX]),
+                    matched_text=redact_text(first.text)[:_MATCHED_TEXT_MAX],
                     score=min(1.0, 0.5 + 0.1 * (len(idxs) - threshold)),
                     detail={"fingerprint": fp, "count": len(idxs)},
                     support_indices=tuple(idxs[:threshold]),

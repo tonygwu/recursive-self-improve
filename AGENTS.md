@@ -10,12 +10,23 @@ Read [preview scope](docs/RESEARCH_PREVIEW.md), [workflow](docs/WORKFLOW.md), an
 - Run the full suite before committing: `uv run --extra dashboard pytest -q -ra`.
 - Run boundary acceptance: `uv run pytest -q tests/test_data_boundary.py`.
 - Package changes must pass `uv run pytest -q tests/test_distribution.py`.
-- Inspector changes must pass `uv run pytest -q tests/test_gate_inspection.py`.
-  `ops/inspect-gate-verdicts.sh` uses the read-only Store and selected private state.
+- Inspector changes must pass `uv run pytest -q tests/test_gate_inspection.py
+  tests/test_ops.py`. `ops/inspect-gate-verdicts.sh` uses the read-only Store and
+  selected private state, and shows only results linked to the selected run.
 - Upgrade-guide changes must pass `uv run --extra dashboard pytest -q
   tests/test_upgrade_guide.py tests/test_state_upgrade.py`. The published
   procedure in `docs/UPGRADING.md` is executed by that test, so keep exactly one
   heredoc in it and keep its required-migration set current.
+- Delivery-target and scope-routing changes must pass `uv run --extra dashboard
+  pytest -q tests/test_delivery_targets.py tests/test_routing.py
+  tests/test_routing_personal.py tests/test_scope_boundary.py
+  tests/test_prompt_contracts.py`. See `docs/TARGETS.md`. A personal lesson goes
+  only to `[targets] global_private`; without it, routing refuses the lesson.
+- Filter-benchmark changes must pass `uv run --extra dashboard pytest -q
+  tests/test_filter_eval.py tests/test_filter_reference.py
+  tests/test_filter_frontier.py tests/test_filter_zen.py`. See `docs/EVAL_FILTER.md`.
+- Deployment-gate changes must pass `uv run --extra dashboard pytest -q
+  tests/test_deploy_prod.py tests/test_ops.py`. See `docs/DEPLOYMENT.md`.
 - Browser contracts live in `tests/browser/`. Each verifier owns one contract and
   runs against its own temporary fixture server. Serve the fixture, run the
   verifier, then stop the fixture. They require a free port, an installed
@@ -34,6 +45,10 @@ Read [preview scope](docs/RESEARCH_PREVIEW.md), [workflow](docs/WORKFLOW.md), an
 - Verify an external backup before removing private data. Preserve the only
   surviving evidence for an incident. Do not rewrite history or install services
   as an incidental development action.
+- A change to which texts `redact_text` leaves unchanged needs a new
+  `redact.RULES_VERSION` and a frozen copy of the old rules registered in
+  `instruction_text.RULES`, because retained archives validate against the rules
+  version they record.
 - Redact excerpts before storage/model prompts, then inspect the rendered prompt.
   Redaction is not publication clearance. Bind evaluation identity to the actual
   served model and retained evidence, not a successful process exit.

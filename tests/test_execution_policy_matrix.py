@@ -23,11 +23,13 @@ from tests.test_apply import init_git_repo, insert_proposal, make_diff, run_git
 # item needs a reviewed decision here, not automatic inheritance of permission.
 STATUSES = ('pending', 'gated_pass', 'gated_fail', 'ungated', 'inconclusive',
             'held', 'approved_user', 'rejected_user', 'applied', 'rolled_back', 'superseded')
-TARGETS = {'global_claude_md': 'global', 'codex_global': 'global',
+TARGETS = {'global_claude_md': 'global', 'codex_global': 'global', 'global_private': 'global',
            'project_agents_md': 'project', 'project_claude_md': 'project',
            'rule_file': 'project', 'skill': 'skill', 'hook': 'hook'}
-ORDINARY = {'add', 'edit', 'delete', 'new_skill', 'new_rule_file'}
-MANUAL = {'delete_human_line', 'convert_to_hook', 'resolve_rollback', 'reapply', 'recover_rule'}
+ORDINARY = {'add', 'edit', 'new_skill', 'new_rule_file'}
+# 'delete' is the A/B prune of a delivered rule: one arm, no majority vote
+# (BACKLOG BL-11, 2026-10-12), so it always needs a human.
+MANUAL = {'delete', 'delete_human_line', 'convert_to_hook', 'resolve_rollback', 'reapply', 'recover_rule'}
 WAITING = {'pending', 'gated_pass', 'gated_fail', 'ungated', 'inconclusive', 'held', 'approved_user'}
 UNKNOWN = 'future_unsupported_value'
 BEFORE, AFTER = 'existing instruction\n', 'existing instruction\nnew instruction\n'
@@ -56,7 +58,7 @@ def test_complete_status_target_action_permission_matrix(enabled):
         assert bool(result['reason']) is (not expected), (proposal, result)
         assert result['target_class'] == TARGETS.get(kind)
         cases += 1
-    assert cases == 1056
+    assert cases == 1188
 
 
 @pytest.fixture
@@ -78,8 +80,13 @@ def target_for(root, kind):
 
 
 def propose(store, target, *, status='gated_pass', kind='global_claude_md', action='add'):
-    return insert_proposal(store, target=target, diff=make_diff(BEFORE, AFTER),
-                           status=status, target_kind=kind, action=action)
+    row = insert_proposal(store, target=target, diff=make_diff(BEFORE, AFTER),
+                          status=status, target_kind=kind, action=action)
+    # Distinct lessons carry distinct rules; the prior-rollback veto also
+    # matches rule text, so a shared fixture text would link every case.
+    store.update('learnings', 'id', row['learning_id'], {'rule_text': f'matrix rule for {target.name}'})
+    store.commit()
+    return row
 
 
 def assert_delivery(cfg, target, kind):
@@ -176,10 +183,17 @@ def test_review_counts_and_report_match_the_independent_permission_set(environme
     if enabled:
         for cls in ('global', 'project', 'skill'):
             policy.set_class_policy(store, cls, True, now='2020-01-01T00:00:00Z')
-    for run, veto in [('ordinary-run', False), ('review-only-run', True)]:
+    # Automatic delivery happens only inside the live run that created a
+    # proposal; once a run has ended, an undelivered proposal returns to Review.
+    # The running run records this test process as its live owner.
+    from tests.test_run_liveness import live_run_stats
+    for run, veto, status, finished in [('ordinary-run', False, 'running', ''),
+                                        ('review-only-run', True, 'ok', '2030-01-01T01:00:00Z'),
+                                        ('ended-run', False, 'ok', '2030-01-01T01:00:00Z')]:
         store.insert('runs', {'id': run, 'started': '2030-01-01T00:00:00Z',
-                             'finished': '2030-01-01T01:00:00Z', 'status': 'ok',
-                             'stats_json': json.dumps({'review_only': veto})})
+                             'finished': finished, 'status': status,
+                             'stats_json': live_run_stats(review_only=veto) if status == 'running'
+                             else json.dumps({'review_only': veto})})
     expected, automatic, cases = set(), set(), []
     for status, kind in product(STATUSES, TARGETS):
         cases.append((status, kind, 'add', 'ordinary-run', False))
@@ -188,6 +202,7 @@ def test_review_counts_and_report_match_the_independent_permission_set(environme
         for action in ('delete_human_line', 'convert_to_hook', 'edit'):
             cases.append(('gated_pass', kind, action, 'ordinary-run', False))
         cases.append(('gated_pass', kind, 'add', 'review-only-run', False))
+        cases.append(('gated_pass', kind, 'add', 'ended-run', False))
         cases.append(('gated_pass', kind, 'add', 'ordinary-run', True))
     for index, (status, kind, action, run, rollback) in enumerate(cases):
         target = root / f'case-{index}.md'; target.write_text(BEFORE)

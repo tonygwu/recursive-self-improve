@@ -198,6 +198,41 @@ def test_self_observation_headless_still_fires():
     assert len(by_signal(detect(events, CFG), SIGNAL_SELF_OBSERVATION)) == 1
 
 
+def test_self_observation_fires_when_results_are_invalidated():
+    # The agent learns that a tool it relied on produced bad numbers; nothing
+    # errored and no human pushed back.
+    events = [
+        tool_result("zcat: can't stat: run1/events.jsonl.gz (run1/events.jsonl.gz.Z)"),
+        ev(
+            ROLE_ASSISTANT,
+            "macOS `zcat` cannot read `.gz` files, so the drop-rule counts above "
+            "are not valid. Re-running with `gzip -dc`.",
+        ),
+    ]
+    hits = by_signal(detect(events, CFG), SIGNAL_SELF_OBSERVATION)
+    assert len(hits) == 1
+    assert hits[0].detail["patterns"] == ["invalidated_result"]
+
+
+def test_self_observation_invalidated_result_variants():
+    for text in (
+        "Those numbers were wrong: the filter matched nothing.",
+        "So the results from that run are meaningless.",
+        "The scores are invalid because both arms used one model.",
+    ):
+        hits = by_signal(detect([tool_result(), ev(ROLE_ASSISTANT, text)], CFG), SIGNAL_SELF_OBSERVATION)
+        assert [h.detail["patterns"] for h in hits] == [["invalidated_result"]], text
+
+
+def test_self_observation_valid_results_do_not_fire():
+    for text in (
+        "The counts above are valid; both runs agree.",
+        "The results are not yet available.",
+        "Results were written to report.md.",
+    ):
+        assert by_signal(detect([tool_result(), ev(ROLE_ASSISTANT, text)], CFG), SIGNAL_SELF_OBSERVATION) == [], text
+
+
 def test_ordinary_assistant_prose_does_not_fire():
     events = [tool_result(), ev(ROLE_ASSISTANT, "I'll run the tests and report back.")]
     assert by_signal(detect(events, CFG), SIGNAL_SELF_OBSERVATION) == []

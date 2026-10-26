@@ -60,8 +60,10 @@ with sync_playwright() as p:
         start=time.monotonic()
         counts(8);assert page.locator('#ov-tiles .tile').count()==4
         assert 'all classes off' in page.locator('#ov-policy').inner_text()
-        latest=page.locator('#ov-latest').inner_text()
-        assert 'same-z' in latest and 'succeeded: 4' in latest and 'succeeded: 12' not in latest
+        latest=' '.join(page.locator('#ov-latest').inner_text().split())
+        # Mine shows native stage accounting ("4 processed"): the exact latest
+        # run, never the sum of the two runs that share its time (8 + 4).
+        assert 'same-z' in latest and 'mine 4 processed' in latest and '12 processed' not in latest, latest
         assert page.locator('#ov-inbox .overview-family').count()==3
         assert max(len(text) for text in page.locator('#ov-inbox .overview-family a').all_text_contents())<=161
         assert page.locator('#ov-inbox script').count()==0

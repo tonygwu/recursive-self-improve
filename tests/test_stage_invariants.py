@@ -154,3 +154,22 @@ def test_a_gate_that_really_does_not_add_up_is_still_caught():
         "the message must show the counters the fix added, or it names numbers "
         "that do not explain the gap"
     )
+
+
+def test_a_declined_merge_is_an_accounted_outcome():
+    """BL-20: a valid keep_separate answer left an attempt unaccounted, and the
+    dashboard showed an accounting gap for a normal run."""
+    from self_improve.stage_accounting import numbers, state_from_numbers
+
+    nums = numbers('cluster', {'candidates': 4, 'merge_attempted': 2, 'merge_succeeded': 1,
+                               'merge_declined': 1, 'merge_failed': 0})
+    assert nums['unaccounted'] == 0 and state_from_numbers(nums) == 'ok'
+
+
+def test_a_budget_refused_merge_is_a_refusal_not_a_failure():
+    from self_improve.stage_accounting import numbers, state_from_numbers
+
+    nums = numbers('cluster', {'candidates': 4, 'merge_attempted': 2, 'merge_succeeded': 1,
+                               'merge_declined': 0, 'merge_failed': 0, 'merge_refused': 1})
+    assert (nums['failed'], nums['refused'], nums['unaccounted']) == (0, 1, 0)
+    assert state_from_numbers(nums) == 'budget_exhausted'

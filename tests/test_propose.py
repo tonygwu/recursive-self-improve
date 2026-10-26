@@ -137,12 +137,19 @@ class TestAddRoundTrip:
             build_proposal(learning(), decision, content, cfg)
 
     def test_trailing_newline_normalization_is_recorded(self, tmp_path: Path) -> None:
+        """Review of BL-15: delivery now refuses such a target instead of
+        adding the newline. Only a retained record recomputes the old result."""
+        from self_improve.propose import UnsupportedLineEndings
+
         cfg = make_cfg(tmp_path)
         content = "# P\n\nIntro without trailing newline"
         decision = route(learning(project_count=5), cfg)
         proposal = build_proposal(learning(), decision, content, cfg)
         assert proposal["normalized_trailing_newline"] is True
-        applied = apply_unified_diff(content, proposal["diff_unified"])
+        assert "delivery is refused" in proposal["note"]
+        with pytest.raises(UnsupportedLineEndings, match="final newline"):
+            apply_unified_diff(content, proposal["diff_unified"])
+        applied = apply_unified_diff(content, proposal["diff_unified"], refuse_rewritten_boundaries=False)
         assert applied.endswith(BULLET + "\n")
 
     def test_trailing_newline_flag_false_when_terminated(self, tmp_path: Path) -> None:
@@ -387,3 +394,159 @@ def test_diff_round_trips_for_a_seeded_corpus_of_adversarial_pairs():
     # Guard the guard: if the generator stopped producing differing pairs this
     # test would pass while asserting nothing.
     assert checked > 400, f"only {checked} non-trivial pairs exercised"
+
+
+# ----------------------------------------------------------------------------
+# Path-scoped rule files (routing sends scope_guess == "rule_path" here).
+# ----------------------------------------------------------------------------
+
+
+class TestRuleFile:
+    """The new_rule_file action had no test of the file it writes."""
+
+    def _route(self, tmp_path: Path) -> RouteDecision:
+        return RouteDecision(target_path=str(tmp_path / "proj" / ".claude" / "rules" / "x.md"),
+                             target_kind="rule_file", action="new_rule_file")
+
+    def test_the_rule_file_declares_its_globs_and_carries_the_marker(self, tmp_path: Path) -> None:
+        import yaml
+
+        globs = ["**/*.py", 'docs/"quoted" name/*.md', "tests/[ab]*.py"]
+        proposal = build_proposal(learning(path_globs=globs), self._route(tmp_path), "", make_cfg(tmp_path))
+        assert proposal["action"] == "new_rule_file"
+        content = apply_unified_diff("", proposal["diff_unified"])
+        assert content.startswith("---\npaths:\n") and content.endswith("<!-- si:abc123 -->\n")
+        front = content.split("---\n")[1]
+        assert yaml.safe_load(front) == {"paths": globs}
+        assert line_marker_id(content.splitlines()[-1]) == "abc123"
+
+    def test_stored_json_globs_are_read(self, tmp_path: Path) -> None:
+        proposal = build_proposal(learning(path_globs_json='["tests/*.py"]'), self._route(tmp_path),
+                                  "", make_cfg(tmp_path))
+        assert '  - "tests/*.py"\n' in apply_unified_diff("", proposal["diff_unified"])
+
+    @pytest.mark.parametrize("fields, message", [
+        ({"path_globs": []}, "no path globs"),
+        ({"path_globs": ["src/*.py", "  "]}, "non-empty strings"),
+        ({"path_globs": "src/*.py"}, "non-empty strings"),
+        ({"path_globs_json": "[not json"}, "not valid JSON"),
+        ({}, "non-empty strings"),
+    ])
+    def test_a_rule_file_scoped_to_no_valid_paths_is_refused(self, tmp_path, fields, message) -> None:
+        with pytest.raises(ProposalError, match=message):
+            build_proposal(learning(**fields), self._route(tmp_path), "", make_cfg(tmp_path))
+
+    def test_an_existing_rule_file_is_never_overwritten(self, tmp_path: Path) -> None:
+        with pytest.raises(ProposalError, match="already has content"):
+            build_proposal(learning(path_globs=["src/*.py"]), self._route(tmp_path),
+                           "existing\n", make_cfg(tmp_path))
+
+
+SOURCE = "a\nb\nc\nd\n"
+HEAD = "--- t\n+++ t\n"
+
+
+@pytest.mark.parametrize("diff, message", [
+    (HEAD + "@@ nonsense @@\n a\n", "malformed hunk header"),
+    (HEAD + "@@ -2,1 +2,1 @@\n b\n@@ -1,1 +1,1 @@\n a\n", "out of order or overlapping"),
+    (HEAD + "@@ -9,1 +9,1 @@\n z\n", "beyond end of source"),
+    (HEAD + "@@ -1,1 +1,1 @@\n\n", "empty"),
+    (HEAD + "@@ -1,1 +1,1 @@\n*a\n", "unknown diff line prefix"),
+    (HEAD + "@@ -1,1 +1,1 @@\n-x\n+a\n", "delete mismatch"),
+    (HEAD + "@@ -1,2 +1,2 @@\n a\n", "declared 2 source lines but consumed 1"),
+    (HEAD + "@@ -1,1 +1,2 @@\n a\n", "declared 2 result lines but produced 1"),
+])
+def test_every_malformed_patch_is_refused_rather_than_applied(diff, message):
+    """apply.py relies on this strictness: no fuzz, no partial write."""
+    with pytest.raises(PatchConflict, match=message):
+        apply_unified_diff(SOURCE, diff)
+
+
+@pytest.mark.parametrize("separator", ["\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x85", " ", " "])
+def test_a_target_whose_line_structure_would_be_rewritten_is_refused(separator):
+    """BL-15: splitlines() split on CRLF and on Unicode separators, and the
+    result was rejoined with LF, so delivery rewrote bytes outside the hunk.
+    Review of BL-15: the refusal is the default. It used to depend on a flag
+    at every call site, and no test reached any of those flags."""
+    from self_improve.propose import PatchConflict, UnsupportedLineEndings, apply_unified_diff, make_unified_diff
+
+    before = "# Rules" + separator + "keep me\n" if separator not in ("\r\n", "\r") else f"# Rules{separator}keep me{separator}"
+    diff = make_unified_diff("# Rules\nkeep me\n", "# Rules\nkeep me\nnew rule\n", "AGENTS.md")
+    with pytest.raises(UnsupportedLineEndings) as excinfo:
+        apply_unified_diff(before, diff)
+    assert isinstance(excinfo.value, PatchConflict)
+    assert repr(separator[0])[1:-1] in str(excinfo.value)
+
+
+def test_a_mid_file_edit_cannot_add_a_final_newline_outside_its_hunk():
+    """Review of BL-15: a target without a final newline came back with one,
+    although the edit was in the middle of the file and its hunk never reached
+    the last line. The review probe printed: before ends 'no newline', after
+    ends 'o newline\\n'."""
+    from self_improve.propose import UnsupportedLineEndings, apply_unified_diff, make_unified_diff
+
+    before = "one\ntwo\nthree\nfour\nfive\nsix\nseven\nno newline"
+    diff = make_unified_diff(before, before.replace("two", "TWO"), "AGENTS.md")
+    assert "no newline" not in diff, "the last line is outside the reviewed hunk"
+    with pytest.raises(UnsupportedLineEndings, match="final newline"):
+        apply_unified_diff(before, diff)
+
+
+def test_plain_lf_content_still_applies():
+    from self_improve.propose import apply_unified_diff, make_unified_diff
+
+    diff = make_unified_diff("# Rules\nkeep me\n", "# Rules\nkeep me\nnew rule\n", "AGENTS.md")
+    assert apply_unified_diff("# Rules\nkeep me\n", diff) == "# Rules\nkeep me\nnew rule\n"
+
+
+@pytest.mark.parametrize("before", [
+    "# Rules\r\n\r\n- keep tests green\r\n",
+    "# Rules\n\n- keep tests green",
+], ids=["crlf", "no_final_newline"])
+def test_a_historical_crlf_delivery_record_still_validates(before):
+    """Review of BL-15: the refusal ran inside apply_unified_diff, which also
+    re-validates retained delivery records, so a delivery recorded before the
+    refusal existed (CRLF before_content) failed validation, breaking the
+    Overview delivery summary and its rollback. A record whose target lacked a
+    final newline must keep validating the same way."""
+    import hashlib
+    from self_improve import delivery_records as dr
+    from self_improve.propose import apply_unified_diff, make_unified_diff
+
+    lf = "\n".join(before.splitlines()) + "\n"
+    diff = make_unified_diff(lf, lf + "- new rule <!-- si:abc -->\n", "AGENTS.md")
+    # What the applier wrote before the refusal existed.
+    after = apply_unified_diff(before, diff, refuse_rewritten_boundaries=False)
+    sha = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    delivery = {"version": 1, "before_exists": True, "branch_exists": False, "snapshot_before": "s0",
+                "branch_commit": "", "base_ref": "", "before_content": before, "before_hash": sha(before),
+                "after_content": after, "after_hash": sha(after)}
+    dr.validated_delivery({"delivery": delivery, "delivery_hash": dr.delivery_fingerprint(delivery)}, diff)
+
+
+def test_the_first_rule_in_an_empty_section_sits_directly_above_the_next_heading():
+    """Accepted formatting (review of the empty-section gap): the first rule
+    in an empty Learned section has no blank line before a following heading. Adding
+    that blank line broke rollback of the first rule once a second rule was
+    added, because the second rule went between the bullet and the blank
+    line (see test_apply). Any later formatting fix must keep that rollback
+    working."""
+    content = f"# Rules\n\n{SECTION_HEADER}\n\n## Commands\n- make test\n"
+    assert append_learned_rule(content, BULLET) == (
+        f"# Rules\n\n{SECTION_HEADER}\n\n{BULLET}\n## Commands\n- make test\n")
+    at_end = f"# Rules\n\n{SECTION_HEADER}\n\n"
+    assert append_learned_rule(at_end, BULLET) == f"# Rules\n\n{SECTION_HEADER}\n\n{BULLET}\n"
+
+
+def test_deleting_the_only_rule_of_an_empty_section_restores_the_file(tmp_path: Path) -> None:
+    """Review of the empty-section gap: with a blank line after the first rule,
+    deleting that rule left two blank lines above '## Commands', so the file
+    no longer returned to its original bytes."""
+    cfg = make_cfg(tmp_path)
+    original = f"# Rules\n\n{SECTION_HEADER}\n\n## Commands\n- make test\n"
+    add = build_proposal(learning(), route(learning(project_count=5), cfg), original, cfg)
+    added = apply_unified_diff(original, add["diff_unified"])
+    assert BULLET in added
+    delete = build_proposal({"id": "del-only", "delete_marker_id": "abc123"}, delete_route(cfg), added, cfg)
+    assert delete["action"] == "delete"
+    assert apply_unified_diff(added, delete["diff_unified"]) == original

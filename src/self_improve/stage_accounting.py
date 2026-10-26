@@ -21,7 +21,7 @@ UNITS = {'scan':'file scan passes', 'mine':'incident mining attempts',
 COUNT_FIELDS = {
     'scan': ('files_skipped_unchanged',), 'mine': (),
     'cluster': ('candidates', 'open_learnings', 'clusters', 'absorbed_into_pending',
-                'open_passthrough_clusters', 'merged'),
+                'open_passthrough_clusters', 'merged', 'merge_declined', 'merge_refused'),
     'gate': ('dup_dropped', 'dup_dropped_by_miner'), 'apply': (),
 }
 
@@ -78,6 +78,12 @@ def numbers(stage, payload):
     failed = 0 if passthrough else payload[failed_key]
     refused = payload['refused'] if stage == 'gate' else 0
     succeeded = 0 if passthrough else sum(payload[k] for k in outcome_keys if k not in (failed_key, 'refused'))
+    if stage == 'cluster' and not passthrough:
+        # Older payloads predate these counters. When present, a declined merge
+        # is a completed call and a refusal is not a failure; when absent, any
+        # declines or refusals still show as an accounting gap.
+        succeeded += payload.get('merge_declined', 0)
+        refused = payload.get('merge_refused', 0)
     taxonomy = payload.get('taxonomy', {})
     refused_in_failed = mining_failure_counts(payload)['refused'] if stage == 'mine' else 0
     number = payload['candidates'] if stage == 'cluster' else payload['applied'] if stage == 'apply' else succeeded
@@ -88,7 +94,7 @@ def numbers(stage, payload):
         'unit':UNITS[stage], 'meaning':MEANINGS[stage], 'refused_in_failed':refused_in_failed,
         'not_attempted':{k:taxonomy[k] for k in ('budget_exhausted','wall_deadline_reached','provider_unavailable')
                          if taxonomy.get(k,0)>0},
-        'native_outcomes':{k:payload[k] for k in outcome_keys if k in payload}}
+        'native_outcomes':{k:payload[k] for k in (*outcome_keys, *(('merge_declined', 'merge_refused') if stage == 'cluster' else ())) if k in payload}}
     if 'taxonomy' in payload: result['taxonomy'] = dict(taxonomy)
     if 'mode' in payload: result['mode'] = payload['mode']
     if stage == 'cluster': result['passthrough'] = passthrough

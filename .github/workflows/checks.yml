@@ -90,7 +90,10 @@ jobs:
       - name: Run the full suite, including dashboard and wheel tests
         env:
           HF_HUB_OFFLINE: "1"
-        run: uv run pytest -q -ra
+        # One worker per vCPU: 3 on macos-14, and on ubuntu-24.04 4 for a
+        # public repository or 2 for a private one. loadgroup keeps each
+        # xdist_group on one worker; see CONTRIBUTING.md.
+        run: uv run pytest -q -ra -n auto --dist loadgroup
       - name: Check the data-boundary acceptance marker
         env:
           HF_HUB_OFFLINE: "1"

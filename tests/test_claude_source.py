@@ -280,9 +280,9 @@ def test_parse_subagent_sidechain_meta(tmp_path):
     src = make_source(root)
     events = list(src.parse(str(root / MAIN_SLUG / SID / "subagents" / "agent-1.jsonl")))
     assert len(events) == 2
-    # The subagent prompt satisfies the human predicate; is_sidechain/agent_id
-    # in meta let downstream discount it.
-    assert events[0].role == ROLE_HUMAN
+    # The parent agent wrote the subagent's prompt, so it is not human text.
+    # No downstream reader discounted is_sidechain (BL-24), so the source does.
+    assert (events[0].role, events[0].kind) == (ROLE_SYSTEM, "sidechain_prompt")
     assert events[0].meta["is_sidechain"] is True
     assert events[0].meta["agent_id"] == "agent-1"
 
@@ -448,3 +448,47 @@ def test_the_two_types_found_on_2026_08_23_are_known_bookkeeping(tmp_path):
     assert stats.lines_failed == 0, f"marked malformed: {stats.error_taxonomy}"
     assert stats.unknown_lines == 0, f"still unknown: {stats.unknown_taxonomy}"
     assert stats.skipped_taxonomy == {"pr-link": 1, "fork-context-ref": 1}
+
+
+@pytest.mark.parametrize(
+    "extra, content",
+    [
+        ({}, "<bash-stdout>?? notes.txt</bash-stdout><bash-stderr></bash-stderr>"),
+        ({}, "<bash-input>git status --short</bash-input>"),
+        ({"isCompactSummary": True}, "1. Primary Request: the user said from now on always run the suite"),
+        ({"isSidechain": True}, "You MUST only read files. Never edit anything."),
+    ],
+)
+def test_machine_written_user_lines_are_not_human_text(tmp_path, extra, content):
+    """BL-24: bash-mode output, compact summaries and subagent prompts passed
+    the human predicate and produced false frustration/instruction incidents."""
+    root = build_tree(tmp_path)
+    path = tmp_path / "machine.jsonl"
+    record = {"type": "user", "timestamp": "2026-08-10T10:00:00Z", "cwd": "/work/alpha",
+              "sessionId": "s", "entrypoint": "cli", "message": {"role": "user", "content": content}, **extra}
+    path.write_text(json.dumps(record) + "\n")
+    events = list(make_source(root).parse(str(path)))
+    assert events and all(e.role != ROLE_HUMAN for e in events), [(e.role, e.kind) for e in events]
+
+
+def test_a_plain_user_prompt_is_still_human(tmp_path):
+    root = build_tree(tmp_path)
+    path = tmp_path / "human.jsonl"
+    record = {"type": "user", "timestamp": "2026-08-10T10:00:00Z", "cwd": "/work/alpha",
+              "sessionId": "s", "entrypoint": "cli", "message": {"role": "user", "content": "no, that's wrong"}}
+    path.write_text(json.dumps(record) + "\n")
+    assert [e.role for e in make_source(root).parse(str(path))] == [ROLE_HUMAN]
+
+
+def test_a_symlinked_account_mirror_is_refused_before_resolution(tmp_path):
+    """BL-40: discover() resolved the root before looking for .claude-<letter>,
+    so the real layout, ~/.claude-b/projects -> ~/.claude/projects, passed."""
+    from self_improve.sources.claude_code import ClaudeSourceError
+
+    real = tmp_path / "home" / ".claude" / "projects"
+    real.mkdir(parents=True)
+    mirror = tmp_path / "home" / ".claude-b"
+    mirror.mkdir()
+    (mirror / "projects").symlink_to(real)
+    with pytest.raises(ClaudeSourceError, match=r"\.claude-b"):
+        list(ClaudeCodeSource(Config(claude_projects_dir=str(mirror / "projects"))).discover())

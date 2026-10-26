@@ -565,3 +565,81 @@ def test_rebuild_names_a_missing_table_under_an_applied_migration(tmp_path):
     env.store.commit()
     with pytest.raises(so.ScanObservationError, match="scan_observation_occurrences is unreadable"):
         rebuild.rebuild_state(env.store, export_path=tmp_path / "backup", dry_run=True)
+
+
+def test_a_claude_session_that_moves_into_a_denied_tree_is_not_mined(tmp_path):
+    """BL-05: the denylist was applied only to a Claude file's first cwd, and
+    the Claude source marked no event, so text written after the session moved
+    into a denied tree became an incident."""
+    env = make_env(tmp_path)
+    denied = str(tmp_path / "denied-tree" / "client-x")
+    Path(denied).mkdir(parents=True)
+    write_claude(env, [
+        c_user("start in the clean repo", ts(0), env.repo),
+        c_tool(ts(1), denied),
+        c_result("payroll.csv", ts(2), denied),
+        c_user("no, that's wrong, the client-x payroll export is elsewhere", ts(3), denied),
+    ])
+    stats = scan(env, "scan-1")
+    assert stats.events_denylisted == 3
+    assert count(env.store, "SELECT 1 FROM incidents") == 0
+    rows = env.store.query("SELECT line_no, exclusion FROM scan_lines WHERE active=1 ORDER BY line_no")
+    assert [r["exclusion"] for r in rows][1:] == ["denied", "denied", "denied"]
+
+
+def test_a_failed_gh_lookup_is_retried_on_the_next_run(tmp_path, monkeypatch):
+    """BL-25: a transient gh failure persisted the degraded remote: identity,
+    later runs returned it without asking gh, and a clone with another URL
+    spelling resolved to github:<id>, splitting one repository into two keys."""
+    import self_improve.project_identity as pi
+
+    env = make_env(tmp_path, project_identity_use_gh=True)
+    calls, state = [], {"fail": True}
+
+    def fake_gh(owner_repo):
+        calls.append(owner_repo)
+        if state["fail"]:
+            raise RuntimeError("network unreachable (transient)")
+        return {"id": 4242, "full_name": "example/alpha"}
+
+    monkeypatch.setattr(pi, "_default_gh", fake_gh)
+    write_claude(env, [c_user("hello", ts(0), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000001")
+    scan(env, "scan-1")
+    assert count(env.store, "SELECT 1 FROM project_identity_cache WHERE method='remote_url'") == 0
+    state["fail"] = False
+    write_claude(env, [c_user("again", ts(5), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000002")
+    scan(env, "scan-2")
+    keys = {r["project_key"] for r in env.store.query(
+        "SELECT project_key FROM sessions WHERE file_path LIKE '%000000000002.jsonl'")}
+    assert keys == {"github:4242"}, keys
+    assert len(calls) == 2, calls
+
+
+def test_a_degraded_identity_saved_before_bl25_is_retried_on_load(tmp_path, monkeypatch):
+    """Review of BL-25: databases written before the fix already hold a
+    remote_url row from a failed gh lookup. The test above never stores one,
+    so removing the skip on load still passed. The next scan with a working
+    gh must ask gh again and replace the degraded row with github:<id>."""
+    import self_improve.project_identity as pi
+
+    env = make_env(tmp_path, project_identity_use_gh=True)
+    # The row the code before BL-25 saved after gh failed for this remote.
+    env.store.insert("project_identity_cache", {
+        "remote_norm": "github.com/example/alpha", "project_key": PROJECT,
+        "display": "alpha", "method": pi.METHOD_REMOTE_URL,
+        "resolved_at": "2026-10-01T00:00:00Z"})
+    env.store.commit()
+    calls = []
+
+    def fake_gh(owner_repo):
+        calls.append(owner_repo)
+        return {"id": 4242, "full_name": "example/alpha"}
+
+    monkeypatch.setattr(pi, "_default_gh", fake_gh)
+    write_claude(env, [c_user("hello", ts(0), env.repo)])
+    scan(env, "scan-1")
+    assert calls == ["example/alpha"], calls
+    assert {r["project_key"] for r in env.store.query("SELECT project_key FROM sessions")} == {"github:4242"}
+    rows = env.store.query("SELECT remote_norm, project_key, method FROM project_identity_cache")
+    assert rows == [{"remote_norm": "github.com/example/alpha", "project_key": "github:4242",
+                     "method": pi.METHOD_GH_REPO_ID}], rows

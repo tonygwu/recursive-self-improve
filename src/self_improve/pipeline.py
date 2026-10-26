@@ -232,6 +232,27 @@ def wall_clock_stats(store, run_id: str, started_iso: str, finished_iso: str) ->
     }
 
 
+def _split_denylisted(cfg: Config, store: Store, incidents: list) -> tuple[list, dict]:
+    """Remove waiting incidents whose session the denylist now names.
+
+    Matching is ``scan.incident_denylist_match``, the same check that refuses
+    manual mining. Returns the remaining incidents and a count of the removed
+    ones per matching entry.
+    """
+    from .scan import incident_denylist_match
+
+    recorded = {r["file_path"]: r["project_path"]
+                for r in store.query("SELECT file_path, project_path FROM sessions")}
+    kept, by_substring = [], {}
+    for inc in incidents:
+        matched = incident_denylist_match(cfg, inc, recorded.get(inc["session_file"], ""))
+        if matched:
+            by_substring[matched] = by_substring.get(matched, 0) + 1
+        else:
+            kept.append(inc)
+    return kept, {"incidents": len(incidents) - len(kept), "by_substring": by_substring}
+
+
 def order_incidents_for_mining(
     store, incidents: list[dict], cfg
 ) -> tuple[list[dict], dict]:
@@ -311,37 +332,49 @@ def order_incidents_for_mining(
 
 
 def finalize_stale_runs(store, cfg) -> dict:
-    """Mark stale running rows abandoned after an interrupted process.
+    """Mark running rows abandoned once their process is gone.
 
-    A crash can skip in-process finalization. The configured age threshold permits
-    overlapping manual work to finish before a later invocation abandons its row.
-    Compare UTC timestamps; count and retain rows with unreadable timestamps instead
-    of guessing their age.
+    A crash can skip in-process finalization. `run_liveness.run_liveness` is
+    the one rule, shared with Review: a row that records its process is
+    abandoned once that process (same PID and start time) no longer exists,
+    and is never abandoned while it does, however long the run takes. A
+    legacy row without a recorded process keeps the age rule
+    (`cfg.run_stale_after_hours`, compared in UTC); one whose `started` time
+    cannot be read is counted and left running instead of guessed. An
+    unreadable recorded identity raises with the run id.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
+
+    from .run_liveness import recorded_identity, run_liveness
 
     # cfg required, not defaulted: the same permissive shape on
     # order_incidents_for_mining let its call site drop cfg silently, so
     # mine_order was ignored while the report claimed otherwise.
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg.run_stale_after_hours)
-    stats = {"abandoned": 0, "left_running": 0, "unparseable_started": 0}
-    for row in store.query("SELECT * FROM runs WHERE status = 'running'"):
-        raw = (row["started"] or "").strip()
-        try:
-            started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
+    now = datetime.now(timezone.utc)
+    stats = {"abandoned": 0, "abandoned_process_gone": 0, "abandoned_by_age": 0,
+             "left_running": 0, "unparseable_started": 0, "changed_since_read": 0}
+    # Judge every row before writing any: an unreadable identity raises with
+    # its run id and leaves no partial reaping behind.
+    judged = [(row, run_liveness(row, cfg, now=now))
+              for row in store.query("SELECT * FROM runs WHERE status = 'running'")]
+    for row, liveness in judged:
+        if liveness == "unknown":
             stats["unparseable_started"] += 1
-            continue
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        if started < cutoff:
-            store.update(
-                "runs", "id", row["id"],
-                {"status": "abandoned", "finished": utc_now_iso()},
-            )
-            stats["abandoned"] += 1
-        else:
+        elif liveness == "live":
             stats["left_running"] += 1
+        else:
+            # Match the row as judged: a model-job worker that resumed this
+            # run since the read recorded its own process and keeps it.
+            changed = store.conn.execute(
+                "UPDATE runs SET status='abandoned', finished=? "
+                "WHERE id=? AND status='running' AND stats_json=?",
+                (utc_now_iso(), row["id"], row["stats_json"]))
+            if changed.rowcount == 1:
+                stats["abandoned"] += 1
+                by = "abandoned_process_gone" if recorded_identity(row) else "abandoned_by_age"
+                stats[by] += 1
+            else:
+                stats["changed_since_read"] += 1
     store.commit()
     return stats
 
@@ -402,10 +435,13 @@ def run_pipeline(
         "strong_call_cap": cfg.max_strong_calls_per_run if max_strong_calls is None else max_strong_calls,
         "gate_call_cap": cfg.max_gate_calls_per_run,
     }
-    stats: dict = {"run_id": run_id, "dry_run": dry_run, "review_only": review_only,
-                  "execution_policy": policy_snapshot(store)}
+    from .run_liveness import recording_stats
+    stats: dict = recording_stats({"run_id": run_id, "dry_run": dry_run, "review_only": review_only,
+                                   "execution_policy": policy_snapshot(store)})
     # Persist execution intent before any proposal exists. A concurrent reader
     # must not interpret a running review-only run's missing stats as permission.
+    # The recorded process is this run's live owner (run_liveness): the run
+    # stays running for Review and the reaper exactly while it exists.
     with store.transaction(write=True):
         store.insert("runs", {"id": run_id, "started": run_started,
                               "stats_json": json.dumps(stats)})
@@ -494,11 +530,21 @@ def run_pipeline(
                 incidents = store.query(
                     "SELECT * FROM incidents WHERE status = 'new'"
                 )
+            # The scan applies the denylist only when it first reads a session,
+            # so an entry added later leaves earlier incidents waiting. They are
+            # refused here, before attempted is counted, and keep status 'new'.
+            incidents, denied = _split_denylisted(cfg, store, incidents)
             # Queue order affects which incidents retain their full transcripts
             # until mining reaches them. Use the configured sampling policy.
             incidents, order_stats = order_incidents_for_mining(store, incidents, cfg)
             mine_stats = {"attempted": 0, "succeeded": 0, "failed": 0, "taxonomy": {}}
             mine_stats["queue"] = order_stats
+            mine_stats["denylisted"] = denied
+            if denied["incidents"]:
+                logger.info(
+                    "mine: %d waiting incidents skipped because denylist_substrings "
+                    "now matches their session: %s", denied["incidents"], denied["by_substring"],
+                )
             mine_stats["mode"] = cfg.mine_mode
             # Use wall time because macOS monotonic time pauses during sleep. Record the
             # deadline on every run so an unused limit differs from an unmeasured one.
@@ -636,9 +682,12 @@ def run_pipeline(
                     "candidates": len(candidates),
                     "mode": "agentic_passthrough",
                 }
+                unreadable_rules: list[dict] = []
                 existing_vecs = cluster.existing_rule_vectors(
-                    cfg, _target_paths(store, cfg), embedder
+                    cfg, _target_paths(store, cfg), embedder, unreadable=unreadable_rules
                 )
+                if unreadable_rules:
+                    stats["cluster"]["unreadable_instruction_files"] = unreadable_rules
                 rejected_vecs = cluster.rejected_vectors(store, embedder)
             else:
                 # Pool expansion (fast mode): cluster new candidates
@@ -673,37 +722,55 @@ def run_pipeline(
                     if news and opens:
                         # Absorber choice mirrors merge_clusters' representative
                         # rule: highest evidence_count, ties -> earliest first_seen.
-                        absorber = sorted(
-                            opens,
-                            key=lambda l: (
-                                -int(l.get("evidence_count") or 0),
-                                l.get("first_seen") or "",
-                            ),
-                        )[0]
-                        projects = set(_projects_list(absorber))
-                        evidence = int(absorber.get("evidence_count") or 0)
-                        for cand in news:
-                            # A candidate row is at least one observation (same
-                            # floor merge_clusters applies).
-                            evidence += int(cand.get("evidence_count") or 0) or 1
-                            projects.update(_projects_list(cand))
+                        def _best(rows):
+                            return sorted(rows, key=lambda l: (
+                                -int(l.get("evidence_count") or 0), l.get("first_seen") or ""))[0]
+
+                        def _absorb(absorber, cands):
+                            nonlocal absorbed_into_pending
+                            projects = set(_projects_list(absorber))
+                            evidence = int(absorber.get("evidence_count") or 0)
+                            for cand in cands:
+                                # A candidate row is at least one observation (same
+                                # floor merge_clusters applies).
+                                evidence += int(cand.get("evidence_count") or 0) or 1
+                                projects.update(_projects_list(cand))
+                                store.update(
+                                    "learnings",
+                                    "id",
+                                    cand["id"],
+                                    {"status": "superseded", "duplicate_of": absorber["id"]},
+                                )
+                                absorbed_into_pending += 1
                             store.update(
                                 "learnings",
                                 "id",
-                                cand["id"],
-                                {"status": "superseded", "duplicate_of": absorber["id"]},
+                                absorber["id"],
+                                {
+                                    "evidence_count": evidence,
+                                    "project_count": len(projects),
+                                    "projects_json": json.dumps(sorted(projects)),
+                                },
                             )
-                            absorbed_into_pending += 1
-                        store.update(
-                            "learnings",
-                            "id",
-                            absorber["id"],
-                            {
-                                "evidence_count": evidence,
-                                "project_count": len(projects),
-                                "projects_json": json.dumps(sorted(projects)),
-                            },
-                        )
+
+                        def _personal(row):
+                            return str(row.get("scope") or "") == "personal"
+
+                        absorber = _best(opens)
+                        # A personal candidate never folds into a lesson that is
+                        # not personal: it would leave Review inside a rule bound
+                        # for a shared file. It joins the group's best open
+                        # personal lesson, or clusters on its own when none exists.
+                        held = [] if _personal(absorber) else [c for c in news if _personal(c)]
+                        shared = [c for c in news if c not in held]
+                        if shared:
+                            _absorb(absorber, shared)
+                        if held:
+                            personal_opens = [o for o in opens if _personal(o)]
+                            if personal_opens:
+                                _absorb(_best(personal_opens), held)
+                            else:
+                                candidate_clusters.append(held)
                     elif news:
                         candidate_clusters.append(news)
                     else:
@@ -713,17 +780,25 @@ def run_pipeline(
                 merge_sources={}
                 def _merge_call(items: list[dict]) -> dict | None:
                     prompt,template_sha=miner.render_prompt_revision(PROMPTS_DIR/'cluster_merge.md', {
-                        'rules':json.dumps([{k:it.get(k,'') for k in ('rule_text','why','category')} for it in items],ensure_ascii=False,indent=2)})
+                        'rules':json.dumps([{k:it.get(k,'') for k in ('rule_text','why','category','scope')} for it in items],ensure_ascii=False,indent=2)})
                     provenance=mining_history.context('fast',prompt,template_sha,{'run_id':run_id})
                     provenance['stage']='cluster'
                     key=tuple(sorted(it['id'] for it in items))
                     merge_sources[key]=(provenance,items)
                     try:
-                        return _llm_json(llm,'cluster',cfg.strong_model_class,prompt,provenance=provenance)
-                    except BudgetExhaustedSignal:
-                        return None
+                        return _judge_with_causes(
+                            lambda p: _llm_json(llm,'cluster',cfg.strong_model_class,p,provenance=provenance),
+                            merge_causes)(prompt)
+                    except BudgetExhaustedSignal as exc:
+                        raise cluster.MergeRefused(str(exc)) from exc
 
+                merge_causes: dict = {}
                 merged, merge_stats = cluster.merge_clusters(candidate_clusters, _merge_call)
+                if merge_causes:
+                    # merge_clusters may already have named content causes.
+                    taxonomy = merge_stats.setdefault("taxonomy", {})
+                    for cause, count in merge_causes.items():
+                        taxonomy[cause] = taxonomy.get(cause, 0) + count
                 store.commit()
                 for m in merged:
                     if m.get("absorbed_ids"):
@@ -735,6 +810,9 @@ def run_pipeline(
                                 store.update('learnings','id',absorbed,{'status':'superseded','duplicate_of':m['id']})
                             store.update('learnings','id',m['id'],{
                                 'rule_text':m['rule_text'],'why':m.get('why',''),
+                                # The stored scope routes every later run; a merge that kept a
+                                # personal member personal must persist that, not the representative's.
+                                'scope':m.get('scope',''),'title':m.get('title',''),'category':m.get('category',''),
                                 'evidence_count':m.get('evidence_count',0),'project_count':m.get('project_count',0),
                                 'projects_json':json.dumps(m.get('projects',[]))})
                             current=store.query_one('SELECT * FROM learnings WHERE id=?',(m['id'],))
@@ -742,8 +820,9 @@ def run_pipeline(
                             incidents=store.query(f'SELECT DISTINCT i.* FROM incidents i JOIN incident_learnings il ON il.incident_id=i.id WHERE il.learning_id IN ({slots}) ORDER BY i.ts,i.id',key)
                             mining_history.append(store,current,before=before,kind='cluster_merge',incidents=incidents,
                                 provenance=provenance,source_learnings=source_learnings)
+                unreadable_rules = []
                 existing_vecs = cluster.existing_rule_vectors(
-                    cfg, _target_paths(store, cfg), embedder
+                    cfg, _target_paths(store, cfg), embedder, unreadable=unreadable_rules
                 )
                 rejected_vecs = cluster.rejected_vectors(store, embedder)
                 stats["cluster"] = {
@@ -755,6 +834,8 @@ def run_pipeline(
                     "merged": len(merged),
                     **merge_stats,
                 }
+                if unreadable_rules:
+                    stats["cluster"]["unreadable_instruction_files"] = unreadable_rules
 
             # ---- 4. route + propose + gate + apply ----
             from .apply import APPLIABLE_STATUSES, apply_proposal
@@ -912,28 +993,37 @@ def run_pipeline(
             try:
                 from . import contradictions
 
+                unreadable_contra: list[dict] = []
                 cands = contradictions.find_candidates(
-                    cfg, _target_paths(store, cfg), embedder
+                    cfg, _target_paths(store, cfg), embedder, unreadable=unreadable_contra
                 )
+                judge_causes: dict = {}
                 stats["contradictions"] = contradictions.judge_pairs(
                     store,
                     cfg,
                     cands,
-                    lambda prompt: _llm_json(
+                    _judge_with_causes(_refusable(lambda prompt: _llm_json(
                         llm, "contradiction", cfg.cheap_model_class, prompt
-                    ),
+                    ), contradictions.JudgeRefused), judge_causes),
                     PROMPTS_DIR,
                     run_id,
                 )
+                if judge_causes:
+                    stats["contradictions"]["taxonomy"] = dict(judge_causes)
+                if unreadable_contra:
+                    stats["contradictions"]["unreadable_instruction_files"] = unreadable_contra
             except BudgetExhaustedSignal:
                 stats["contradictions"] = {"skipped": "budget_exhausted"}
             except Exception as exc:
                 stats["contradictions"] = {"error": f"{type(exc).__name__}: {exc}"}
 
             # ---- 4c. A/B pruning of applied rules (Part 2) ----
-            # Re-tests applied rules WITHOUT them on the current model; rules
-            # the model no longer needs become delete proposals. Proposals are
-            # returned (not persisted by ab.py) and go through the SAME
+            # Re-tests applied rules WITHOUT them on the current model. A rule
+            # the model no longer needs becomes a delete proposal only when its
+            # marker line is the whole rule (PRUNE_MARKER_LINE_KINDS). A rule
+            # in a skill, rule file or hook is refused and counted as
+            # prune_rule_outside_marker_line (PRUNE_REFUSED_KINDS). Proposals
+            # are returned (not persisted by ab.py) and go through the SAME
             # propose/apply machinery, so review-only still holds them.
             try:
                 from .evals import ab
@@ -959,33 +1049,9 @@ def run_pipeline(
                     run_id=run_id,
                 )
                 prune_proposals = ab_result.pop("proposals", [])
-                for pp in prune_proposals:
-                    learning = store.query_one(
-                        "SELECT * FROM learnings WHERE id = ?", (pp["learning_id"],)
-                    )
-                    if learning is None:
-                        continue
-                    current = (
-                        Path(pp["target_path"]).read_text()
-                        if Path(pp["target_path"]).exists()
-                        else ""
-                    )
-                    route = routing.RouteDecision(
-                        target_path=pp["target_path"],
-                        target_kind="global_claude_md",
-                        action="delete",
-                    )
-                    try:
-                        proposal = propose.build_proposal(learning, route, current, cfg)
-                    except Exception as exc:
-                        _bump_tax(f"prune_{type(exc).__name__}")
-                        continue
-                    proposal.setdefault("id", new_id())
-                    proposal["run_id"] = run_id
-                    proposal["status"] = "gated_pass"  # the A/B run IS its gate
-                    proposal["eval_result_id"] = pp.get("eval_result_id", "")
-                    _persist_proposal(store, proposal)
-                ab_result["proposals_persisted"] = len(prune_proposals)
+                ab_result["proposals_persisted"] = _persist_prune_proposals(
+                    store, cfg, run_id, prune_proposals, _bump_tax
+                )
                 stats["ab_prune"] = ab_result
             except (BudgetExhaustedSignal, BudgetExhausted):
                 # Same reason as the gate: a raw BudgetExhausted from a trial
@@ -1119,6 +1185,17 @@ def derive_run_status(stats: dict) -> tuple[str, list[str]]:
             reasons.append(
                 f"{stage}: 0 of {attempted} attempts succeeded ({failed} failed)"
             )
+    # A comparison that ran without some in-force instruction files finished,
+    # but it may miss a duplicate or a contradiction in a rule it never saw.
+    for stage, purpose in (("cluster", "duplicate detection"), ("contradictions", "contradiction checks")):
+        payload = stats.get(stage)
+        unreadable = payload.get("unreadable_instruction_files") if isinstance(payload, dict) else None
+        if unreadable:
+            named = ", ".join(f"{u['path']} ({u['cause']})" for u in unreadable)
+            reasons.append(
+                f"{stage}: {len(unreadable)} in-force instruction file(s) unreadable "
+                f"and left out of {purpose}: {named}"
+            )
     return ("degraded" if reasons else "ok"), reasons
 
 
@@ -1205,10 +1282,13 @@ class BudgetExhaustedSignal(Exception):
 
 
 def _llm_json(llm, stage: str, model_class: str, prompt: str, *, provenance=None, call_trace=None) -> dict | None:
-    """Adapter: LLMRunner.call -> parsed dict or None on parse failure.
+    """Adapter: LLMRunner.call -> parsed dict, or None for an unparseable reply.
 
     Budget exhaustion propagates as BudgetExhaustedSignal so the pipeline can
-    stop the stage and report how much work was refused.
+    stop the stage and report how much work was refused. Any other failed call
+    (spawn error, timeout, quota, empty output, model mismatch) raises
+    MineCallFailed with its outcome, like :func:`_llm_agentic_json`: only a
+    reply that did not parse is a parse failure.
     """
     from .llm import BudgetExhausted
 
@@ -1219,7 +1299,36 @@ def _llm_json(llm, stage: str, model_class: str, prompt: str, *, provenance=None
         raise BudgetExhaustedSignal(str(exc)) from exc
     from .mining_history import capture
     capture(provenance,result)
-    return result.parsed if result.ok else None
+    if result.ok:
+        return result.parsed
+    outcome = getattr(result, "outcome", "") or "other"
+    if outcome == "parse_error":
+        return None
+    raise MineCallFailed(outcome, getattr(result, "error", "") or "")
+
+
+def _refusable(llm_json, refused_type):
+    """Turn a budget refusal into ``refused_type`` so a stage that already did
+    some work can keep it instead of losing its statistics."""
+    def call(prompt):
+        try:
+            return llm_json(prompt)
+        except BudgetExhaustedSignal as exc:
+            raise refused_type(str(exc)) from exc
+    return call
+
+
+def _judge_with_causes(llm_json, causes: dict):
+    """Turn a failed call into None for a caller that counts failures, and
+    record its cause as ``call_failed:<outcome>`` in ``causes``."""
+    def judge(prompt):
+        try:
+            return llm_json(prompt)
+        except MineCallFailed as exc:
+            key = f"call_failed:{exc.outcome}"
+            causes[key] = causes.get(key, 0) + 1
+            return None
+    return judge
 
 
 def _llm_agentic_json(
@@ -1463,7 +1572,8 @@ def gate_one_proposal(
         history.stop(exc)
         proposal["status"] = "pending"
         gate_stats["failed"] += 1
-        bump_taxonomy(f"gate_{type(exc).__name__}")
+        bump_taxonomy(f"gate_call_failed:{exc.outcome}" if isinstance(exc, MineCallFailed)
+                      else f"gate_{type(exc).__name__}")
     except BaseException as exc:
         history.stop(exc)
         raise
@@ -1515,7 +1625,9 @@ def gate_existing_proposal(cfg, store, proposal_id: str, *, _llm_factory=None) -
     run_dir = cfg.state_path("runs", run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     started = utc_now_iso()
-    store.insert("runs", {"id": run_id, "started": started, "status": "running"})
+    from .run_liveness import recording_stats
+    store.insert("runs", {"id": run_id, "started": started, "status": "running",
+                          "stats_json": json.dumps(recording_stats({}))})
     store.commit()
     with store.transaction(write=True):
         source = review_snapshot(store, proposal_id, cfg)
@@ -1676,15 +1788,83 @@ def _target_paths(store: Store, cfg: Config) -> list[str]:
     read-only search tool enumerate the SAME corpus — they disagreed before,
     and the miner's dedup tool could not see instruction files at all.
     """
+    from .instruction_exclusions import included
     from .routing import instruction_target_paths
 
-    projects = [
+    recorded = [
         r["project_path"]
         for r in store.query(
             "SELECT DISTINCT project_path FROM sessions WHERE project_path != ''"
         )
     ]
+    projects = included(cfg, recorded)
+    if len(projects) != len(recorded):
+        logger.info(
+            "instruction corpus: %d of %d session working directories excluded by "
+            "instruction_excluded_dirs", len(recorded) - len(projects), len(recorded),
+        )
     return instruction_target_paths(projects, cfg)
+
+
+# A prune delete removes one si: marker line. That removes the rule only where
+# the marker bullet is the whole rule: the four Markdown instruction files.
+PRUNE_MARKER_LINE_KINDS = frozenset(
+    {"global_claude_md", "codex_global", "global_private", "project_agents_md", "project_claude_md"}
+)
+# In these kinds the rule outlives its marker line. A SKILL.md repeats the rule
+# in its description, title and Why section. A rule file exists for one rule,
+# and its paths frontmatter stays behind. A hook lives in settings.json, which
+# has no marker line. Deleting whole files is not supported, so these refuse.
+PRUNE_REFUSED_KINDS = frozenset({"skill", "rule_file", "hook"})
+
+
+def _persist_prune_proposals(
+    store: Store, cfg: Config, run_id: str, prune_proposals: list[dict], bump
+) -> int:
+    """Persist A/B prune results as delete proposals; return how many persisted."""
+    from . import propose, routing
+
+    persisted = 0
+    for pp in prune_proposals:
+        learning = store.query_one(
+            "SELECT * FROM learnings WHERE id = ?", (pp["learning_id"],)
+        )
+        if learning is None:
+            bump("prune_learning_missing")
+            continue
+        if pp["target_kind"] in PRUNE_REFUSED_KINDS:
+            bump("prune_rule_outside_marker_line")
+            continue
+        # The learning row has no delete_marker_id; the A/B result names the
+        # applied line by its si: marker, and build_proposal needs that id.
+        learning = {**learning, "delete_marker_id": pp["marker_id"]}
+        route = routing.RouteDecision(
+            target_path=pp["target_path"],
+            target_kind=pp["target_kind"],
+            action="delete",
+        )
+        try:
+            if pp["target_kind"] not in PRUNE_MARKER_LINE_KINDS:
+                raise propose.ProposalError(
+                    f"prune target kind {pp['target_kind']!r} is not a known target kind"
+                )
+            # Read inside the try: one undecodable target must not end the batch.
+            target = Path(pp["target_path"])
+            current = target.read_text(encoding="utf-8") if target.exists() else ""
+            proposal = propose.build_proposal(learning, route, current, cfg)
+        except Exception as exc:
+            bump(f"prune_{type(exc).__name__}")
+            continue
+        proposal.setdefault("id", new_id())
+        proposal["run_id"] = run_id
+        # The A/B run is its gate, but three without-rule trials and
+        # no majority vote cannot authorize deleting a delivered rule:
+        # "delete" is a mandatory-review action (execution_policy).
+        proposal["status"] = "gated_pass"
+        proposal["eval_result_id"] = pp.get("eval_result_id", "")
+        _persist_proposal(store, proposal)
+        persisted += 1
+    return persisted
 
 
 def _persist_proposal(store: Store, proposal: dict) -> None:

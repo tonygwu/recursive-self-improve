@@ -528,6 +528,26 @@ def test_report_notes_runs_it_reaped(tmp_path):
     assert "abandoned" in text.lower()
 
 
+def test_report_splits_reaped_runs_by_process_and_by_age(tmp_path):
+    """BL-55: a run that records its process is reaped once that process is
+    gone; only legacy rows are still reaped by age. The report says which."""
+    text = _run_with_stats(tmp_path, {"stale_runs_reaped": {
+        "abandoned": 3, "abandoned_process_gone": 2, "abandoned_by_age": 1, "left_running": 0,
+        "unparseable_started": 0, "changed_since_read": 0}})
+    assert ("3 marked `abandoned` (2 whose recorded process was gone, 1 legacy row(s) past the age limit)"
+            in text)
+
+
+def test_report_shows_runs_the_reaper_left_because_they_changed_after_it_judged_them(tmp_path):
+    """BL-55 review: the reaper counts a row that a resumed model job changed
+    between its read and its write. A count the report never shows is lost."""
+    text = _run_with_stats(tmp_path, {"stale_runs_reaped": {
+        "abandoned": 0, "abandoned_process_gone": 0, "abandoned_by_age": 0, "left_running": 0,
+        "unparseable_started": 0, "changed_since_read": 1}})
+    assert ("0 left alone with an unparseable `started` timestamp, 1 not reaped because the row "
+            "changed after it was judged (for example, a model job resumed it)." in text)
+
+
 def test_a_small_but_nonzero_group_never_renders_as_zero_percent(tmp_path):
     """Keep a small non-zero group visible after whole-percent rounding."""
     text = _run_with_stats(
@@ -660,6 +680,7 @@ def test_report_explains_learnings_that_produced_no_proposal(tmp_path):
     assert "3 learning(s) produced no proposal" in text
     assert "no writable target" in text
     assert "Missing or non-Git project directories" in text
+    assert "a production checkout without a repo-0 sibling of the same origin" in text
     assert "invalid learning metadata" in text
     assert "Inspect the proposal-stage error details" in text
 
@@ -1052,6 +1073,152 @@ def test_the_check_runs_through_the_real_report(tmp_path):
     generate(store, Config(), rid, out)
     text = out.read_text(encoding="utf-8")
     assert "4 incident(s) disagree" in text, "the check never reached the report"
+    store.close()
+
+
+def test_a_remote_split_by_a_failed_gh_lookup_is_reported(tmp_path, monkeypatch):
+    """BL-25 review: one clone with one URL spelling whose first gh lookup
+    fails ends up under two keys after the next run. Sessions from the
+    degraded run keep their remote: key, and _identity_split_lines compares
+    each incident only with its own session, so the split was silent."""
+    import json as _json
+
+    import self_improve.project_identity as pi
+    from self_improve.report import _identity_split_lines, generate
+    from self_improve.store import new_id, utc_now_iso
+    from tests.test_scan_observations import c_user, make_env, scan, ts, write_claude
+
+    env = make_env(tmp_path, project_identity_use_gh=True)
+    state = {"fail": True}
+
+    def fake_gh(owner_repo):
+        if state["fail"]:
+            raise RuntimeError("network unreachable (transient)")
+        return {"id": 4242, "full_name": "example/alpha"}
+
+    monkeypatch.setattr(pi, "_default_gh", fake_gh)
+    write_claude(env, [c_user("hello", ts(0), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000001")
+    scan(env, "scan-1")
+    state["fail"] = False
+    write_claude(env, [c_user("again", ts(5), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000002")
+    write_claude(env, [c_user("third", ts(9), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000003")
+    scan(env, "scan-2")
+    keys = sorted(r["project_key"] for r in env.store.query("SELECT DISTINCT project_key FROM sessions"))
+    assert keys == ["github:4242", "remote:github.com/example/alpha"], keys
+    assert _identity_split_lines(env.store) == [], "the existing check cannot see this split"
+
+    rid = new_id()
+    env.store.insert("runs", {"id": rid, "started": utc_now_iso(), "finished": utc_now_iso(),
+                              "status": "ok", "stats_json": _json.dumps({})})
+    env.store.commit()
+    out = tmp_path / "r.md"
+    generate(env.store, env.cfg, rid, out)
+    text = _body_without_appendix(out.read_text(encoding="utf-8"))
+    assert "## One remote under several project keys" in text
+    assert ("**`github.com/example/alpha` is stored under 2 project keys:** "
+            "`github:4242` (2 session(s)), `remote:github.com/example/alpha` (1 session(s)).") in text
+    assert "`selfimprove backfill-project-keys --requalify --dry-run`" in text
+    # The command the line names does repair this split, and the preview writes nothing.
+    from self_improve.backfill import backfill_project_identity
+    preview = backfill_project_identity(env.store, dry_run=True, requalify=True)
+    assert preview["sessions"]["would_requalify"] == 1, preview["sessions"]
+    assert sorted(r["project_key"] for r in env.store.query(
+        "SELECT DISTINCT project_key FROM sessions")) == keys
+
+
+def test_one_key_per_remote_gets_no_split_line(tmp_path):
+    """A cached remote whose sessions all share its key is not a split."""
+    from self_improve.report import _remote_split_lines
+    from self_improve.store import Store, utc_now_iso
+
+    store = Store(tmp_path / "s.db")
+    _split_fixture(store, method="gh_repo_id", n=2, incident_key="github:42")
+    store.update("sessions", "file_path", "gh_repo_id-0", {"project_key": "github:42"})
+    store.update("sessions", "file_path", "gh_repo_id-1", {"project_key": "github:42"})
+    store.insert("project_identity_cache", {"remote_norm": "github.com/x", "project_key": "github:42",
+                                            "display": "x", "method": "gh_repo_id",
+                                            "resolved_at": utc_now_iso()})
+    store.commit()
+    from types import SimpleNamespace
+    assert _remote_split_lines(store, SimpleNamespace(project_identity_use_gh=True)) == []
+    store.close()
+
+
+@pytest.mark.parametrize("spelling", [
+    "git@github.com:Example/Alpha.git",      # letter case differs
+    "git@github.com:example/alpha-old.git",  # the name before a rename
+], ids=["case", "renamed"])
+def test_a_split_across_two_spellings_of_one_github_remote_is_reported(tmp_path, monkeypatch, spelling):
+    """BL-25 second review: gh fails for a clone whose origin is spelled one
+    way, then works for a clone spelled another way. The sessions carry
+    github:4242 and remote:github.com/<other spelling>, which share no
+    normalized remote, so the split section printed nothing."""
+    import json as _json
+
+    import self_improve.project_identity as pi
+    from self_improve.backfill import backfill_project_identity
+    from self_improve.store import new_id, utc_now_iso
+    from tests.test_scan_observations import c_user, make_env, make_repo, scan, ts, write_claude
+
+    env = make_env(tmp_path, project_identity_use_gh=True)
+    other = make_repo(tmp_path / "work" / "alpha-2", remote=spelling)
+    state = {"fail": True}
+
+    def fake_gh(owner_repo):
+        if state["fail"]:
+            raise RuntimeError("network unreachable (transient)")
+        return {"id": 4242, "full_name": "example/alpha"}
+
+    monkeypatch.setattr(pi, "_default_gh", fake_gh)
+    write_claude(env, [c_user("hello", ts(0), other)], name="aaaaaaaa-0000-4000-8000-000000000001",
+                 slug="-work-alpha-2")
+    scan(env, "scan-1")
+    state["fail"] = False
+    write_claude(env, [c_user("again", ts(5), env.repo)], name="aaaaaaaa-0000-4000-8000-000000000002")
+    scan(env, "scan-2")
+    degraded = "remote:" + pi.normalize_remote_url(spelling)
+    keys = sorted(r["project_key"] for r in env.store.query("SELECT DISTINCT project_key FROM sessions"))
+    assert keys == ["github:4242", degraded], keys
+
+    rid = new_id()
+    env.store.insert("runs", {"id": rid, "started": utc_now_iso(), "finished": utc_now_iso(),
+                              "status": "ok", "stats_json": _json.dumps({})})
+    env.store.commit()
+    out = tmp_path / "r.md"
+    generate(env.store, env.cfg, rid, out)
+    text = _body_without_appendix(out.read_text(encoding="utf-8"))
+    assert "## One remote under several project keys" not in text, "no shared remote to group by"
+    assert "## GitHub sessions keyed without a repository ID" in text
+    assert f"- `{degraded}` (1 session(s))" in text
+    # A run with gh lookups off also leaves such a key; the line must not
+    # claim that every one is a failure.
+    assert "means the lookup failed, or did not run, when the session was scanned" in text
+    assert "`selfimprove backfill-project-keys --requalify --dry-run`" in text
+    # The named command repairs this split too, and its preview writes nothing.
+    preview = backfill_project_identity(env.store, dry_run=True, requalify=True)
+    assert preview["sessions"]["would_requalify"] == 1, preview["sessions"]
+
+
+def test_remote_keys_are_listed_only_when_gh_could_have_resolved_them(tmp_path):
+    """With gh lookups off, a remote: key is the normal identity, not a
+    failure. A remote off github.com is never looked up. Neither is listed.
+    A config without the flag raises rather than defaulting."""
+    from types import SimpleNamespace
+
+    from self_improve.report import _remote_split_lines
+    from self_improve.store import Store
+
+    store = Store(tmp_path / "s.db")
+    _split_fixture(store, method="remote_url", n=2)
+    store.update("sessions", "file_path", "remote_url-1", {"project_key": "remote:gitlab.com/x/y"})
+    store.update("sessions", "file_path", "remote_url-0", {"project_key": "remote:github.com/x/y"})
+    store.commit()
+    on = _remote_split_lines(store, SimpleNamespace(project_identity_use_gh=True))
+    assert "- `remote:github.com/x/y` (1 session(s))" in on
+    assert not any("gitlab.com" in line for line in on), on
+    assert _remote_split_lines(store, SimpleNamespace(project_identity_use_gh=False)) == []
+    with pytest.raises(ValueError, match="project_identity_use_gh"):
+        _remote_split_lines(store, SimpleNamespace())
     store.close()
 
 
@@ -1652,7 +1819,12 @@ def test_a_starved_contradiction_stage_says_so_and_names_the_pool(tmp_path):
         tmp_path, [("mine_agentic", "ok", 3)],
         stats={"contradictions": {"skipped": "budget_exhausted"}},
     )
-    assert "Contradiction detection did not run" in text, text[:1500]
+    # Review fix (BL-37): the older shape lost judge_failed, so "did not run"
+    # was a guess. With no verdict in the database the line says only what
+    # is known: a state rebuild removes verdicts, so none is not proof.
+    assert ("Contradiction detection was refused by the call budget, and this "
+            "database holds no verdict from this run.") in text, text[:1500]
+    assert "A state rebuild removes every stored verdict" in text
     assert "max_cheap_calls_per_run" in text
     assert "does not reserve calls for contradiction detection" in text
 
@@ -1661,15 +1833,17 @@ def test_a_contradiction_stage_that_ran_says_nothing(tmp_path):
     """Narrowness guard: only the starved case gets the note."""
     text = _run_with_llm_calls(
         tmp_path, [("mine_agentic", "ok", 3)],
-        stats={"contradictions": {"judged": 4, "deferred": 0}},
+        stats={"contradictions": {"judged": 4, "judge_failed": 0, "deferred": 0}},
     )
-    assert "Contradiction detection did not run" not in text
+    assert "- **Contradiction detection" not in text
+    assert "- Contradiction stage" not in text
 
 
 def test_a_run_that_never_reached_the_stage_says_nothing(tmp_path):
     """An absent stage does not establish that its budget was exhausted."""
     text = _run_with_llm_calls(tmp_path, [("mine_agentic", "ok", 3)], stats={})
-    assert "Contradiction detection did not run" not in text
+    assert "- **Contradiction detection" not in text
+    assert "- Contradiction stage" not in text
 
 
 def _global_routing_report(tmp_path, learnings):
@@ -1804,10 +1978,80 @@ def test_a_malformed_counter_does_not_crash_the_whole_report(tmp_path):
     """
     text = _run_with_llm_calls(
         tmp_path, [("mine", "ok", 2)],
-        stats={"contradictions": {"deferred": "lots", "judged": 2}},
+        stats={"contradictions": {"deferred": "lots", "judged": 2, "judge_failed": 0}},
     )
     assert "## Funnel" in text, "a bad counter destroyed the report"
     assert "unreadable" in text.lower() or "pair(s) deferred" not in text
+
+
+# The shape judge_pairs records when the shared pool refused the first judgment.
+_REFUSED_SWEEP = {"candidates": 4, "judged": 0, "contradicts": 0, "compatible": 0,
+                  "judge_failed": 0, "deferred": 4, "budget_deferred": 4,
+                  "skipped_already_judged": 0}
+
+
+def test_a_budget_refused_contradiction_sweep_names_the_mining_pool_not_the_cap(tmp_path):
+    """BL-37 review: after a budget refusal the report said the judgment cap
+    was reached "rather than that anything failed". The real cause is that
+    mining spent the shared max_cheap_calls_per_run pool."""
+    text = _run_with_stats(tmp_path, {"contradictions": dict(_REFUSED_SWEEP)})
+    assert "judged no pair: the mining pool was already spent" in text, text[:2000]
+    assert "The call budget left 4 pair(s) unjudged; 0 judged." in text
+    assert "max_cheap_calls_per_run" in text
+    assert "does not reserve calls for contradiction detection" in text
+    assert "reached its judgment cap" not in text
+    assert "contradiction_max_judgments_per_run" not in text
+
+
+def test_a_sweep_refused_after_some_judgments_says_it_stopped_early(tmp_path):
+    stats = dict(_REFUSED_SWEEP, judged=2, compatible=2, deferred=3, budget_deferred=3, candidates=5)
+    text = _run_with_stats(tmp_path, {"contradictions": stats})
+    assert "stopped early: the mining pool ran out" in text, text[:2000]
+    assert "The call budget left 3 pair(s) unjudged; 2 judged." in text
+    assert "reached its judgment cap" not in text
+
+
+def test_the_pool_history_counts_new_and_old_refusal_shapes(tmp_path):
+    """Both the BL-37 counters and the older {'skipped': ...} entry are
+    refusals by the shared pool; a completed sweep is not."""
+    from self_improve.store import new_id, utc_now_iso
+
+    store = Store(tmp_path / "s.db")
+    for entry in ({"skipped": "budget_exhausted"}, {"judged": 4, "judge_failed": 0, "deferred": 0},
+                  dict(_REFUSED_SWEEP)):
+        rid = new_id()
+        store.insert("runs", {"id": rid, "started": utc_now_iso(), "finished": utc_now_iso(),
+                              "status": "ok", "stats_json": json.dumps({"contradictions": entry})})
+    store.commit()
+    out = tmp_path / "r.md"
+    generate(store, Config(state_dir=str(tmp_path / "state")), rid, out)
+    text = _body_without_appendix(out.read_text())
+    assert ("Across every run in this database, 2 had contradiction judgments "
+            "refused by this pool, and 1 ran the stage without a refusal.") in text, text[:2000]
+
+
+@pytest.mark.parametrize("entry", [
+    {"judged": 4, "judge_failed": 0, "deferred": 0, "budget_deferred": 0},
+    {"judged": 5, "judge_failed": 0, "deferred": 12, "budget_deferred": 0},
+])
+def test_a_report_without_a_refusal_never_reads_the_pool_history(tmp_path, monkeypatch, entry):
+    """The history reads every run's stats_json; a run with no line that
+    names the pool must not pay for it."""
+    import self_improve.report as report
+
+    def unexpected(store):
+        raise AssertionError("the pool history was read for a run without a refusal")
+
+    monkeypatch.setattr(report, "_contradiction_pool_history", unexpected)
+    text = _run_with_stats(tmp_path, {"contradictions": entry})
+    assert "## Funnel" in text
+
+
+def test_refusal_counters_that_disagree_are_reported_not_explained(tmp_path):
+    stats = dict(_REFUSED_SWEEP, deferred=2, budget_deferred=5)
+    text = _run_with_stats(tmp_path, {"contradictions": stats})
+    assert "Contradiction stage counters disagree" in text, text[:2000]
+    assert "mining pool" not in text
 
 
 def test_the_global_routing_threshold_never_silently_defaults(tmp_path):
@@ -1838,17 +2082,23 @@ class _StoreWithGlobalProposals:
         return [{"pc": 1}]
 
 
-def test_the_held_section_matches_review_for_ungated_and_manual_actions(tmp_path):
+def test_the_held_section_matches_review_for_ungated_and_manual_actions(tmp_path, monkeypatch):
     """Render every waiting proposal and exclude an eligible automatic delivery."""
+    from self_improve import apply
     from self_improve.dashboard.queries import waiting_proposal_ids
     from self_improve.execution_policy import set_class_policy
     from self_improve.store import Store
+    from tests.test_apply import OLD, NEW, make_diff
 
-    store = Store(tmp_path / "s.db")
     cfg = Config(state_dir=str(tmp_path / "state"))
+    store = Store(cfg.state_path("state.db"))
     now = "2026-01-02T00:00:00Z"
+    # The pipeline stores the run's final status and commits before it calls
+    # report.generate, so the run has ended when the report reads Review. The
+    # eligible proposal stays out of the held section only because the run
+    # recorded an automatic operation that the worker still owns.
     store.insert("runs", {"id": "run", "started": now, "finished": now,
-                          "status": "ok", "stats_json": "{}"})
+                          "status": "degraded", "stats_json": "{}"})
     store.insert("learnings", {
         "id": "learning", "rule_text": "An invented review rule.",
         "why": "An invented reason.", "category": "testing", "scope": "global",
@@ -1863,12 +2113,26 @@ def test_the_held_section_matches_review_for_ungated_and_manual_actions(tmp_path
         ("ungated", "ungated", "add"),
         ("automatic", "gated_pass", "add"),
     )
+    automatic = tmp_path / "automatic.md"
+    automatic.write_text(OLD)
     for pid, status, action in proposals:
         store.insert("proposals", {
             "id": pid, "learning_id": "learning", "run_id": "run",
-            "target_path": f"/invented/{pid}.md", "target_kind": "global_claude_md",
+            "target_path": str(automatic) if pid == "automatic" else f"/invented/{pid}.md",
+            "target_kind": "global_claude_md", "diff_unified": make_diff(OLD, NEW),
             "action": action, "status": status, "created_at": now})
     store.commit()
+
+    # A human edit between preparation and publication blocks the write, as
+    # the run's apply stage would meet it; the worker now owns the operation.
+    def human_edit(point, *_):
+        if point == "prepared":
+            automatic.write_text("A human edit after preparation.\n")
+    monkeypatch.setattr(apply, "_operation_checkpoint", human_edit)
+    with pytest.raises(apply.DeliveryBlocked):
+        apply.apply_proposal(store, cfg, store.query_one("SELECT * FROM proposals WHERE id='automatic'"))
+    blocked = store.query_one("SELECT state FROM instruction_operations WHERE proposal_id='automatic'")
+    assert blocked["state"] == "blocked"
     out = tmp_path / "r.md"
     try:
         assert set(waiting_proposal_ids(store, cfg)) == {"pending", "manual-hook", "ungated"}
@@ -1882,5 +2146,5 @@ def test_the_held_section_matches_review_for_ungated_and_manual_actions(tmp_path
         "- [pending] `/invented/pending.md` (add): An invented review rule.",
         "- [ungated] `/invented/ungated.md` (add): An invented review rule.",
     ]
-    assert "/invented/automatic.md" not in section
+    assert str(automatic) not in section
     assert "**3 proposal(s) await your decision** (1 not yet gated)." in section

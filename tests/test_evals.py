@@ -9,6 +9,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -226,6 +232,132 @@ class TestRunTrials:
             work_dir=tmp_path / "w", grader_timeout_seconds=0.2,
         )
         assert stats.errors == {"grader_error": 1}
+
+    def test_a_check_that_leaves_a_background_child_passes_and_the_child_dies(self, tmp_path):
+        """Review of BL-08: subprocess.run waited for the background child's
+        hold on stdout, so a check that exited 0 became a grader_error at the
+        timeout, and the child lived on and wrote its marker. The check is the
+        reviewer's, with the child's pid recorded."""
+        pidfile, marker = tmp_path / "child.pid", tmp_path / "M"
+        data = code_spec_dict()
+        data["grader"] = {"type": "code", "check": (
+            f"(sleep 4; touch {marker}) & echo $! > {pidfile}; echo graded-ok; exit 0")}
+        spec = harness.spec_from_dict(data, origin="test")
+        child = None
+        try:
+            started = time.monotonic()
+            stats = run_trials(spec, None, always_good_runner, 1,
+                               work_dir=tmp_path / "w", grader_timeout_seconds=2.0)
+            elapsed = time.monotonic() - started
+            child = int(pidfile.read_text())
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    child = None
+                    break
+                assert time.monotonic() < deadline, f"check child {child} outlived the grade"
+                time.sleep(0.05)
+        finally:
+            if child is not None:
+                os.kill(child, signal.SIGKILL)
+        # The wait above outlasts the child's own 4 s. Without the group kill
+        # it ends because the child finished, and the child wrote its marker.
+        assert not marker.exists(), "the check's child ran on and wrote its marker"
+        assert (stats.succeeded, stats.errors) == (1, {})
+        result = json.loads((tmp_path / "w" / "trial-00" / "result.json").read_text())
+        assert result["outcome"] == "pass"
+        assert result["grader"] == {"returncode": 0, "stdout": "graded-ok\n", "stderr": "",
+                                    "held_streams": []}
+        assert elapsed < 4, f"grading took {elapsed:.2f} s"
+
+    @pytest.mark.parametrize("shell", [
+        "sh",
+        pytest.param("dash", marks=pytest.mark.skipif(
+            not os.path.exists("/bin/dash"), reason="/bin/dash is not installed")),
+    ])
+    def test_a_check_that_signals_its_own_group_is_still_graded(self, tmp_path, shell):
+        """Review of the grader fix: `trap 'kill 0' EXIT` in a check signalled
+        the provider guard too, and a correct trial became grader_error.
+        The check ignores SIGTERM after it starts its background child: dash
+        (/bin/sh on Ubuntu) dies of its own `kill 0` otherwise, which is a
+        true graded fail. The dash case runs dash on a Mac too."""
+        check = "trap 'kill 0' EXIT; sleep 30 & trap '' TERM; echo graded-ok; exit 0"
+        if shell == "dash":
+            check = f"exec /bin/dash -c {shlex.quote(check)}"
+        data = code_spec_dict()
+        data["grader"] = {"type": "code", "check": check}
+        spec = harness.spec_from_dict(data, origin="test")
+        stats = run_trials(spec, None, always_good_runner, 1,
+                           work_dir=tmp_path / "w", grader_timeout_seconds=10.0)
+        result = json.loads((tmp_path / "w" / "trial-00" / "result.json").read_text())
+        assert (stats.succeeded, stats.errors, result["error"]) == (1, {}, "")
+        assert result["grader"]["returncode"] == 0
+
+    @pytest.mark.parametrize("check", [
+        r"printf 'a\r\nb\rc'; exit 0",   # newlines translated as text=True did
+        r"printf '\377'; exit 0",        # not decodable: still a grader crash
+    ], ids=["newlines", "undecodable"])
+    def test_check_output_decodes_as_subprocess_text_mode_did(self, tmp_path, check):
+        """The grader now reads bytes from the provider runner and decodes
+        them itself. Compare it with subprocess.run(text=True) on the same
+        check, in this environment, for the stored outcome and output."""
+        try:
+            old = subprocess.run(["/bin/sh", "-c", check], capture_output=True, text=True)
+            expected = ("pass", {"returncode": 0, "stdout": old.stdout, "stderr": old.stderr,
+                                 "held_streams": []})
+        except UnicodeDecodeError:
+            expected = ("grader_error", {})
+        data = code_spec_dict()
+        data["grader"] = {"type": "code", "check": check}
+        spec = harness.spec_from_dict(data, origin="test")
+        run_trials(spec, None, always_good_runner, 1, work_dir=tmp_path / "w",
+                   grader_timeout_seconds=10.0)
+        result = json.loads((tmp_path / "w" / "trial-00" / "result.json").read_text())
+        assert (result["outcome"], result["grader"]) == expected
+        if expected[0] == "grader_error":
+            assert result["error"].startswith("UnicodeDecodeError:")
+
+    def test_a_check_whose_escaped_child_holds_the_pipes_records_them(self, tmp_path):
+        """A child that calls setsid escapes the group kill. The grade still
+        ends, and result.json names the pipes that child still held."""
+        pidfile, script = tmp_path / "escaped.pid", tmp_path / "escape.py"
+        # The child records its pid only after setsid, and the parent waits
+        # for that, so the group kill can never reach the child first.
+        script.write_text("import os, time\n"
+                          "if os.fork() == 0:\n"
+                          "    os.setsid()\n"
+                          f"    open({str(pidfile)!r} + '.tmp', 'w').write(str(os.getpid()))\n"
+                          f"    os.rename({str(pidfile)!r} + '.tmp', {str(pidfile)!r})\n"
+                          "    time.sleep(30); os._exit(0)\n"
+                          f"while not os.path.exists({str(pidfile)!r}):\n    time.sleep(0.01)\n")
+        data = code_spec_dict()
+        data["grader"] = {"type": "code",
+                          "check": f"{sys.executable} {script}; echo graded-ok; exit 0"}
+        spec = harness.spec_from_dict(data, origin="test")
+        try:
+            stats = run_trials(spec, None, always_good_runner, 1, work_dir=tmp_path / "w",
+                               grader_timeout_seconds=2.0)
+        finally:
+            if pidfile.exists():
+                escaped = int(pidfile.read_text())
+                try:
+                    os.kill(escaped, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 3
+                while True:
+                    try:
+                        os.kill(escaped, 0)
+                    except ProcessLookupError:
+                        break
+                    assert time.monotonic() < deadline, f"could not clean up {escaped}"
+                    time.sleep(0.05)
+        result = json.loads((tmp_path / "w" / "trial-00" / "result.json").read_text())
+        assert (stats.succeeded, result["outcome"]) == (1, "pass")
+        assert result["grader"]["stdout"] == "graded-ok\n"
+        assert result["grader"]["held_streams"] == ["stdout", "stderr"]
 
     def test_model_grader_receives_rubric_and_summary(self, tmp_path):
         calls: list[tuple[str, str]] = []
@@ -690,6 +822,7 @@ class TestRerunApplied:
         applied_at: str,
         target: str = "/targets/CLAUDE.md",
         with_proposal: bool = True,
+        target_kind: str = "global_claude_md",
     ) -> None:
         store.insert(
             "learnings",
@@ -703,7 +836,7 @@ class TestRerunApplied:
                     "id": f"prop-{lid}",
                     "learning_id": lid,
                     "target_path": target,
-                    "target_kind": "global_claude_md",
+                    "target_kind": target_kind,
                     "action": "add",
                     "status": "applied",
                     "applied_at": applied_at,
@@ -765,6 +898,7 @@ class TestRerunApplied:
                 {
                     "learning_id": "learn-ab-1",
                     "target_path": "/targets/CLAUDE.md",
+                    "target_kind": "global_claude_md",
                     "action": "delete",
                     "marker_id": "learn-ab-1",
                     "eval_result_id": row["id"],
@@ -772,6 +906,446 @@ class TestRerunApplied:
             ]
             # rerun_applied never writes proposals rows itself
             assert store.query("SELECT * FROM proposals WHERE action = 'delete'") == []
+        finally:
+            store.close()
+
+    def test_pipeline_persists_the_prunable_rule_as_a_reviewed_delete(self, tmp_path):
+        """Review of BL-11: a prune result names the rule by marker_id, but the
+        pipeline built the delete from the bare learning row, which carries no
+        delete_marker_id. Every prunable rule raised ProposalError and was
+        counted as persisted anyway."""
+        from self_improve import propose
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target = tmp_path / "AGENTS.md"
+        target.write_text(f"# Rules\n\n- keep tests green <!-- si:{lid} -->\n- unrelated rule\n")
+        store = self._store(tmp_path)
+        try:
+            # Not the global kind: a hardcoded global_claude_md must not pass.
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z", target=str(target),
+                               target_kind="project_agents_md")
+            self._write_spec(tmp_path / "regr", lid)
+            result = ab.rerun_applied(
+                store, Config(), always_good_runner, tmp_path / "regr",
+                work_dir=tmp_path / "w",
+            )
+            taxonomy: dict[str, int] = {}
+
+            def bump(key: str) -> None:
+                taxonomy[key] = taxonomy.get(key, 0) + 1
+
+            persisted = _persist_prune_proposals(
+                store, Config(), "run-1", result["proposals"], bump
+            )
+            assert taxonomy == {}
+            assert persisted == 1
+            row = store.query_one("SELECT * FROM proposals WHERE action = 'delete'")
+            assert row["learning_id"] == lid
+            assert row["target_kind"] == "project_agents_md"
+            assert row["target_path"] == str(target)
+            assert row["status"] == "gated_pass"
+            assert row["run_id"] == "run-1"
+            assert row["eval_result_id"] == result["proposals"][0]["eval_result_id"]
+            after = propose.apply_unified_diff(target.read_text(), row["diff_unified"])
+            assert after == "# Rules\n\n- unrelated rule\n"
+        finally:
+            store.close()
+
+    def test_a_rule_with_an_open_delete_proposal_is_not_retested(self, tmp_path):
+        """Second review of BL-11: a persisted delete proposal leaves the
+        learning applied, so every later night re-tested the rule, spent its
+        gate calls and filed another delete proposal for the same line."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(f"# Rules\n\n- keep tests green <!-- si:{lid} -->\n")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z", target=str(target))
+            self._write_spec(tmp_path / "regr", lid)
+            nights = []
+            for night in ("run-1", "run-2"):
+                result = ab.rerun_applied(store, Config(), always_good_runner,
+                                          tmp_path / "regr", work_dir=tmp_path / night)
+                _persist_prune_proposals(store, Config(), night, result["proposals"], lambda k: None)
+                store.commit()
+                nights.append(result)
+            assert nights[0]["prunable"] == 1
+            assert (nights[1]["attempted"], nights[1]["skipped_open_delete"]) == (0, 1)
+            assert nights[1]["proposals"] == []
+            rows = store.query("SELECT run_id FROM proposals WHERE action = 'delete'")
+            assert [r["run_id"] for r in rows] == ["run-1"]
+            assert len(store.query("SELECT id FROM eval_results WHERE kind = 'ab'")) == 1
+        finally:
+            store.close()
+
+    def test_the_zero_attempt_reason_names_every_skip_it_counts(self, tmp_path):
+        """Third review of BL-11: with one rule skipped for an open delete
+        proposal and another without a spec, the reason said that no
+        candidate had a spec, while skipped_no_spec was 1."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        target = tmp_path / "CLAUDE.md"
+        target.write_text("# Rules\n\n- one <!-- si:learn-a -->\n- two <!-- si:learn-b -->\n")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, "learn-a", "2026-08-01T00:00:00.000000Z", target=str(target))
+            self._seed_applied(store, "learn-b", "2026-08-02T00:00:00.000000Z", target=str(target))
+            self._write_spec(tmp_path / "regr", "learn-a")
+            for night in ("run-1", "run-2"):
+                result = ab.rerun_applied(store, Config(), always_good_runner,
+                                          tmp_path / "regr", work_dir=tmp_path / night)
+                _persist_prune_proposals(store, Config(), night, result["proposals"], lambda k: None)
+                store.commit()
+            assert (result["attempted"], result["skipped_open_delete"], result["skipped_no_spec"]) == (0, 1, 1)
+            assert "none had a regression spec" not in result["reason"], result["reason"]
+            assert "1 already have an open delete proposal" in result["reason"], result["reason"]
+            assert "1 had no regression spec" in result["reason"], result["reason"]
+        finally:
+            store.close()
+
+    @staticmethod
+    def _seed_delete(store: Store, lid: str, status: str, applied_at: str) -> None:
+        store.insert("proposals", {
+            "id": f"del-{lid}", "learning_id": lid, "target_path": "/targets/CLAUDE.md",
+            "target_kind": "global_claude_md", "action": "delete", "status": status,
+            "applied_at": applied_at, "created_at": applied_at or "2026-08-09T00:00:00.000000Z"})
+        store.commit()
+
+    def test_a_delivered_delete_is_not_retested_every_night(self, tmp_path):
+        """Fourth review of BL-11: nothing sets a learning to pruned, so after
+        its delete was delivered the learning stayed applied and the delete
+        became its latest applied proposal. Every night re-ran the
+        without-rule arm against a rule no longer in the file."""
+        from self_improve import propose
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(f"# Rules\n\n- keep tests green <!-- si:{lid} -->\n- other\n")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z", target=str(target))
+            self._write_spec(tmp_path / "regr", lid)
+            first = ab.rerun_applied(store, Config(), always_good_runner,
+                                     tmp_path / "regr", work_dir=tmp_path / "run-1")
+            assert _persist_prune_proposals(store, Config(), "run-1", first["proposals"],
+                                            lambda k: None) == 1
+            # Deliver the delete the way an approved write leaves it.
+            delete = store.query_one("SELECT * FROM proposals WHERE action = 'delete'")
+            target.write_text(propose.apply_unified_diff(target.read_text(), delete["diff_unified"]))
+            store.update("proposals", "id", delete["id"],
+                         {"status": "applied", "applied_at": "2026-08-03T00:00:00.000000Z"})
+            store.commit()
+            bumps: list[str] = []
+            for night in ("run-2", "run-3"):
+                result = ab.rerun_applied(store, Config(), always_good_runner,
+                                          tmp_path / "regr", work_dir=tmp_path / night)
+                _persist_prune_proposals(store, Config(), night, result["proposals"], bumps.append)
+                store.commit()
+                assert (result["attempted"], result["skipped_delivered_delete"]) == (0, 1), result
+                assert result["proposals"] == []
+                assert result["reason"].startswith("delivered_delete:"), result["reason"]
+                assert "1 already had their delete delivered" in result["reason"], result["reason"]
+            assert bumps == []
+            assert len(store.query("SELECT id FROM eval_results WHERE kind = 'ab'")) == 1
+            assert store.query_one("SELECT status FROM learnings WHERE id = ?", (lid,))["status"] == "applied"
+        finally:
+            store.close()
+
+    def test_delete_skips_never_consume_or_dodge_the_per_run_cap(self, tmp_path):
+        """Fourth review of BL-11: no test held the claim that a skipped rule
+        is skipped before the cap. With cap 1, skips placed before and after
+        the one attempt must keep their own counts and leave the slot free."""
+        cfg = dataclasses.replace(Config(), ab_prune_max_rules_per_run=1)
+        store = self._store(tmp_path)
+        try:
+            # Oldest first: open, delivered, ATTEMPTED, deferred, open, delivered.
+            plan = [("learn-a", "open"), ("learn-b", "delivered"), ("learn-c", "run"),
+                    ("learn-d", "run"), ("learn-e", "open"), ("learn-f", "delivered")]
+            for day, (lid, kind) in enumerate(plan, start=1):
+                self._seed_applied(store, lid, f"2026-08-{day:02d}T00:00:00.000000Z")
+                self._write_spec(tmp_path / "regr", lid)
+                if kind == "open":
+                    self._seed_delete(store, lid, "gated_pass", "")
+                elif kind == "delivered":
+                    self._seed_delete(store, lid, "applied", f"2026-08-{day:02d}T12:00:00.000000Z")
+            assert len(plan) > cfg.ab_prune_max_rules_per_run
+            result = ab.rerun_applied(store, cfg, always_good_runner, tmp_path / "regr",
+                                      work_dir=tmp_path / "w")
+            counts = {k: result[k] for k in ("attempted", "prunable", "deferred", "skipped_no_spec",
+                                             "skipped_open_delete", "skipped_delivered_delete")}
+            assert counts == {"attempted": 1, "prunable": 1, "deferred": 1, "skipped_no_spec": 0,
+                              "skipped_open_delete": 2, "skipped_delivered_delete": 2}, counts
+            assert [p["learning_id"] for p in result["proposals"]] == ["learn-c"]
+        finally:
+            store.close()
+
+    def test_a_prune_result_without_a_learning_row_is_counted(self, tmp_path):
+        """A vanished learning is a named outcome, not a silent skip."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        store = self._store(tmp_path)
+        try:
+            taxonomy: dict[str, int] = {}
+            persisted = _persist_prune_proposals(
+                store, Config(), "run-1",
+                [{"learning_id": "gone", "target_path": str(tmp_path / "CLAUDE.md"),
+                  "target_kind": "global_claude_md", "action": "delete",
+                  "marker_id": "gone", "eval_result_id": "e1"}],
+                lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+            )
+            assert persisted == 0
+            assert taxonomy == {"prune_learning_missing": 1}
+            assert store.query("SELECT * FROM proposals") == []
+        finally:
+            store.close()
+
+    @staticmethod
+    def _whole_file_target(tmp_path: Path, kind: str, lid: str) -> tuple[Path, str]:
+        """A delivered target whose rule does not live only in its marker line."""
+        from self_improve import propose
+
+        learning = {"id": lid, "title": "Grader reads answer", "rule_text": RULE_MARKER,
+                    "why": "the grader reads answer.txt", "path_globs": ["src/**"]}
+        if kind == "skill":
+            return tmp_path / "skills" / "grader" / "SKILL.md", propose.render_skill_md(learning)
+        if kind == "rule_file":
+            return tmp_path / ".claude" / "rules" / "grader.md", propose.render_rule_file(learning)
+        assert kind == "hook", kind
+        # A hook lives in settings.json, which has no si: marker line at all.
+        return tmp_path / "settings.json", json.dumps(
+            {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "check-answer"}]}]}}, indent=2) + "\n"
+
+    @pytest.mark.parametrize("kind", ["skill", "rule_file", "hook"])
+    def test_a_prune_whose_rule_outlives_its_marker_line_is_refused_by_name(self, tmp_path, kind):
+        """Fourth review of BL-11: for a skill the delete removed only the
+        marker bullet. Approved, it left SKILL.md installed with the rule in
+        its description. A rule file keeps its paths frontmatter, and a hook
+        has no marker line to remove."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target, content = self._whole_file_target(tmp_path, kind, lid)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z",
+                               target=str(target), target_kind=kind)
+            self._write_spec(tmp_path / "regr", lid)
+            result = ab.rerun_applied(store, Config(), always_good_runner,
+                                      tmp_path / "regr", work_dir=tmp_path / "w")
+            assert result["prunable"] == 1, result
+            taxonomy: dict[str, int] = {}
+            persisted = _persist_prune_proposals(
+                store, Config(), "run-1", result["proposals"],
+                lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+            )
+            assert (persisted, taxonomy) == (0, {"prune_rule_outside_marker_line": 1})
+            assert store.query("SELECT id FROM proposals WHERE action != 'add'") == []
+            assert target.read_text(encoding="utf-8") == content
+        finally:
+            store.close()
+
+    def test_refused_prune_copy_names_what_did_not_change(self, tmp_path):
+        """Review fix (BL-11): both prune refusals said "nothing was written",
+        but by then the A/B rerun had written its eval result and history and
+        spent gate calls. The copy must name only what did not change."""
+        from self_improve.failure_presentation import FAILURE_COPY, NOT_FAILURE_TAXONOMY
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target, content = self._whole_file_target(tmp_path, "skill", lid)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z",
+                               target=str(target), target_kind="skill")
+            self._write_spec(tmp_path / "regr", lid)
+            result = ab.rerun_applied(store, Config(), always_good_runner,
+                                      tmp_path / "regr", work_dir=tmp_path / "w")
+            taxonomy: dict[str, int] = {}
+            _persist_prune_proposals(
+                store, Config(), "run-1", result["proposals"],
+                lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+            )
+            assert taxonomy == {"prune_rule_outside_marker_line": 1}
+            written = store.query("SELECT id FROM eval_results WHERE subject_id=? AND kind='ab'", (lid,))
+            assert len(written) == 1, written
+        finally:
+            store.close()
+        for copy in (NOT_FAILURE_TAXONOMY["prune_rule_outside_marker_line"],
+                     FAILURE_COPY["prune_learning_missing"]["explanation"]):
+            assert "nothing was written" not in copy, copy
+            assert "o delete proposal was created and no instruction file changed" in copy, copy
+
+    def test_the_prune_target_kinds_cover_the_whole_vocabulary(self):
+        """A new target kind must be classified before a prune can reach it."""
+        from self_improve import pipeline
+        from self_improve.execution_policy import TARGET_CLASS
+
+        allowed, refused = pipeline.PRUNE_MARKER_LINE_KINDS, pipeline.PRUNE_REFUSED_KINDS
+        assert not allowed & refused
+        assert allowed | refused == set(TARGET_CLASS)
+        assert {"skill", "rule_file", "hook"} <= refused
+
+    def test_the_refused_prune_is_work_not_performed(self):
+        from self_improve.failure_presentation import NOT_FAILURE_TAXONOMY, taxonomy_rows
+
+        assert "prune_rule_outside_marker_line" in NOT_FAILURE_TAXONOMY
+        [row] = taxonomy_rows({"prune_rule_outside_marker_line": 2}, owner="apply.taxonomy")
+        assert (row["kind"], row["name"], row["count"]) == ("not_failure", "Work not performed", 2)
+
+    def test_a_prune_with_an_unknown_target_kind_fails_by_name(self, tmp_path):
+        """Fail loud: a kind outside the vocabulary is not a supported delete."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        lid = "learn-ab-1"
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(f"# Rules\n\n- keep tests green <!-- si:{lid} -->\n", encoding="utf-8")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z", target=str(target),
+                               target_kind="future_unsupported_kind")
+            taxonomy: dict[str, int] = {}
+            persisted = _persist_prune_proposals(
+                store, Config(), "run-1",
+                [{"learning_id": lid, "target_path": str(target),
+                  "target_kind": "future_unsupported_kind", "action": "delete",
+                  "marker_id": lid, "eval_result_id": "e1"}],
+                lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+            )
+            assert (persisted, taxonomy) == (0, {"prune_ProposalError": 1})
+            assert store.query("SELECT id FROM proposals WHERE action = 'delete'") == []
+        finally:
+            store.close()
+
+    def test_an_undecodable_prune_target_is_counted_and_the_batch_continues(self, tmp_path):
+        """Fourth review of BL-11: read_text ran outside the try, so one
+        non-UTF-8 target raised out of the batch and the pipeline replaced
+        every ab_prune count with one error string."""
+        from self_improve.pipeline import _persist_prune_proposals
+
+        bad, good = tmp_path / "bad" / "CLAUDE.md", tmp_path / "good" / "CLAUDE.md"
+        bad.parent.mkdir()
+        good.parent.mkdir()
+        bad.write_bytes(b"# Rules\n\n- \xff\xfe broken <!-- si:learn-a -->\n")
+        good.write_text("# Rules\n\n- fine <!-- si:learn-b -->\n", encoding="utf-8")
+        store = self._store(tmp_path)
+        try:
+            self._seed_applied(store, "learn-a", "2026-08-01T00:00:00.000000Z", target=str(bad))
+            self._seed_applied(store, "learn-b", "2026-08-02T00:00:00.000000Z", target=str(good))
+            taxonomy: dict[str, int] = {}
+            persisted = _persist_prune_proposals(
+                store, Config(), "run-1",
+                [{"learning_id": lid, "target_path": str(path), "target_kind": "global_claude_md",
+                  "action": "delete", "marker_id": lid, "eval_result_id": "e-" + lid}
+                 for lid, path in (("learn-a", bad), ("learn-b", good))],
+                lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+            )
+            assert (persisted, taxonomy) == (1, {"prune_UnicodeDecodeError": 1})
+            rows = store.query("SELECT learning_id FROM proposals WHERE action = 'delete'")
+            assert [r["learning_id"] for r in rows] == ["learn-b"]
+        finally:
+            store.close()
+
+    def test_the_gates_scenario_spec_is_found_through_the_applied_proposal(self, tmp_path):
+        """BL-11: the gate names specs <lid>-s<N>.yaml, but the A/B lookup only
+        tried <lid>.yaml, so every applied rule was skipped as no_spec."""
+        store = self._store(tmp_path)
+        try:
+            lid = "learn-ab-1"
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z",
+                               target="/targets/AGENTS.md")
+            store.update("proposals", "id", f"prop-{lid}",
+                         {"eval_result_id": "gate-result", "target_kind": "project_agents_md"})
+            store.insert("eval_results", {"id": "gate-result", "kind": "regression",
+                                          "subject_id": f"{lid}-s1", "verdict": "gated_pass"})
+            store.commit()
+            self._write_spec(tmp_path / "regr", f"{lid}-s1")
+            result = ab.rerun_applied(
+                store, Config(), always_good_runner, tmp_path / "regr",
+                work_dir=tmp_path / "w",
+            )
+            assert (result["attempted"], result["skipped_no_spec"]) == (1, 0), result
+            assert result["proposals"][0]["target_kind"] == "project_agents_md"
+        finally:
+            store.close()
+
+    def test_the_spec_the_majority_gate_generated_is_rerun_through_its_link(self, tmp_path, monkeypatch):
+        """Review of BL-11: the test above writes `<lid>-s1.yaml` and the gate
+        link by hand, so renaming the generator's files still passed. A later
+        review found that this test re-created the pipeline's spec wiring, so
+        changing `out_dir=regression_specs_dir(cfg)` in pipeline.py left it
+        green. Here pipeline.gate_one_proposal, the gate call site that the
+        pipeline and `gate-proposal` share, runs over a real LLMRunner whose
+        provider hop (`_execute`) is scripted. The proposal then takes the
+        majority's deciding eval_result_id, as the pipeline stores it, and
+        rerun_applied reads regression_specs_dir(cfg). Scenario 0 reproduces
+        nothing (ungated), so the deciding spec is s1, and the A/B arm must
+        run s1's own prompt."""
+        from self_improve import pipeline
+        from self_improve.llm import LLMRunner, _ExecResult
+
+        cfg = Config(state_dir=str(tmp_path / "state"), eval_sandbox_enabled=False)
+        store = self._store(tmp_path)
+        try:
+            lid, run_id = "learn-chain-1", "run-chain-1"
+            self._seed_applied(store, lid, "2026-08-01T00:00:00.000000Z")
+            store.insert("runs", {"id": run_id, "started": "2026-08-02T00:00:00.000000Z"})
+            store.commit()
+            generated: list[int] = []
+            gate_agent = rule_sensitive_runner()
+
+            def execute(self, call_id, stage, model_class, prompt, expect_json, **kwargs):
+                served = {"outcome": "ok", "provider": "codex", "model_reported": "gpt-5.6-terra",
+                          "provider_attempts": 1}
+                if stage == "eval_gen":
+                    value = {**{k: v for k, v in code_spec_dict().items() if k != "id"},
+                             "scenario_prompt": f"Complete the task (variant {len(generated)})."}
+                    generated.append(len(generated))
+                    return _ExecResult(ok=True, text=json.dumps(value), parsed=value, **served)
+                assert stage == "grade", stage
+                # Variant 0 has no mistake to catch, so its scenario is ungated.
+                agent = always_good_runner if "(variant 0)" in prompt else gate_agent
+                return _ExecResult(ok=True, text=agent(prompt, Path(kwargs["sandbox_dir"])),
+                                   parsed=None, **served)
+
+            monkeypatch.setattr(LLMRunner, "_execute", execute)
+            llm = LLMRunner(cfg, store, run_id, tmp_path / "raw")
+            learning = store.query_one("SELECT * FROM learnings WHERE id = ?", (lid,))
+            proposal = store.query_one("SELECT * FROM proposals WHERE id = ?", (f"prop-{lid}",))
+            gate_stats, taxonomy = pipeline.new_gate_stats(), {}
+            pipeline.gate_one_proposal(
+                store, cfg, llm, learning, proposal, run_dir=tmp_path / "run",
+                sandbox_state={"ok": None, "error": "", "observed": {}}, gate_stats=gate_stats,
+                bump_taxonomy=lambda key: taxonomy.__setitem__(key, taxonomy.get(key, 0) + 1),
+                run_id=run_id)
+            assert taxonomy == {} and generated == list(range(cfg.eval_scenarios)), (taxonomy, generated)
+            [split] = gate_stats["scenario_splits"]
+            assert (proposal["status"], split["tally"]["ungated"], split["tally"]["gated_pass"]) == (
+                "gated_pass", 1, 2), (proposal, split)
+            # Spec names are left to the rerun below: that is the link under test.
+            # The pipeline stores the majority's deciding result on the proposal.
+            store.update("proposals", "id", f"prop-{lid}", {"eval_result_id": proposal["eval_result_id"]})
+            store.commit()
+
+            seen = []
+
+            def ab_runner(prompt, sandbox):
+                seen.append(prompt)
+                return always_good_runner(prompt, sandbox)
+
+            result = ab.rerun_applied(store, cfg, ab_runner, pipeline.regression_specs_dir(cfg),
+                                      work_dir=tmp_path / "ab")
+            assert (result["attempted"], result["skipped_no_spec"]) == (1, 0), result
+            assert result["prunable"] == 1, result
+            assert seen and all("(variant 1)" in p for p in seen), seen
         finally:
             store.close()
 
@@ -1163,6 +1737,33 @@ class TestMajorityVerdictDecisionTable:
         )
         assert got == expected
 
+    @pytest.mark.parametrize(
+        "n_pass,n_fail,n_ungated,n_error,expected",
+        [
+            # BL-02: with five scenarios, two passes are not a majority
+            (2, 0, 3, 0, "inconclusive"),
+            (2, 0, 0, 3, "inconclusive"),
+            (3, 0, 2, 0, "gated_pass"),
+            (3, 0, 0, 2, "gated_pass"),
+            # a single scenario can never pass on its own
+            (1, 0, 0, 0, "inconclusive"),
+        ],
+    )
+    def test_a_pass_needs_a_majority_of_every_scenario_that_ran(
+        self, n_pass, n_fail, n_ungated, n_error, expected
+    ):
+        from self_improve.evals.regression import majority_verdict
+
+        got = majority_verdict(
+            {
+                "gated_pass": n_pass,
+                "gated_fail": n_fail,
+                "ungated": n_ungated,
+                "error": n_error,
+            }
+        )
+        assert got == expected
+
     def test_a_mixed_result_is_never_auto_appliable(self):
         """Mixed pass/fail evidence must remain inconclusive and require review.
 
@@ -1258,6 +1859,29 @@ class TestMajorityGateRunsEveryScenario:
         assert got["scenario_tally"] == {
             "gated_pass": 2, "gated_fail": 0, "ungated": 1, "error": 0
         }
+
+    def test_the_linked_evidence_is_a_scenario_that_supports_the_verdict(self):
+        """BL-21: the deciding scenario skipped only `ungated`, so an `error`
+        scenario, which tested nothing, became the proposal's evidence link."""
+        from self_improve.evals.regression import gate_majority
+
+        got = gate_majority(
+            lambda i: self._spec(f"s{i}"),
+            self._gate(["error", "gated_pass", "gated_pass"]),
+            scenarios=3,
+        )
+        assert got["verdict"] == "gated_pass"
+        assert got["eval_result_id"] == "e1", got["eval_result_id"]
+
+    def test_a_failing_verdict_links_a_failing_scenario(self):
+        from self_improve.evals.regression import gate_majority
+
+        got = gate_majority(
+            lambda i: self._spec(f"s{i}"),
+            self._gate(["gated_pass", "gated_fail", "gated_fail"]),
+            scenarios=3,
+        )
+        assert got["verdict"] == "gated_fail" and got["eval_result_id"] == "e1"
 
     def test_a_single_flake_does_not_condemn_a_rule(self):
         """FAIL_VOTES is 2, so one bad scenario holds rather than condemns."""
@@ -1492,7 +2116,22 @@ class TestAskingTheOperatorIsNotAGradedFailure:
         assert with_arm_verdict(
             {"succeeded": 0, "attempted": 3, "errors": {"asked_operator": 3}},
             min_passes=2,
-        ) == "ungated"
+        ) == "error"
+
+    def test_an_untested_with_arm_does_not_vote_like_an_unreproduced_mistake(self):
+        """BL-22: a with-rule arm where every trial broke returned "ungated",
+        the word for "the mistake did not reproduce", although the without
+        arm had reproduced it. Infrastructure failure in either arm is a
+        non-voting "error"."""
+        from self_improve.evals.regression import majority_verdict, with_arm_verdict
+
+        crashed = with_arm_verdict(
+            {"succeeded": 0, "attempted": 3, "errors": {"agent_error": 3}}, min_passes=2)
+        assert crashed == "error"
+        # Three such scenarios hold the rule as inconclusive. They must not
+        # read as "ungated", which says the mistake never reproduced.
+        tally = {k: (3 if k == crashed else 0) for k in ("gated_pass", "gated_fail", "ungated", "error")}
+        assert majority_verdict(tally) == "inconclusive"
 
     def test_a_genuinely_failing_rule_still_gates_fail(self):
         from self_improve.evals.regression import with_arm_verdict
@@ -1552,7 +2191,7 @@ class TestInfraErrorsInTheWithArmAreNotEvidence:
         assert with_arm_verdict(
             {"succeeded": 1, "attempted": 3, "errors": {"agent_error": 2}},
             min_passes=2,
-        ) == "ungated"
+        ) == "error"
 
     def test_infra_and_asking_failures_combine(self):
         """Both are 'the rule was never tested', so they count together."""
@@ -1562,7 +2201,7 @@ class TestInfraErrorsInTheWithArmAreNotEvidence:
             {"succeeded": 0, "attempted": 3, "errors": {"agent_error": 1, "asked_operator": 1,
                                                         "graded_fail": 1}},
             min_passes=2,
-        ) == "ungated"
+        ) == "error"
 
     def test_a_real_failure_majority_still_gates_fail(self):
         from self_improve.evals.regression import with_arm_verdict
@@ -1578,7 +2217,7 @@ class TestInfraErrorsInTheWithArmAreNotEvidence:
         assert with_arm_verdict(
             {"succeeded": 0, "attempted": 3, "errors": {"grader_error": 3}},
             min_passes=2,
-        ) == "ungated"
+        ) == "error"
 
 
 class TestABudgetFailureIsNeverAVerdict:

@@ -112,6 +112,8 @@ def existing_rule_vectors(
     cfg: Config,
     paths: list[str],
     embedder: "Embedder",
+    *,
+    unreadable: list[dict] | None = None,
 ) -> list[tuple[str, list[float]]]:
     """(unit_text, vector) for every rule unit across the given target files.
 
@@ -120,8 +122,14 @@ def existing_rule_vectors(
     owner_kind ``'rule_unit'`` and owner_key sha1 of ``"<path>\\n<unit text>"``
     (expanded absolute path; \\n separator disambiguates path/unit boundary).
 
-    A listed file that does not exist is skipped; a file that exists but
-    cannot be read raises (fail loud).
+    A listed file that does not exist is skipped. A file that exists but
+    cannot be read raises (fail loud), unless the caller passes an
+    ``unreadable`` list: each such file is then appended as
+    ``{path, cause, detail}`` and left out, so the caller can report exactly
+    what the comparison lacked. The pipeline does this because the corpus
+    includes the instruction file of every session directory, and one folder
+    the scheduler may not read (macOS privacy-protected cloud storage, for
+    example) must not stop every later run.
     """
     # Deduplicate unit text across files and working copies, as search.py and
     # contradictions.py do, so repeated copies add no comparison weight.
@@ -135,7 +143,13 @@ def existing_rule_vectors(
         path = Path(p).expanduser()
         if not path.exists():
             continue
-        content = path.read_text(encoding="utf-8", errors="strict")
+        try:
+            content = path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as exc:
+            if unreadable is None:
+                raise
+            unreadable.append({"path": str(path), "cause": type(exc).__name__, "detail": str(exc)})
+            continue
         for unit in split_rule_units(content):
             if len(normalize_tokens(unit)) < 3:
                 continue
@@ -195,6 +209,15 @@ def is_duplicate(
     return (best_score >= threshold, best_text)
 
 
+class MergeRefused(Exception):
+    """The merge call was refused before it ran, for example by the call budget."""
+
+
+# The scopes the merge prompt allows (prompts/cluster_merge.md); a test keeps
+# this list and the prompt in agreement.
+MERGE_SCOPES = ("global", "personal", "project", "skill", "hook", "codex_global")
+
+
 def merge_clusters(
     clusters: list[list[dict]],
     llm_merge: Callable[[list[dict]], dict | None],
@@ -213,9 +236,11 @@ def merge_clusters(
       Merging distinct lessons destroys evidence, so declining is a valid
       outcome, not an error.
     - Anything else — None, a missing/unknown ``decision``, empty required
-      fields — is a failed merge (``merge_failed``): the cluster's items pass
+      fields, a ``scope_guess`` outside :data:`MERGE_SCOPES` — is a failed merge (``merge_failed``): the cluster's items pass
       through UNMERGED. Dropping them would silently lose evidence, and
       guessing a merge is forbidden.
+    - ``llm_merge`` raising :class:`MergeRefused` (the call budget refused it)
+      is counted ``merge_refused``; the items pass through unmerged.
 
     Returns (canonical_learnings, stats). Each canonical learning reuses the
     representative's id (highest evidence_count, ties -> earliest first_seen)
@@ -228,6 +253,7 @@ def merge_clusters(
         "merge_succeeded": 0,
         "merge_declined": 0,
         "merge_failed": 0,
+        "merge_refused": 0,
     }
     out: list[dict] = []
     for cluster in clusters:
@@ -236,7 +262,14 @@ def merge_clusters(
             out.append({**cluster[0], "absorbed_ids": []})
             continue
         stats["merge_attempted"] += 1
-        merged = llm_merge(cluster)
+        try:
+            merged = llm_merge(cluster)
+        except MergeRefused:
+            # A budget refusal tested nothing: count it as refused, never as a
+            # failed merge, and keep the items unmerged.
+            stats["merge_refused"] += 1
+            out.extend({**l, "absorbed_ids": []} for l in cluster)
+            continue
         decision = merged.get("decision") if isinstance(merged, dict) else None
         if (
             decision == "keep_separate"
@@ -244,6 +277,16 @@ def merge_clusters(
             and merged["reason"].strip()
         ):
             stats["merge_declined"] += 1
+            out.extend({**l, "absorbed_ids": []} for l in cluster)
+            continue
+        # A scope outside the merge prompt's set would become the merged
+        # learning's stored scope and fail routing on every later run. An absent
+        # scope_guess is a deliberate exception: it keeps the representative's
+        # scope, as merges always have.
+        if decision == "merge" and "scope_guess" in merged and merged["scope_guess"] not in MERGE_SCOPES:
+            stats["merge_failed"] += 1
+            taxonomy = stats.setdefault("taxonomy", {})
+            taxonomy["merge_invalid_scope"] = taxonomy.get("merge_invalid_scope", 0) + 1
             out.extend({**l, "absorbed_ids": []} for l in cluster)
             continue
         if (
@@ -273,7 +316,7 @@ def merge_clusters(
                 "why": merged["why"].strip(),
                 "title": str(merged.get("title") or rep.get("title") or ""),
                 "category": str(merged.get("category") or rep.get("category") or ""),
-                "scope": str(merged.get("scope_guess") or rep.get("scope") or ""),
+                "scope": _merged_scope(cluster, merged, rep),
                 "evidence_count": evidence,
                 "project_count": len(projects),
                 "projects": sorted(projects),
@@ -281,6 +324,17 @@ def merge_clusters(
             }
         )
     return out, stats
+
+
+def _merged_scope(cluster: list[dict], merged: dict, rep: dict) -> str:
+    """The merged learning's scope; a personal member keeps the merge personal.
+
+    The merge model may widen a scope, but widening a personal rule would route
+    it to the shared global file, so that one decision is not the model's.
+    """
+    if any(str(l.get("scope") or l.get("scope_guess") or "") == "personal" for l in cluster):
+        return "personal"
+    return str(merged.get("scope_guess") or rep.get("scope") or "")
 
 
 def _projects_of(learning: dict) -> list[str]:

@@ -174,6 +174,15 @@ def main(argv: list[str] | None = None) -> int:
         help="list open (unresolved) contradictions between instruction-file rules",
     )
 
+    p_scope = sub.add_parser(
+        "eval-scope",
+        help="score the miner's scope guidance (global/personal/project/skill) on a "
+        "labeled case file; makes one cheap model call per case per repeat",
+    )
+    p_scope.add_argument("--dataset", required=True, help="case file, e.g. evals/scope/boundary.yaml")
+    p_scope.add_argument("--out", required=True, help="new directory for the disposable eval Store and report")
+    p_scope.add_argument("--repeat", type=int, default=1)
+
     p_re = sub.add_parser(
         "eval-retrieval",
         help="score the dedup retrieval layer (semantic / keyword-proxy / oracle "
@@ -217,9 +226,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_rbd = sub.add_parser(
         "rebuild-state",
-        help="wipe derived state so a re-scan can rebuild it, preserving the "
-        "incidents whose transcripts are already deleted (they cannot be "
-        "regenerated). Requires --export; --dry-run reports without writing.",
+        help="wipe derived state so a re-scan can rebuild it. Keeps every session "
+        "a re-scan cannot regenerate: its transcript is missing, unreadable, "
+        "shorter than scanned or changed under a retained line hash, or it holds "
+        "an incident no scan produced. Requires --export; --dry-run reports "
+        "without writing.",
     )
     p_rbd.add_argument(
         "--export",
@@ -256,11 +267,16 @@ def main(argv: list[str] | None = None) -> int:
     p_service.add_argument('service', choices=['delivery', 'models'])
     p_service.add_argument('action', choices=['install', 'uninstall', 'status'])
 
+    from .evals.filter_cli import add_parser as add_filter_parser
+    add_filter_parser(sub)
     args = parser.parse_args(argv)
     # Resolve dataset selection and export targets BEFORE reading configuration
     # or opening any Store. A missing private benchmark is never a demo result.
     if args.command == "eval-retrieval":
         return _retrieval_command(args)
+    if args.command == "eval-filter":
+        from .evals.filter_cli import command as filter_command
+        return filter_command(args)
     if args.command == "self-eval":
         from pathlib import Path
         from .data_boundary import DataBoundaryError, load_dataset
@@ -297,6 +313,18 @@ def main(argv: list[str] | None = None) -> int:
         except (ServiceError, OSError, ValueError) as exc:
             print(f'Service setup failed: {exc}', file=sys.stderr)
             return 2
+        return 0
+
+    if args.command == 'eval-scope':
+        from pathlib import Path
+        from .evals.scope_boundary import ScopeEvalError, run_with_models
+        try:
+            report = run_with_models(cfg, Path(args.dataset).expanduser(), Path(args.out).expanduser(),
+                                     repeat=args.repeat)
+        except (ScopeEvalError, OSError) as exc:
+            print(f'Scope eval failed: {exc}', file=sys.stderr)
+            return 2
+        print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
 
     if args.command == 'upgrade-state':
@@ -657,10 +685,11 @@ def _dispatch(args, cfg, store) -> int:
             if completed:
                 print("No open contradictions.")
             else:
+                # Not "no contradiction has ever been computed": a run that
+                # raised or was refused can still have stored verdicts.
                 print(
-                    "No contradiction has ever been computed — the stage has "
-                    "not completed in any recorded run, so this is NOT "
-                    "'checked and found none'."
+                    "Contradiction detection has not completed in any recorded "
+                    "run, so this is NOT 'checked and found none'."
                 )
                 print(f"  what the runs recorded instead: {why}")
             return 0

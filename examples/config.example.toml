@@ -1,0 +1,17 @@
+# Example ~/.self-improve/config.toml. Copy it, then replace /home/you.
+# Every key is optional; unknown keys are refused. Field defaults and meanings
+# are in src/self_improve/config.py. Do not commit your real copy.
+
+# Load paths: what Claude Code and Codex read. Observation, the in-force rule
+# corpus and hook settings use these.
+# global_claude_md = "/home/you/.claude/CLAUDE.md"
+# codex_global_agents_md = "/home/you/.codex/AGENTS.md"
+# skills_dir = "/home/you/.claude/skills"
+
+# Delivery paths: where approved edits are written. See docs/TARGETS.md.
+# Without this table every delivery path is the load path above.
+[targets]
+global_public = "/home/you/self-improve/skills/context/global/AGENTS.md"
+codex_global = "/home/you/self-improve/skills/context/global/AGENTS.md"
+global_private = "/home/you/.claude/rules/personal.md"
+skills_dir = "/home/you/self-improve/skills/skills"

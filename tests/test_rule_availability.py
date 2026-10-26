@@ -15,7 +15,9 @@ from tests.test_apply import store, insert_proposal, init_git_repo, make_diff, r
 
 @pytest.fixture
 def cfg(tmp_path):
-    return Config(state_dir=str(tmp_path/'state'), claude_managed_dir=str(tmp_path/'managed'), global_claude_md=str(tmp_path/'home/CLAUDE.md'),
+    # pytest's tmp_path lies under /var/folders, which the default denylist
+    # names; selected mining refuses denylisted incidents (test_mine_denylist.py).
+    return Config(state_dir=str(tmp_path/'state'), denylist_substrings=(), claude_managed_dir=str(tmp_path/'managed'), global_claude_md=str(tmp_path/'home/CLAUDE.md'),
                   codex_global_agents_md=str(tmp_path/'codex/AGENTS.md'), skills_dir=str(tmp_path/'home/skills'),
                   claude_projects_dir=str(tmp_path/'transcripts/claude'), codex_sessions_dir=str(tmp_path/'transcripts/codex'),
                   codex_archived_dir=str(tmp_path/'transcripts/archived'))
@@ -394,3 +396,60 @@ def test_live_observation_clock_is_sampled_after_file_reads(cfg,store,tmp_path,m
     check=availability.inspect_working_copy(cfg,project_key=key,working_copy_path=str(repo),
         revisions=revisions.retained_revisions(store),observed_at=None)[0]
     assert check['observed_at']=='2030-01-03T00:00:00.000000Z'
+
+
+def test_a_settings_write_during_one_copy_refuses_only_that_copy(cfg, store, tmp_path, monkeypatch):
+    """BL-31: a settings change while one copy was inspected raised out of
+    collect_availability and discarded every copy's inventory."""
+    import os as _os
+    from self_improve import instruction_surfaces as surfaces
+
+    one = init_git_repo(tmp_path/'one', 'AGENTS.md', '# One\n'); known_copy(store, one)
+    two = init_git_repo(tmp_path/'two', 'AGENTS.md', '# Two\n'); known_copy(store, two)
+    local = two/'.claude/settings.local.json'; local.parent.mkdir(); local.write_text('{"permissions": {}}')
+    original = surfaces.inspect_plugins
+
+    def racing(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if _os.path.exists(local):
+            local.write_text('{"permissions": {"allow": ["Bash(ls)"]}}')
+        return result
+
+    monkeypatch.setattr(surfaces, 'inspect_plugins', racing)
+    availability.collect_availability(store, cfg, observed_at='2030-01-01T00:00:00Z')
+    rows = store.query('SELECT working_copy_id, status, record_json FROM instruction_inventories')
+    assert len({r['working_copy_id'] for r in rows}) == 2, rows
+    changed = [r for r in rows if 'source_changed_during_observation' in r['record_json']]
+    assert len(changed) == 1 and changed[0]['status'] != 'recorded', [r['status'] for r in rows]
+
+
+def test_a_large_global_codex_file_does_not_spend_the_project_budget(cfg, store, tmp_path):
+    """BL-32: the collector started the Codex budget with the global AGENTS.md
+    and charged separators, so a 31 KB global file turned a delivered project
+    rule from available to unknown. Codex loads the global file separately and
+    applies project_doc_max_bytes to project files only."""
+    from tests.test_apply import run_git
+    repo = init_git_repo(tmp_path/'project', 'AGENTS.md', '# Human instructions\n' + 'filler line\n' * 300)
+    known_copy(store, repo); delivery(store, cfg, repo)
+    run_git(['merge', '--ff-only', cfg.project_branch_name], repo)
+    assert observe(store, cfg, 1)['outcomes'] == {'available': 1}
+    global_file = Path(cfg.codex_global_agents_md); global_file.parent.mkdir(parents=True, exist_ok=True)
+    global_file.write_text('- Global guidance line.\n' * 1300)
+    assert observe(store, cfg, 2)['outcomes'] == {'available': 1}
+    issues = rows(store)[-1]['inspection']['issues']
+    assert not [i for i in issues if i['cause'] == 'codex_instruction_coverage_limit'], issues
+
+
+def test_a_rule_added_inside_an_existing_skill_is_a_bullet_not_the_whole_file(cfg,store,tmp_path):
+    repo=init_git_repo(tmp_path/'project','AGENTS.md','# Human instructions\n');known_copy(store,repo)
+    skill=Path(cfg.skills_dir)/'existing/SKILL.md';skill.parent.mkdir(parents=True)
+    human='---\nname: existing\ndescription: x\n---\n# Existing\n\nHuman paragraph.\n'
+    skill.write_text(human)
+    p=insert_proposal(store,target=skill,diff='',target_kind='skill')
+    text=human+'\n- **Fixture rule** for the skill. <!-- si:'+p['learning_id']+' -->\n'
+    store.update('proposals','id',p['id'],{'diff_unified':make_diff(human,text)});store.commit()
+    apply.apply_proposal(store,cfg,store.query_one('SELECT * FROM proposals WHERE id=?',(p['id'],)))
+    assert observe(store,cfg,1)['outcomes']=={'available':1}
+    assert revisions.retained_revisions(store)[0]['content'].startswith('- **Fixture rule**')
+    skill.write_text(text.replace('Human paragraph.','Edited human paragraph.'))
+    assert observe(store,cfg,2)['outcomes']=={'available':1}

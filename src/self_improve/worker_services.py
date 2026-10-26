@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 
 from . import launchd
 from .config import load_config
@@ -16,6 +17,8 @@ from .store import Store
 
 SERVICES = {'delivery': ('com.self-improve.worker', 'run-worker.sh', 'worker'),
             'models': ('com.self-improve.jobs', 'run-jobs.sh', 'jobs')}
+REMOVAL_TIMEOUT_SECONDS = 10.0
+REMOVAL_POLL_SECONDS = 0.1
 
 
 class ServiceError(ValueError):
@@ -117,6 +120,16 @@ def manage(cfg, service, action, *, config_path=None, run_cmd=None, agent_plist_
             raise failed('Registration cannot be determined; service files retained')
         return probe.returncode == 0
 
+    def wait_for_removal():
+        # bootout can return while a process is still stopping. Never bootstrap
+        # another worker or discard its service file until absence is observed.
+        deadline = time.monotonic() + REMOVAL_TIMEOUT_SECONDS
+        while registration():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failed('Timed out waiting for service removal; current plist retained')
+            time.sleep(min(REMOVAL_POLL_SECONDS, remaining))
+
     if action == 'status':
         # No state or config read is needed to report registration.
         probe = command([launchd._LAUNCHCTL, 'print', target])
@@ -138,8 +151,7 @@ def manage(cfg, service, action, *, config_path=None, run_cmd=None, agent_plist_
                 raise failed('Registered service has no managed plist; ownership cannot be verified')
             if command([launchd._LAUNCHCTL, 'bootout', target]).returncode:
                 raise failed('launchctl bootout failed; plist retained')
-            if registration():
-                raise failed('Service still registered after bootout; plist retained')
+            wait_for_removal()
         if old is not None:
             dst.unlink()
             steps.append(f'removed {dst}')
@@ -188,8 +200,8 @@ def manage(cfg, service, action, *, config_path=None, run_cmd=None, agent_plist_
     cfg.state_path('logs').mkdir(parents=True, exist_ok=True, mode=0o700)
     if registered and command([launchd._LAUNCHCTL, 'bootout', target]).returncode:
         raise failed('launchctl bootout failed; prior plist retained')
-    if registered and registration():
-        raise failed('Service still registered after bootout; prior plist retained')
+    if registered:
+        wait_for_removal()
     attempted_bootstrap = False
     try:
         _write_plist(dst, rendered)
@@ -205,6 +217,7 @@ def manage(cfg, service, action, *, config_path=None, run_cmd=None, agent_plist_
             if attempted_bootstrap and registration():
                 if command([launchd._LAUNCHCTL, 'bootout', target]).returncode:
                     raise failed('Replacement cleanup failed; current plist retained for inspection')
+                wait_for_removal()
             if old is None:
                 dst.unlink(missing_ok=True)
             else:
@@ -217,6 +230,17 @@ def manage(cfg, service, action, *, config_path=None, run_cmd=None, agent_plist_
                     raise failed('Prior registration restoration failed; prior plist retained')
                 steps.append('prior registration restored')
         except (ServiceError, OSError) as restore_exc:
+            # Keep the currently registered definition untouched when cleanup
+            # is uncertain, but do not lose the old definition with this process.
+            if old is not None:
+                try:
+                    fd, backup = tempfile.mkstemp(prefix='.self-improve-prior-',
+                        suffix='.plist.backup', dir=dst.parent)
+                    with os.fdopen(fd, 'wb') as handle:
+                        handle.write(old)
+                    steps.append(f'prior plist saved for recovery: {backup}')
+                except OSError as backup_exc:
+                    steps.append(f'Could not preserve prior plist backup: {backup_exc}')
             raise failed(f'Installation failed; restoration incomplete: {restore_exc}') from exc
         raise failed('Installation failed; prior state restored') from exc
     steps.append(f'{label}: registration verified; config={config}; database={expected["database"]}. Worker health requires runtime evidence.')

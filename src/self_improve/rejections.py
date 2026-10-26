@@ -44,10 +44,20 @@ def target_identity(store, destination):
     return {'mode': 'project', 'project_key': key, 'remote': remote, 'path': destination['relative_path']}
 
 
+def _same_remote(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    # GitHub owner and repository names are case-insensitive; other hosts are
+    # compared exactly because their rules are not known here.
+    if a.startswith('github.com/') and b.startswith('github.com/'):
+        return a.casefold() == b.casefold()
+    return a == b
+
+
 def same_target(a, b):
     if a['mode'] != b['mode'] or a['path'] != b['path']:
         return False
-    return a['mode'] == 'file' or a['project_key'] == b['project_key'] or bool(a['remote'] and a['remote'] == b['remote'])
+    return a['mode'] == 'file' or a['project_key'] == b['project_key'] or _same_remote(a['remote'], b['remote'])
 
 
 def validate_identity(identity):

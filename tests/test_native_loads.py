@@ -266,3 +266,21 @@ def test_receiver_reuses_retained_repository_identity_without_network(env,monkey
     monkeypatch.setattr(api.project_identity,'_default_gh',forbidden)
     got=api.record_native_event(env.store,env.cfg,event(env))
     assert got['project_key']=='github:123' and got['identity_method']=='gh_repo_id'
+
+
+@pytest.mark.parametrize('kind, change, provider, message', [
+    ('InstructionsLoaded', {}, 'gemini', 'Unsupported native provider'),
+    ('InstructionsLoaded', {'session_id': 'has space'}, 'claude', 'Invalid native identity: session_id'),
+    ('InstructionsLoaded', {'agent_id': 'a/b'}, 'claude', 'Invalid native identity: agent_id'),
+    ('SessionStart', {'source': 'reboot'}, 'claude', 'Invalid native session source'),
+    ('PostCompact', {'trigger': 'scheduled'}, 'claude', 'Invalid native compaction trigger'),
+    ('CwdChanged', {'old_cwd': '/a'}, 'claude', 'Native cwd change requires both paths'),
+    ('SessionStart', {'source': 'startup', 'session_id': None}, 'codex', 'Missing Codex lifecycle identity'),
+])
+def test_each_invalid_native_event_is_refused_by_name_without_mutation(env, kind, change, provider, message):
+    """These hook-intake refusals had no test. The receiver accepts metadata
+    from a hook process, so each malformed event must be named and dropped."""
+    payload = {k: v for k, v in (event(env, kind=kind) | change).items() if v is not None}
+    with pytest.raises(native().NativeLoadError, match=message):
+        native().record_native_event(env.store, env.cfg, payload, provider=provider)
+    assert env.store.query_one('SELECT COUNT(*) n FROM native_load_reports')['n'] == 0

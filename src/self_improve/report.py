@@ -264,12 +264,83 @@ def _identity_split_lines(store) -> list[str]:
     ]
 
 
+def _remote_split_lines(store, cfg) -> list[str]:
+    """One repository stored under two or more session project keys.
+
+    A failed ``gh`` lookup keys a session ``remote:<normalized remote>``. A
+    later run that reaches ``gh`` keys new sessions ``github:<id>`` and caches
+    that remote in ``project_identity_cache``. Stored keys are never rewritten
+    automatically (BL-25), and :func:`_identity_split_lines` compares each
+    incident only with its own session, so this split is otherwise silent.
+    The remote of a ``remote:`` key is its suffix; the remote of any other key
+    comes from the cache. Every split remote is listed; nothing is capped.
+
+    Two clones can spell one GitHub repository differently: letter case, or
+    an old name from before a rename. Only ``gh`` knows those spellings name
+    one repository, so no grouping here can match them. With
+    ``project_identity_use_gh`` on, a ``remote:`` key for a GitHub
+    ``owner/name`` means its lookup failed, or did not run because lookups
+    were off when it was scanned. So every such key is listed too, whether or
+    not it shares a remote with another key.
+    """
+    from collections import defaultdict
+
+    from .project_identity import _github_owner_repo
+
+    use_gh = bool(_cfg_attr_or_raise(cfg, "project_identity_use_gh"))
+    sessions = {r["project_key"]: int(r["n"]) for r in store.query(
+        "SELECT project_key, COUNT(*) AS n FROM sessions WHERE project_key <> '' "
+        "GROUP BY project_key")}
+    keys_by_remote: dict[str, set[str]] = defaultdict(set)
+    for r in store.query("SELECT remote_norm, project_key FROM project_identity_cache"):
+        if r["project_key"] in sessions:
+            keys_by_remote[r["remote_norm"]].add(r["project_key"])
+    for key in sessions:
+        if key.startswith("remote:"):
+            keys_by_remote[key[len("remote:"):]].add(key)
+    splits = [(remote, sorted(keys)) for remote, keys in sorted(keys_by_remote.items())
+              if len(keys) >= 2]
+    unresolved = sorted(key for key in sessions if key.startswith("remote:")
+                        and _github_owner_repo(key[len("remote:"):])) if use_gh else []
+    if not splits and not unresolved:
+        return []
+    out: list[str] = []
+    if splits:
+        out.extend(["", "## One remote under several project keys", ""])
+        for remote, keys in splits:
+            parts = ", ".join(f"`{k}` ({sessions[k]:,} session(s))" for k in keys)
+            out.append(f"- **`{remote}` is stored under {len(keys)} project keys:** {parts}.")
+        out.append(
+            "  - A failed `gh` lookup keys sessions by remote URL, and a later run that "
+            "reaches `gh` keys new sessions by repository ID. Stored keys are not "
+            "rewritten automatically, so project counts can treat one repository as "
+            "several projects.")
+    if unresolved:
+        out.extend(["", "## GitHub sessions keyed without a repository ID", ""])
+        for key in unresolved:
+            out.append(f"- `{key}` ({sessions[key]:,} session(s))")
+        out.append(
+            "  - `gh` lookups are on now, so each of these keys means the lookup failed, "
+            "or did not run, when the session was scanned. Another clone can spell the same repository "
+            "differently (letter case, or its name before a rename) and carry its "
+            "`github:<id>` key. Only `gh` can match those spellings, so grouping keys "
+            "by remote cannot show that split.")
+    out.append(
+        "  - `selfimprove backfill-project-keys --requalify --dry-run` reports how "
+        "many rows would move to a stronger key and writes nothing. The same "
+        "command without `--dry-run` re-keys them, and only ever moves a key up "
+        "the resolution order. Both need a working `gh`: with `--no-gh` the "
+        "repository ID cannot be resolved, so nothing moves.")
+    return out
+
+
 def _routing_loss_lines(stats: dict) -> list[str]:
     """Explain learnings that were mined but could not be written anywhere.
 
-    ``propose_RoutingError`` means target construction failed. Missing directories
-    and invalid learning metadata are possible causes; the counter alone cannot
-    establish which one occurred.
+    ``propose_RoutingError`` means target construction failed. Missing directories,
+    an unverifiable production-checkout redirect, a configured instruction
+    exclusion and invalid learning metadata are
+    possible causes; the counter alone cannot establish which one occurred.
     """
     apply_stats = stats.get("apply") or {}
     taxonomy = apply_stats.get("taxonomy") or {}
@@ -279,9 +350,11 @@ def _routing_loss_lines(stats: dict) -> list[str]:
     return [
         "",
         f"- **{n} learning(s) produced no proposal: routing found no writable "
-        "target.** Missing or non-Git project directories and invalid learning "
-        "metadata can prevent target construction. Inspect the proposal-stage "
-        "error details before choosing a repair.",
+        "target.** Missing or non-Git project directories, a production "
+        "checkout without a repo-0 sibling of the same origin, a project "
+        "inside instruction_excluded_dirs, and invalid learning metadata "
+        "can prevent target construction. Inspect the "
+        "proposal-stage error details before choosing a repair.",
     ]
 
 
@@ -464,21 +537,6 @@ def _hollow_eval_lines(store) -> list[str]:
     ]
 
 
-def _counter(block: dict, key: str) -> int | None:
-    """One integer counter out of a stats block, or None if it is unreadable.
-
-    Returns None rather than raising: the caller says so in its own line and
-    the rest of the report still renders. Absent is 0 — a stage that never
-    incremented a counter genuinely has none.
-    """
-    raw = block.get(key)
-    if raw is None:
-        return 0
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    return int(raw)
-
-
 def _cfg_attr_or_raise(cfg, name: str):
     """A config value, or a raise. Never a default.
 
@@ -492,74 +550,196 @@ def _cfg_attr_or_raise(cfg, name: str):
     return getattr(cfg, name)
 
 
-def _contradiction_starved_lines(stats: dict, store=None) -> list[str]:
-    """The contradiction sweep refused for budget, and how often that happens.
-
-    It bills to ``max_cheap_calls_per_run`` — the pool ``mine_agentic`` draws
-    down first — and not to the gate's separate pool. So mining spends the
-    budget and the sweep is refused, which reaches ``stats_json`` as
-    ``{"skipped": "budget_exhausted"}`` and stopped there. In the taxonomy
-    table the stage renders ``attempted 0``, which is also what "nothing to
-    do" looks like.
+def _contradiction_pool_history(store) -> str:
+    """How often the shared pool refused this stage, counted over every run.
 
     The corpus figure is COUNTED here rather than typed, because a number in
     a document ages the moment another run lands. Its scope is stated: it is
     every run in the database, not this one.
+
+    Counters are read through ``contradictions.sweep_counters``, the check
+    ``ever_completed`` uses. A run whose record this count cannot read is
+    named, so "every run" does not hide a row it skipped.
     """
-    con = (stats or {}).get("contradictions")
+    from .contradictions import SweepCounterError, sweep_counters
+
+    if store is None:
+        return ""
+    starved = ran = 0
+    unreadable: list[str] = []
+    for row in store.query(
+        "SELECT id, stats_json FROM runs WHERE stats_json <> '' ORDER BY started, id"
+    ):
+        try:
+            d = json.loads(row["stats_json"])
+        except (json.JSONDecodeError, TypeError):
+            unreadable.append(row["id"])
+            continue
+        if not isinstance(d, dict):
+            unreadable.append(row["id"])
+            continue
+        c = d.get("contradictions")
+        if c is None:
+            continue
+        if not isinstance(c, dict):
+            unreadable.append(row["id"])
+            continue
+        if c.get("skipped") == "budget_exhausted":
+            starved += 1
+            continue
+        if "skipped" in c or "error" in c:
+            continue
+        try:
+            refused = sweep_counters(c)["budget_deferred"]
+        except SweepCounterError:
+            unreadable.append(row["id"])
+            continue
+        if refused:
+            starved += 1
+        else:
+            ran += 1
+    if not starved:
+        return ""
+    text = (
+        f" Across every run in this database, {starved} had contradiction "
+        f"judgments refused by this pool, and {ran} ran the stage without a "
+        "refusal."
+    )
+    if unreadable:
+        named = ", ".join(f"`{r}`" for r in unreadable)
+        text += (
+            f" {len(unreadable)} more had a record this count could not read, "
+            f"so it may miss refusals there: {named}."
+        )
+    return text
+
+
+def _contradiction_starved_lines(stats: dict, store, *, run_id: str) -> list[str]:
+    """The contradiction sweep refused for budget, and how often that happens.
+
+    It bills to ``max_cheap_calls_per_run``, the pool ``mine_agentic`` draws
+    down first, and not to the gate's separate pool. So mining can spend the
+    budget and the sweep is refused. Since BL-37 the stage keeps its counters
+    and records the refused pairs as ``budget_deferred``, a part of
+    ``deferred``. The rest of ``deferred`` hit the judgment cap
+    ``contradiction_max_judgments_per_run``. Each cause gets its own line, so
+    a budget refusal is never explained as the judgment cap. A failed judgment
+    call counts toward that cap, so the cap line names failed calls and then
+    does not say that nothing failed.
+
+    Older runs recorded a refusal as ``{"skipped": "budget_exhausted"}``,
+    which replaced the counters even when verdicts were already stored. For
+    that shape the line counts the verdicts from ``run_id`` that this
+    database holds, with ``contradictions.stored_verdicts``, the count
+    ``ever_completed`` uses. A state rebuild removes every verdict, so with
+    none the line does not say that the run stored none.
+
+    Counters are read through ``contradictions.sweep_counters``, the check
+    ``ever_completed`` and the pool history use. A record it cannot read gets
+    a line that names the problem and infers nothing, and the rest of the
+    report still renders.
+    """
+    from .contradictions import SweepCounterError, stored_verdicts, sweep_counters
+
+    con = stats.get("contradictions")
+    if con is None:
+        return []
     if not isinstance(con, dict):
-        return []
-    # Report work deferred by the judgment cap. Validate the stored counter
-    # without letting one unreadable value suppress unrelated report sections.
-    deferred = _counter(con, "deferred")
-    if deferred is None:
         return [
-            "- Contradiction stage counters are unreadable: `deferred` is "
-            f"{con.get('deferred')!r}, not a number. Nothing is inferred from "
-            "them here.",
+            f"- The contradiction stage recorded {con!r}, not an object. "
+            "Nothing is inferred from it here.",
             "",
         ]
-    if deferred:
-        judged = _counter(con, "judged") or 0
+
+    def pool() -> str:
+        # Called only for a line that names the pool: the history reads
+        # every run's stats_json.
+        return (
+            "It bills to `max_cheap_calls_per_run`, the pool `mine_agentic` "
+            "draws down first, rather than to the gate's separate "
+            f"`max_gate_calls_per_run`.{_contradiction_pool_history(store)} "
+            "Increasing the shared cap does not reserve calls for contradiction "
+            "detection; mining can consume them too."
+        )
+
+    if con.get("skipped") == "budget_exhausted":
+        # The older shape replaced the counters, even after verdicts were
+        # stored, so this run's stored rows are the only count left.
+        stored = stored_verdicts(store, run_id)
+        older = ("This run recorded the refusal in the older shape, without "
+                 "counters, so")
+        if stored:
+            head = "stopped early: the mining pool ran out"
+            body = (f"It judged at least {stored} pair(s) before the refusal, and "
+                    f"their verdicts are stored. {older} the number of pairs left "
+                    "unjudged is unknown.")
+        else:
+            # No row does not show that the run stored nothing: a state
+            # rebuild deletes every contradictions row.
+            head = ("was refused by the call budget, and this database holds no "
+                    "verdict from this run")
+            body = (f"{older} it cannot say whether judgment calls failed before "
+                    "the refusal or how many pairs were left unjudged. A state "
+                    "rebuild removes every stored verdict, so this run may have "
+                    "judged pairs whose verdicts are gone.")
+        return [f"- **Contradiction detection {head}.** {body} {pool()}", ""]
+    if "skipped" in con or "error" in con:
+        return []
+    try:
+        counters = sweep_counters(con)
+    except SweepCounterError as exc:
+        what = "disagree" if exc.kind == "disagree" else "are unreadable"
         return [
-            f"- **Contradiction detection reached its judgment cap: "
-            f"{deferred} pair(s) deferred**, {judged} judged. Deferred pairs "
-            "are not lost — they are skipped this run and re-offered next "
-            "time, so a standing backlog here means the cap "
-            "(`contradiction_max_judgments_per_run`) is below the candidate "
-            "rate rather than that anything failed.",
+            f"- Contradiction stage counters {what}: {exc}. Nothing is "
+            "inferred from them here.",
             "",
         ]
-    if con.get("skipped") != "budget_exhausted":
-        return []
-    ever = ""
-    if store is not None:
-        starved = ran = 0
-        for row in store.query("SELECT stats_json FROM runs WHERE stats_json <> ''"):
-            try:
-                d = json.loads(row["stats_json"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            c = d.get("contradictions")
-            if not isinstance(c, dict):
-                continue
-            if c.get("skipped") == "budget_exhausted":
-                starved += 1
-            elif "error" not in c:
-                ran += 1
-        if starved:
-            ever = (
-                f" Across every run in this database, {starved} reached this "
-                f"stage and were refused the same way, and {ran} ran it."
-            )
-    return [
-        "- **Contradiction detection did not run: the mining pool was already "
-        "spent.** It bills to `max_cheap_calls_per_run`, the pool "
-        "`mine_agentic` draws down first, rather than to the gate's separate "
-        f"`max_gate_calls_per_run`.{ever} Increasing the shared cap does not "
-        "reserve calls for contradiction detection; mining can consume them too.",
-        "",
-    ]
+    deferred, refused, judged, failed = (
+        counters[k] for k in ("deferred", "budget_deferred", "judged", "judge_failed"))
+    lines: list[str] = []
+    if refused:
+        # A failed judgment call spends a call from the pool, so the pool was
+        # "already spent" only when the refusal came before any call.
+        if judged + failed == 0:
+            head = "judged no pair: the mining pool was already spent"
+        elif judged == 0:
+            head = "judged no pair: its judgment calls failed, then the mining pool ran out"
+        else:
+            head = "stopped early: the mining pool ran out"
+        failures = (f" {failed} judgment call(s) failed before the refusal, and "
+                    "those pairs are offered again too." if failed else "")
+        lines += [
+            f"- **Contradiction detection {head}.** The call budget left "
+            f"{refused} pair(s) unjudged; {judged} judged. Those pairs are "
+            f"offered again next run.{failures} {pool()}",
+            "",
+        ]
+    capped = deferred - refused
+    if capped:
+        head = (f"- **Contradiction detection reached its judgment cap: "
+                f"{capped} pair(s) deferred**, {judged} judged.")
+        kept = ("Deferred pairs are not lost. They are skipped this run and "
+                "offered again next run")
+        if failed:
+            # judge_pairs counts a failed call toward the cap, so failures
+            # can be what used it up. Raising the cap would not fix them.
+            lines += [
+                f"{head} {failed} judgment call(s) failed, and those pairs are "
+                "offered again too. Each failed call counted toward the cap. "
+                f"{kept}. A standing backlog here can mean that the cap "
+                "(`contradiction_max_judgments_per_run`) is below the candidate "
+                "rate, or that judgment calls keep failing. Find out why the "
+                "calls failed before you raise the cap.",
+                "",
+            ]
+        else:
+            lines += [
+                f"{head} {kept}, so a standing backlog here means the cap "
+                "(`contradiction_max_judgments_per_run`) is below the candidate "
+                "rate rather than that anything failed.",
+                "",
+            ]
+    return lines
 
 
 def _global_routing_lines(store, cfg) -> list[str]:
@@ -847,7 +1027,7 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
     out.extend(_apply_posture_lines(cfg, stats, store))
     out.extend(_hollow_eval_lines(store))
     out.extend(_global_routing_lines(store, cfg))
-    out.extend(_contradiction_starved_lines(stats, store))
+    out.extend(_contradiction_starved_lines(stats, store, run_id=run_id))
     funnel: list[list[object]] = [
         ["File scan passes completed (this run)", _run_scan_int(stats, "files_succeeded")],
         ["File scan passes failed (this run)", _run_scan_int(stats, "files_failed")],
@@ -905,6 +1085,7 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
     out.extend(_parser_blindspot_lines(stats))
     out.extend(_wall_clock_lines(stats))
     out.extend(_identity_split_lines(store))
+    out.extend(_remote_split_lines(store, cfg))
     out.append("")
 
     out.extend(_mine_coverage_lines(store))
@@ -1049,11 +1230,22 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         out.append("")
 
     reaped = stats.get("stale_runs_reaped") or {}
-    if reaped.get("abandoned") or reaped.get("unparseable_started"):
+    if reaped.get("abandoned") or reaped.get("unparseable_started") or reaped.get("changed_since_read"):
+        # Stats stored before runs recorded their process carry only the total.
+        split = ""
+        if "abandoned_process_gone" in reaped:
+            split = (f" ({reaped['abandoned_process_gone']} whose recorded process was gone, "
+                     f"{reaped['abandoned_by_age']} legacy row(s) past the age limit)")
+        changed = ""
+        if "changed_since_read" in reaped:
+            # The reaper's write matches the row as judged. A model job that
+            # resumed the run, or the run finishing, changes the row first.
+            changed = (f", {reaped['changed_since_read']} not reaped because the row changed "
+                       "after it was judged (for example, a model job resumed it)")
         out.append(
             f"- Stale runs reaped at start: {reaped.get('abandoned', 0)} marked "
-            f"`abandoned`, {reaped.get('unparseable_started', 0)} left alone "
-            "with an unparseable `started` timestamp."
+            f"`abandoned`{split}, {reaped.get('unparseable_started', 0)} left alone "
+            f"with an unparseable `started` timestamp{changed}."
         )
         out.append("")
 
@@ -1161,6 +1353,9 @@ def generate(store: Store, cfg: Config, run_id: str, out_path: str | Path) -> st
         caps["events denylisted"] = scan_stats["events_denylisted"]
     if scan_stats.get("denylisted_by_substring"):
         caps["denylist hits by substring"] = scan_stats["denylisted_by_substring"]
+    mine_denied = (stats.get("mine") or {}).get("denylisted") or {}
+    if mine_denied.get("incidents"):
+        caps["waiting incidents not mined: denylist now matches"] = mine_denied["by_substring"]
     llm_stats = stats.get("llm", {})
     if llm_stats.get("refused"):
         refused = {k: v for k, v in llm_stats["refused"].items() if v}

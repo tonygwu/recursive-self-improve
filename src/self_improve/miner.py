@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -41,6 +42,7 @@ TURN_RESERVE = 6
 # Marker prepended to a fallback transcript.md built from window_json because
 # the full transcript aged out (see mine_incident_agentic).
 AGED_OUT_NOTE = "# NOTE: full transcript aged out; redacted incident window only"
+REFERENCE_MISSING_NOTE = "# NOTE: full transcript has no matching incident timestamp; redacted incident window only"
 
 # {{key}} placeholders in prompt templates. Word-characters only, so JSON
 # braces inside templates (single { }) never collide with the syntax.
@@ -51,7 +53,7 @@ PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 IN_FORCE_TRUNCATE_CHARS = 4000
 
 # Legal values for the mine response's scope_guess field.
-MINE_SCOPES = ("global", "project", "skill", "hook", "rule_path", "codex_global")
+MINE_SCOPES = ("global", "personal", "project", "skill", "hook", "rule_path", "codex_global")
 
 # Exact key set of the strict mine-response JSON contract (fast path).
 MINE_JSON_KEYS = frozenset(
@@ -129,10 +131,19 @@ class TranscriptAgedOut(MinerError):
     """The incident's full transcript file no longer exists on disk.
 
     Raised by :func:`build_mine_sandbox`. The caller
-    (:func:`mine_incident_agentic`) catches exactly this and builds the
+    (:func:`mine_incident_agentic`) catches this and builds the
     sandbox from the incident's stored ``window_json`` instead — the window
     was persisted precisely so evidence survives transcript age-out.
     """
+
+
+class IncidentReferenceMissing(MinerError):
+    """Parsed evidence has no event at the incident's exact timestamp."""
+
+
+def retained_window_note(reason: MinerError) -> str:
+    """Keep the retained-source limitation identical in both mining paths."""
+    return REFERENCE_MISSING_NOTE if isinstance(reason, IncidentReferenceMissing) else AGED_OUT_NOTE
 
 
 def render_prompt(template_path: str | Path, mapping: dict[str, str], *, template_text: str | None = None) -> str:
@@ -174,18 +185,37 @@ def render_prompt_revision(template_path, mapping):
     return render_prompt(template_path,mapping,template_text=text),hashlib.sha256(text.encode()).hexdigest()
 
 
-def gather_in_force_instructions(project_path: str, cfg: Config) -> str:
+def gather_in_force_instructions(project_path: str, cfg: Config, *, redact: bool = False) -> str:
     """Collect the instruction files in force for a project, labeled per file.
 
-    Includes the global CLAUDE.md plus the project's AGENTS.md and CLAUDE.md.
-    Each file is truncated to IN_FORCE_TRUNCATE_CHARS with an explicit
-    ``[truncated N chars]`` marker recording exactly how much was cut. Missing
+    Includes the global CLAUDE.md, the user rule files beside it
+    (``rules/**/*.md``, where a private ``personal.md`` lives), a configured
+    private target that lives elsewhere, and the project's AGENTS.md and
+    CLAUDE.md. A path that resolves to a file already shown is noted as SAME
+    FILE rather than quoted twice. Each file is truncated to
+    IN_FORCE_TRUNCATE_CHARS with an explicit ``[truncated N chars]`` marker recording exactly how much was cut. Missing
     files are noted as ABSENT (that is real information for the duplicate
     check, not an error); unreadable files are surfaced with the error rather
     than silently skipped or guessed at.
+
+    By default the text is the user's own instruction text, unredacted, so the
+    duplicate check can quote existing lines verbatim (see
+    ``render.environment_document``). A caller that stores or sends the result
+    as redacted input passes ``redact=True``: each file is then redacted before
+    the cut, and the marker counts characters of the redacted text. Redacting
+    after the cut would leave a secret that straddles it with a prefix too
+    short for any pattern.
     """
+    from .instruction_exclusions import excluded_by
+
     entries: list[tuple[str, Path]] = [("global CLAUDE.md", Path(cfg.global_claude_md))]
+    rules = Path(cfg.global_claude_md).parent / "rules"
+    if rules.is_dir():
+        entries.extend((f"global rule {r.relative_to(rules)}", r) for r in sorted(rules.rglob("*.md")))
+    if cfg.delivery_path("global_private"):
+        entries.append(("private rules", Path(cfg.delivery_path("global_private"))))
     blocks: list[str] = []
+    excluded = excluded_by(cfg, project_path)
     if project_path:
         entries.append(("project AGENTS.md", Path(project_path) / "AGENTS.md"))
         entries.append(("project CLAUDE.md", Path(project_path) / "CLAUDE.md"))
@@ -193,15 +223,36 @@ def gather_in_force_instructions(project_path: str, cfg: Config) -> str:
         blocks.append(
             "(incident has no project path — project AGENTS.md/CLAUDE.md not resolvable)"
         )
+    shown: dict[str, str] = {}
     for label, path in entries:
+        if excluded and label.startswith("project "):
+            # Checked before is_file(), so this reader never touches the
+            # excluded folder's files. Other steps, such as project identity,
+            # may still check that the folder exists.
+            blocks.append(
+                f"=== {label} ({path}) — EXCLUDED: not read, because "
+                f"instruction_excluded_dirs contains {excluded} ==="
+            )
+            continue
         if not path.is_file():
             blocks.append(f"=== {label} ({path}) — ABSENT ===")
             continue
+        # A symlinked entrypoint (CLAUDE.md -> AGENTS.md) is one file in force,
+        # not two; quoting it twice spends the budget on a repeat.
+        real = os.path.realpath(path)
+        if real in shown:
+            blocks.append(f"=== {label} ({path}) — SAME FILE AS {shown[real]} ===")
+            continue
+        shown[real] = label
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             blocks.append(f"=== {label} ({path}) — UNREADABLE: {exc} ===")
             continue
+        if redact:
+            # Before the cap, as archive_trajectory does: a secret straddling
+            # the cut would otherwise keep a prefix too short for any pattern.
+            text = redact_text(text)
         if len(text) > IN_FORCE_TRUNCATE_CHARS:
             cut = len(text) - IN_FORCE_TRUNCATE_CHARS
             text = text[:IN_FORCE_TRUNCATE_CHARS] + f"\n[truncated {cut} chars]"
@@ -383,6 +434,100 @@ def _persist_mine_payload(
         raise
 
 
+def _cached_remote_key(store: Store):
+    """Map a ``remote:`` project key to the key project_identity_cache holds.
+
+    A key the cache does not hold is returned unchanged. GitHub owner and
+    repository names are case-insensitive, the rule
+    ``rejections._same_remote`` applies, so a ``github.com`` remote that the
+    cache holds in another letter case still maps. An exact entry wins. A
+    case-insensitive match is used only when every entry it matches names
+    one project key; otherwise the key is returned unchanged. GitHub names
+    are ASCII, so only an ASCII key is matched this way, with ``lower()``.
+    ``casefold()`` would map the long s to s, and ``lower()`` maps the
+    Kelvin sign to k, so either alone could match a name GitHub refuses.
+    """
+    from collections import defaultdict
+
+    from .scan import _load_identity_cache
+
+    # resolve() names a remote fallback "remote:<normalized>", and the cache
+    # is keyed by that normalized remote. A format change only makes lookups
+    # miss, which refuses the sibling rather than adopting it. Normalization
+    # lowercases the host, so the github.com prefix test is exact.
+    github = "remote:github.com/"
+    cached = {"remote:" + norm: ident.key for norm, ident in _load_identity_cache(store).items()}
+    folded: dict[str, set[str]] = defaultdict(set)
+    for remote, project in cached.items():
+        if remote.startswith(github) and remote.isascii():
+            folded[remote.lower()].add(project)
+
+    def lookup(key: str) -> str:
+        if key in cached:
+            return cached[key]
+        if not (key.startswith(github) and key.isascii()):
+            return key
+        projects = folded.get(key.lower(), set())
+        return next(iter(projects)) if len(projects) == 1 else key
+    return lookup
+
+
+def _cache_only_resolver(store: Store, lookup=None):
+    """Repository identity from local git config and project_identity_cache.
+
+    It never runs ``gh``. Mining persistence can run inside the incident-job
+    write transaction, and a network lookup there could hold the writer for
+    the full ``gh`` timeout. A remote key goes through ``_cached_remote_key``
+    (``lookup`` when the caller already built one). A GitHub remote that the
+    cache does not hold keeps its ``remote:`` key. That key matches only a
+    project key that the same lookup also leaves as a ``remote:`` key, so
+    an uncached sibling is never adopted under a ``github:`` key.
+    """
+    from .project_identity import METHOD_REMOTE_URL, resolve
+
+    lookup = lookup or _cached_remote_key(store)
+
+    def key(path: str) -> str:
+        local = resolve(path, use_gh=False)
+        if local.method != METHOD_REMOTE_URL:
+            return local.key
+        return lookup(local.key)
+    return key
+
+
+def _write_target(store: Store, raw_path: str, project_key: str) -> str:
+    """The working copy a new learning should be written into.
+
+    The rule backfill applies, through routing.canonical_working_copy. The
+    candidates are the incident's copy and every scanned copy with the same
+    project_key that still exists. The first match wins: a repo-0 among
+    them; a repo-0 sibling on disk whose identity matches project_key; the
+    lowest-numbered repo-N; the incident's own copy. A repo-prod copy goes
+    to its verified repo-0 sibling or, without one, stays as the raw path for
+    routing to redirect or refuse. Without a canonical key there is nothing
+    to verify against, so the incident's own copy is kept. Identity comes
+    from local git and the persisted cache only; see _cache_only_resolver.
+
+    The scan can leave a GitHub clone set at its ``remote:`` key, when gh
+    failed or was off, while the cache now maps that remote to a ``github:``
+    key. The sibling's key goes through the cache, so the incident's key
+    goes through the same lookup before the two are compared. The scanned
+    copies are still those stored under the incident's own key.
+    """
+    if not raw_path or not project_key:
+        return raw_path
+    from .routing import canonical_working_copy
+
+    known = [r["project_path"] for r in store.query(
+        "SELECT DISTINCT project_path FROM sessions WHERE project_key = ? AND project_path <> ''",
+        (project_key,))]
+    lookup = _cached_remote_key(store)
+    return canonical_working_copy(
+        [raw_path], also_consider=known, project_key=lookup(project_key),
+        resolver=_cache_only_resolver(store, lookup),
+    ) or raw_path
+
+
 def _persist_mine_body(
     store: Store, incident_row: dict, payload: dict | None, *, agentic: bool = False, commit: bool = True,
     provenance: dict | None = None,
@@ -497,9 +642,12 @@ def _persist_mine_body(
         "evidence_count": 1,
         "project_count": 1 if project else 0,
         "projects_json": json.dumps([project] if project else []),
-        # The working copy this incident came from — routing writes here.
+        # The working copy routing writes into: a verified repo-0 of this
+        # repository, else the lowest-numbered repo-N among its scanned
+        # copies, else the incident's own copy (see _write_target).
         # Distinct from projects_json, which holds canonical repo keys.
-        "primary_project_path": incident_row.get("project_path", ""),
+        "primary_project_path": _write_target(store, incident_row.get("project_path", ""),
+                                              incident_row.get("project_key", "")),
         "first_seen": incident_row.get("ts", ""),
         "last_seen": incident_row.get("ts", ""),
         "confidence": float(payload["confidence"]),
@@ -695,7 +843,7 @@ def _resolve_start_line(
     matched_text = incident_row.get("matched_text", "")
     ts_hits = [(line_no, text) for line_no, ets, text in entries if ets == ts]
     if not ts_hits:
-        raise MinerError(
+        raise IncidentReferenceMissing(
             f"incident {incident_row['id']}: no transcript event carries the "
             f"incident ts {ts!r}; pointer unresolvable"
         )
@@ -712,9 +860,9 @@ def _build_full_sandbox(
     """Build transcript.md + environment.md from the FULL session file.
 
     Returns ``(sandbox_dir, start_line)``. Raises :class:`TranscriptAgedOut`
-    when the transcript file no longer exists on disk, and MinerError for
-    broken DB invariants (missing session row, empty parse, unresolvable
-    pointer).
+    when the transcript file no longer exists on disk,
+    :class:`IncidentReferenceMissing` when no event has the incident timestamp,
+    and MinerError for broken DB invariants (missing session row, empty parse).
     """
     events, start_line = _full_mine_events(store, incident_row, cfg)
     sandbox_dir = Path(sandbox_dir)
@@ -745,17 +893,47 @@ def _full_mine_events(store, incident_row, cfg):
             f"incident {incident_id}: transcript no longer on disk: {session_file}"
         )
     source = _source_for(session["source"], cfg)
+    before = Path(session_file).stat()
     events = list(source.parse(session_file, 0))
     if not events:
         raise MinerError(
             f"incident {incident_id}: transcript parsed to zero events: {session_file}"
         )
-    start_line = _resolve_start_line(
-        # Defense in depth: render.py also redacts every event body before the
-        # final prompt. Preserve that final guard when changing this layer.
-        [(e.line_no, e.ts_utc, redact_text(e.text)) for e in events], incident_row
-    )
+    try:
+        start_line = _resolve_start_line(
+            # Defense in depth: render.py also redacts every event body before
+            # the final prompt. Preserve that guard when changing this layer.
+            [(e.line_no, e.ts_utc, redact_text(e.text)) for e in events], incident_row
+        )
+    except IncidentReferenceMissing:
+        _confirm_raw_reference_absent(session_file, incident_row, before)
+        raise
     return events, start_line
+
+
+def _confirm_raw_reference_absent(session_file, incident_row, before):
+    """Do not use archived evidence to override deliberate parser exclusions.
+
+    Both supported sources put logical time in the JSONL envelope's timestamp.
+    This extra streaming read is needed only after parsed lookup fails. A raw
+    match, malformed record or concurrent file change leaves recovery unproven.
+    """
+    with open(session_file, 'rb') as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+            except (ValueError, UnicodeError) as exc:
+                raise MinerError(f"incident {incident_row['id']}: cannot verify reference absence; malformed raw record") from exc
+            if not isinstance(record, dict):
+                raise MinerError(f"incident {incident_row['id']}: cannot verify reference absence; malformed raw record")
+            if record.get('timestamp') == incident_row['ts']:
+                raise MinerError(f"incident {incident_row['id']}: raw record has incident timestamp but no parsed event; parser eligibility needs review")
+    after = Path(session_file).stat()
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    if any(getattr(before, name) != getattr(after, name) for name in fields):
+        raise MinerError(f"incident {incident_row['id']}: transcript changed while checking reference absence")
 
 
 def _write_learnings_dump(store: Store, sandbox_dir: Path) -> None:
@@ -776,12 +954,13 @@ def _write_learnings_dump(store: Store, sandbox_dir: Path) -> None:
 
 
 def _build_fallback_sandbox(
-    store: Store, incident_row: dict, cfg: Config, sandbox_dir: Path
+    store: Store, incident_row: dict, cfg: Config, sandbox_dir: Path,
+    *, note: str = AGED_OUT_NOTE,
 ) -> tuple[Path, int]:
     """Build the sandbox from the incident's stored ``window_json``.
 
-    Used only when the full transcript aged out (:class:`TranscriptAgedOut`).
-    transcript.md is marked with :data:`AGED_OUT_NOTE` so the agent knows it
+    Used when the full transcript aged out or lost the exact incident reference.
+    transcript.md is marked with the source limitation so the agent knows it
     is seeing the redacted incident window only, not the full session.
     Turn and occurrence entries share archive validation. Rendering re-redacts
     retained text and preserves occurrence count, time and source locations.
@@ -792,7 +971,7 @@ def _build_fallback_sandbox(
     transcript_path = sandbox_dir / "transcript.md"
     render_session(events, transcript_path)
     transcript_path.write_text(
-        f"{AGED_OUT_NOTE}\n\n{transcript_path.read_text(encoding='utf-8')}",
+        f"{note}\n\n{transcript_path.read_text(encoding='utf-8')}",
         encoding="utf-8",
     )
     render_environment(
@@ -823,7 +1002,7 @@ def _fallback_mine_events(store, incident_row):
     if not isinstance(window, list) or not window:
         raise MinerError(
             f"incident {incident_id}: window_json must be a non-empty list to "
-            f"build the aged-out fallback sandbox, got "
+            f"build the retained-window fallback sandbox, got "
             f"{type(window).__name__} of len "
             f"{len(window) if isinstance(window, list) else 'n/a'}"
         )
@@ -881,12 +1060,12 @@ def build_mine_sandbox(
     ``sandbox_dir``.
 
     Contract: raises :class:`TranscriptAgedOut` (a MinerError) if the
-    transcript file no longer exists on disk. The caller —
-    :func:`mine_incident_agentic` — then falls back to building transcript.md
-    from the incident's stored ``window_json``, marked with
-    :data:`AGED_OUT_NOTE`. Other MinerErrors (missing session row, zero
-    events, unresolvable incident pointer) are hard invariant failures with
-    no fallback.
+    transcript file no longer exists on disk, or :class:`IncidentReferenceMissing`
+    if its parsed events no longer contain the incident timestamp. The caller,
+    :func:`mine_incident_agentic`, can build from the independently validated
+    retained window, marked with its source limitation. Missing session rows,
+    zero parsed events and malformed or unresolvable retained evidence remain
+    hard failures before a model call.
     """
     path, _start_line = _build_full_sandbox(store, incident_row, cfg, Path(sandbox_dir))
     return path
@@ -904,7 +1083,7 @@ def mine_incident_agentic(
     """Mine one incident by letting an agent explore the full redacted session.
 
     Builds a sandbox under ``sandbox_root/<incident_id>`` (falling back to the
-    stored window when the transcript aged out — see :func:`build_mine_sandbox`),
+    stored window when the transcript aged out or lost the exact trigger),
     renders ``prompts/mine_incident_agentic.md``, and calls
     ``agentic_call(prompt, sandbox_dir)``: a headless agent session with cwd
     inside the sandbox, restricted to cfg.mine_agent_allowed_tools, whose
@@ -924,14 +1103,14 @@ def mine_incident_agentic(
         sandbox_dir, start_line = _build_full_sandbox(
             store, incident_row, cfg, sandbox_dir
         )
-    except TranscriptAgedOut as exc:
+    except (TranscriptAgedOut, IncidentReferenceMissing) as exc:
         logger.warning(
             "mine incident %s: %s; falling back to stored incident window",
             incident_id,
             exc,
         )
         sandbox_dir, start_line = _build_fallback_sandbox(
-            store, incident_row, cfg, sandbox_dir
+            store, incident_row, cfg, sandbox_dir, note=retained_window_note(exc)
         )
     prompt, template_sha = render_prompt_revision(
         Path(prompts_dir) / "mine_incident_agentic.md",

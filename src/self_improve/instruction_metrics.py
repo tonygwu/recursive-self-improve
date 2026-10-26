@@ -61,11 +61,12 @@ def collect(surface, working_copy_path):
                                             'file_bytes': MAX_FILE_BYTES, 'total_bytes': MAX_TOTAL_BYTES,
                                             'excluded_directories': list(EXCLUDED)}}}
     other = result['other_markdown']
-    def issue(cause, path):
-        other['issues'].append({'cause': cause, 'path': str(path)})
+    def issue(cause, path, **extra):
+        other['issues'].append({'cause': cause, 'path': str(path), **extra})
     def exclude(cause, path):
         other['exclusions'].append({'cause': cause, 'path': str(path)})
-    if any(i['cause'] in {'working_copy_identity_changed', 'working_copy_missing', 'working_copy_not_git'} for i in surface['issues']):
+    from .rule_revisions import REFUSED_SURFACE_CAUSES
+    if any(i['cause'] in REFUSED_SURFACE_CAUSES for i in surface['issues']):
         other.update(status='unavailable', totals=None)
         issue('working_copy_not_observed', working_copy_path)
         return result
@@ -103,7 +104,7 @@ def collect(surface, working_copy_path):
             with os.scandir(directory) as handle:
                 entries = list(islice(handle, remaining + 1))
             if len(entries) > remaining:
-                issue('entry_limit', directory)
+                issue('entry_limit', directory, omitted_entries_at_least=len(entries) - remaining)
                 entries = entries[:remaining]
             if _signature(before) != _signature(directory.stat()):
                 issue('directory_changed_during_observation', directory)
@@ -135,11 +136,15 @@ def collect(surface, working_copy_path):
                         continue
                     if len(other['files']) >= MAX_FILES:
                         issue('file_count_limit', path); continue
-                    if used_bytes >= MAX_TOTAL_BYTES:
-                        issue('total_byte_limit', path); continue
+                    # Check the size before charging the budget: a file refused
+                    # by the per-file cap must not spend the total budget.
+                    if st.st_size > MAX_FILE_BYTES:
+                        issue('file_byte_limit', path, bytes=st.st_size); continue
+                    if used_bytes + st.st_size > MAX_TOTAL_BYTES:
+                        issue('total_byte_limit', path, bytes=st.st_size); continue
                     limit = min(MAX_FILE_BYTES, MAX_TOTAL_BYTES-used_bytes)
-                    used_bytes += min(st.st_size, limit)
                     raw, observed = _read(real, limit)
+                    used_bytes += len(raw)
                     if (path.resolve(strict=True) != real or _signature(st) != _signature(observed)
                             or _signature(observed) != _signature(path.stat())):
                         raise ValueError('file_changed_during_observation')
@@ -156,7 +161,7 @@ def collect(surface, working_copy_path):
             if _signature(before) != _signature(directory.stat()):
                 issue('directory_changed_during_observation', directory)
             if other['entries_examined'] >= MAX_ENTRIES and pending:
-                issue('entry_limit', pending[-1][0]); break
+                issue('entry_limit', pending[-1][0], omitted_directories=len(pending)); break
         except OSError as exc:
             issue('directory_unreadable:'+type(exc).__name__, directory)
     other['files'].sort(key=lambda f: f['real_path'])

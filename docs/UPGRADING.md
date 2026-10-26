@@ -1,5 +1,16 @@
 # Upgrade an existing preview installation
 
+Version 0.1.3 adds no schema migration. An installation already on 0.1.2 needs no
+database upgrade, and `upgrade-state --dry-run` reports nothing pending. Newly
+collected instruction-text archives now record the redaction rules version that
+wrote them, and 0.1.2 cannot read those archives. After 0.1.3 has collected
+instruction text, do not run 0.1.2 against the same database.
+
+Mining can now classify a lesson as personal. Until `[targets] global_private`
+names a private rules file, routing refuses each personal lesson and counts it as
+`propose_RoutingError` instead of writing it to the shared file. See
+[delivery targets](TARGETS.md).
+
 Version 0.1.2 adds observational recurrence measurements, human quality
 judgments, native session context and loading reports, display-only rule
 families, retained instruction text, and queue history. Its schema identifiers

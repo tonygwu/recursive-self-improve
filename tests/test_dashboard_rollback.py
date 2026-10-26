@@ -184,3 +184,23 @@ def test_malformed_inverse_records_have_the_same_named_error_in_api_and_worker(c
         with pytest.raises(CommandError, match='Operation'):
             run_once(store, cfg)
     assert target.read_text() == A
+
+
+@pytest.mark.parametrize('change, code', [
+    (lambda body: {**body, 'request_key': 'short'}, 'InvalidRequestKey'),
+    (lambda body: {**body, 'unexpected': 'field'}, 'InvalidCommand'),
+    (lambda body: {k: v for k, v in body.items() if k != 'preview_revision'}, 'InvalidCommand'),
+    (lambda body: {**body, 'preview_revision': ''}, 'InvalidCommand'),
+    (lambda body: {**body, 'proposal_id': ''}, 'InvalidCommand'),
+])
+def test_a_malformed_rollback_request_is_refused_and_queues_nothing(cfg, store, tmp_path, change, code):
+    """Rollback request validation had no test. A refusal names its cause,
+    queues no operation, records no request and leaves the target alone."""
+    target, p = applied(store, cfg, tmp_path)
+    with TestClient(create_app(cfg)) as client:
+        response = client.post('/api/commands', json=change(request(client, p['id'])))
+    assert response.status_code == 400, response.text
+    assert response.json()['error'] == code, response.text
+    assert store.query("SELECT * FROM instruction_operations WHERE kind='rollback'") == []
+    assert store.query('SELECT * FROM instruction_requests') == []
+    assert target.read_text() == A

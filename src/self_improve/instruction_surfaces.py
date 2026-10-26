@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import deque
 from itertools import islice
 from pathlib import Path
+import errno
 import os
 import stat
 import tomllib
@@ -15,7 +16,7 @@ import tomllib
 import yaml
 
 from .dashboard.context_weight import find_imports
-from .rule_revisions import AvailabilityError, marked_units, text_hash
+from .rule_revisions import AvailabilityError, SourceChanged, marked_units, text_hash
 from .instruction_commands import command_metadata, resolve_commands
 from .instruction_policy import inspect_policy, unchecked
 from .instruction_plugins import inspect_plugins, unchecked as unchecked_plugins
@@ -93,7 +94,8 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             text = raw.decode('utf-8')
         except FileNotFoundError:
             issue('file_missing', path); return None
-        except (OSError, UnicodeError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
+            # ValueError covers UnicodeError and an embedded NUL in a path.
             issue('file_unreadable:'+type(exc).__name__, path); return None
         item = {'path': lexical, 'real_path': real, 'aliases': [lexical], 'bytes': len(raw),
                 'content_hash': text_hash(text), 'loading_paths': [], '_text': text,
@@ -104,8 +106,20 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         physical[physical_key] = item
         return item
 
+    def known_present(path):
+        """present(), with a failed check recorded instead of read as absent.
+
+        os.path.lexists returns False on EACCES and below a dangling directory
+        link, which made an unreadable Codex home look complete and empty.
+        """
+        try:
+            return present(Path(path))
+        except (OSError, RuntimeError) as exc:
+            issue('source_unreadable:'+type(exc).__name__, path)
+            return False
+
     def seed(path, provider, mode, *, origin='project', source='memory', optional=True, discovery_root=None):
-        if optional and not os.path.lexists(path):
+        if optional and not known_present(path):
             return
         queue.append((path, provider, {'kind': mode, 'paths': []}, 0, [], [], origin, source, discovery_root))
 
@@ -113,6 +127,10 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         try:
             path.lstat()
             return True
+        except ValueError as exc:
+            # An invalid path (an embedded NUL from a registry or import) is an
+            # unreadable source; every caller already names OSError failures.
+            raise OSError(errno.EINVAL, str(exc)) from exc
         except FileNotFoundError:
             # A missing child below a dangling directory link is a failed read,
             # not a known absent source. Stop at the nearest existing ancestor.
@@ -182,7 +200,7 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
              'runtime_overrides_verified': False, 'sources': []}
     config_paths = [codex_config, *(directory/'.codex/config.toml' for directory in ancestors)]
     for config_path in config_paths:
-        if not os.path.lexists(config_path): continue
+        if not known_present(config_path): continue
         config_file = read(config_path)
         if config_file is None:
             codex['configuration_valid'] = codex['skill_configuration_valid'] = False; continue
@@ -248,7 +266,7 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
     selected = {str(Path(p).resolve()) for p in global_targets}
     for raw, provider in ((cfg.global_claude_md, 'claude'), (cfg.codex_global_agents_md, 'codex')):
         path = Path(raw)
-        if provider == 'codex' and os.path.lexists(path.with_name('AGENTS.override.md')):
+        if provider == 'codex' and known_present(path.with_name('AGENTS.override.md')):
             override = read(path.with_name('AGENTS.override.md'))
             if override is None: continue
             if override['_text'].strip(): path = path.with_name('AGENTS.override.md')
@@ -316,7 +334,7 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         try:
             signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
             return (signature(path.lstat()), signature(path.stat()))
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return type(exc).__name__
     policy_signatures = {path: policy_signature(path) for path in
                          (managed_root/'managed-settings.json', managed_root/'managed-settings.d')}
@@ -340,7 +358,7 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             plugin_container_paths.add(str(path.resolve()))
             info = path.stat()
             plugin_container_inodes.add((info.st_dev, info.st_ino))
-        except (OSError, RuntimeError): pass
+        except (OSError, RuntimeError, ValueError): pass
     def read_plugin_config(path, *, required=False):
         protect_plugin_config(path)
         try:
@@ -466,9 +484,15 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
         if imports and depth >= MAX_IMPORT_DEPTH:
             issue('import_depth_limit', path, omitted_imports=len(imports)); continue
         for spec in imports:
-            target = Path(spec).expanduser()
-            if not target.is_absolute(): target = path.parent/target
-            if str(target.resolve()) in chain + [item['real_path']]:
+            try:
+                target = Path(spec).expanduser()
+                if not target.is_absolute(): target = path.parent/target
+                resolved = str(target.resolve())
+            except (RuntimeError, ValueError, OSError) as exc:
+                # An unknown ~user or a NUL in one import must not abort the
+                # collection of every copy; record it on this file.
+                issue('import_path_invalid:'+type(exc).__name__, path, import_spec=spec[:200]); continue
+            if resolved in chain + [item['real_path']]:
                 result['deduplicated'].append({'path': str(target), 'cause': 'import_cycle'})
                 continue
             queue.append((target, provider, current_scope, depth+1, chain+[item['real_path']], current_conditions, origin, 'import', None))
@@ -477,15 +501,20 @@ def inspect_surfaces(cfg, working_copy_path, *, global_targets=()):
             raise AvailabilityError('Managed policy source changed during observation: ' + str(path))
     for path, signature in plugin_signatures.items():
         if policy_signature(path) != signature:
-            raise AvailabilityError('Plugin source changed during observation: ' + str(path))
+            raise SourceChanged('Plugin source changed during observation: ' + str(path))
     result['files'] = [item for item in cache.values() if item['loading_paths']] + embedded
     resolve_commands(result['files'], issue, uninspected=result['uninspected_commands'], incomplete_roots=result['incomplete_command_roots'])
     codex_paths = [(item, path) for item in result['files'] for path in item['loading_paths']
                    if path['provider'] == 'codex' and path['scope']['kind'] != 'on_demand']
     codex_paths.sort(key=lambda pair: (pair[1]['scope']['kind'] != 'global', len(Path(pair[1]['path']).parts)))
+    # Codex loads the global AGENTS.md separately, without a byte limit, and
+    # applies project_doc_max_bytes to project documents only, charging no
+    # separator bytes (codex-rs agents_md.rs, read 2026-10-11).
     remaining = codex['max_bytes'] if codex['configuration_valid'] else 0
-    for index, (item, path) in enumerate(codex_paths):
-        if index: remaining = max(0, remaining - 2)
+    for item, path in codex_paths:
+        if path['scope']['kind'] == 'global' and codex['configuration_valid']:
+            path['eligible_prefix_bytes'] = item['bytes']
+            continue
         path['eligible_prefix_bytes'] = min(item['bytes'], remaining)
         remaining = max(0, remaining - item['bytes'])
         if path['eligible_prefix_bytes'] < item['bytes']:

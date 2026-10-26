@@ -1,6 +1,8 @@
 """Finalize interrupted runs and later reap abandoned ones.
 KeyboardInterrupt and SystemExit require explicit finalization. A process
-killed before it can finalize leaves a row for a later age-based reaper.
+killed before it can finalize leaves a row for the next pipeline start.
+The rows here record no process, so they exercise the legacy age rule;
+tests/test_run_liveness.py covers rows that record their process.
 """
 
 from __future__ import annotations

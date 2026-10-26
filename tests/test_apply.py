@@ -65,7 +65,9 @@ def init_git_repo(path: Path, filename: str, content: str) -> Path:
 
 @pytest.fixture
 def cfg(tmp_path: Path) -> Config:
-    return Config(state_dir=str(tmp_path / "state"))
+    # pytest's tmp_path lies under /var/folders, which the default denylist
+    # names; selected mining refuses denylisted incidents (test_mine_denylist.py).
+    return Config(state_dir=str(tmp_path / "state"), denylist_substrings=())
 
 
 @pytest.fixture
@@ -218,6 +220,70 @@ class TestNonGitApply:
         events = events_for(store, proposal["id"])
         assert [e["event"] for e in events] == ["held"]
         assert events[0]["note"].startswith("patch_conflict: ")
+
+    @pytest.mark.parametrize("raw, phrase", [
+        (b"# CLAUDE.md\r\n\r\n- old rule\r\n", "line boundaries"),
+        (b"# CLAUDE.md\n\x0c\n- old rule\n", "line boundaries"),
+        # The edit is mid-file; the missing final newline is outside its hunk.
+        (b"# CLAUDE.md\n\n- old rule\n\n## Commands\n\n- make\n- make test", "final newline"),
+    ], ids=["crlf", "form_feed", "no_final_newline"])
+    def test_a_target_whose_line_endings_the_edit_would_rewrite_is_held(
+        self, store: Store, cfg: Config, tmp_path: Path, raw: bytes, phrase: str
+    ):
+        """Review of BL-15: with the refusal removed, apply_proposal returned
+        'applied' and wrote b'# CLAUDE.md\\n\\n- old rule\\n- new rule from
+        miner\\n' over a CRLF file. The refusal must hold it before any
+        operation or snapshot is prepared. Second review: the hold reason
+        was patch_conflict, while Review and the worker name the cause
+        UnsupportedLineEndings, so the hold now names it too."""
+        target = tmp_path / "CLAUDE.md"
+        target.write_bytes(raw)
+        lf = "\n".join(raw.decode("utf-8").splitlines()) + "\n"
+        edited = lf.replace("- old rule\n", "- old rule\n- new rule from miner\n", 1)
+        proposal = insert_proposal(store, target=target, diff=make_diff(lf, edited))
+
+        outcome = apply_proposal(store, cfg, proposal)
+
+        assert outcome["outcome"] == "held", outcome
+        assert outcome["reason"] == "unsupported_line_endings"
+        assert phrase in outcome["detail"]
+        assert target.read_bytes() == raw
+        assert store.query("SELECT * FROM instruction_operations") == []
+        row = store.query_one("SELECT status FROM proposals WHERE id = ?", (proposal["id"],))
+        assert row["status"] == "held"
+        events = events_for(store, proposal["id"])
+        assert [e["event"] for e in events] == ["held"]
+        assert events[0]["note"].startswith("unsupported_line_endings: ")
+
+    def test_rolling_back_the_first_rule_of_an_empty_section_keeps_the_second(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ):
+        """Review of the empty-section gap: the first rule in an empty section above
+        another heading got a blank line after it. The second rule went
+        between the two, so rollback of the first could not find its inserted
+        lines as one block ('Cannot uniquely locate the applied change')."""
+        from self_improve.propose import SECTION_HEADER, append_learned_rule, make_unified_diff
+
+        target = tmp_path / "CLAUDE.md"
+        original = f"# CLAUDE.md\n\n{SECTION_HEADER}\n\n## Commands\n- make test\n"
+        target.write_text(original, encoding="utf-8")
+        rule_a = "- **First.** Rule A. <!-- si:rule-a -->"
+        rule_b = "- **Second.** Rule B. <!-- si:rule-b -->"
+        with_a = append_learned_rule(original, rule_a)
+        a = insert_proposal(store, target=target, diff=make_unified_diff(original, with_a, str(target)))
+        assert apply_proposal(store, cfg, a)["outcome"] == "applied"
+        with_b = append_learned_rule(with_a, rule_b)
+        b = insert_proposal(store, target=target, diff=make_unified_diff(with_a, with_b, str(target)))
+        assert apply_proposal(store, cfg, b)["outcome"] == "applied"
+
+        result = rollback(store, cfg, a["id"])
+
+        assert result["outcome"] == "rolled_back", result
+        assert target.read_text(encoding="utf-8") == append_learned_rule(original, rule_b)
+        statuses = {r["id"]: r["status"] for r in store.query("SELECT id, status FROM proposals")}
+        assert statuses == {a["id"]: "rolled_back", b["id"]: "applied"}
+        assert rollback(store, cfg, b["id"])["outcome"] == "rolled_back"
+        assert target.read_text(encoding="utf-8") == original
 
 
 class TestPolicyGate:

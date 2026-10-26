@@ -99,6 +99,7 @@ BOOKKEEPING_TYPES = frozenset(
 # text. Classify them even when the envelope does not set isMeta.
 _SLASH_COMMAND_PREFIXES = ("<command-name>", "<command-message>", "<command-args>")
 _LOCAL_STDOUT_PREFIX = "<local-command-stdout>"
+_BASH_MODE_PREFIXES = ("<bash-input>", "<bash-stdout>", "<bash-stderr>")
 _LOCAL_CAVEAT_PREFIX = "<local-command-caveat>"
 _TASK_NOTIFICATION_PREFIX = "<task-notification>"
 
@@ -244,11 +245,15 @@ class ClaudeCodeSource:
         """
         root = Path(self.config.claude_projects_dir)
         resolved = root.resolve()
-        for part in resolved.parts:
+        # Check the path as configured, not only its resolution: the real
+        # layout links ~/.claude-b/projects to ~/.claude/projects, which
+        # resolves cleanly but records every session under the alias.
+        for part in (*root.absolute().parts, *resolved.parts):
             if _is_mirrored_config_dir(part):
                 raise ClaudeSourceError(
-                    f"Refusing to scan {resolved}: {part} mirrors ~/.claude via "
-                    "symlinks; scanning it double-counts sessions."
+                    f"Refusing to scan {root}: {part} is an alternate account "
+                    "directory whose projects/ mirrors ~/.claude; scanning it "
+                    "double-counts sessions."
                 )
         if not root.is_dir():
             raise ClaudeSourceError(f"claude_projects_dir does not exist: {root}")
@@ -418,6 +423,14 @@ class ClaudeCodeSource:
                         category = LINE_EVENT
                     else:
                         category, cause = LINE_SKIPPED, f"{line_type}:no_events"
+                    # A session can change into a denylisted tree after it
+                    # starts. The scan applies the denylist to the file's first
+                    # cwd only, so mark each event by the cwd in force on its
+                    # own line; the scan drops marked events before detection.
+                    cwd_now = carried["cwd"]
+                    if cwd_now and any(s in cwd_now for s in self.config.denylist_substrings):
+                        for ev in events:
+                            ev.meta["denylisted"] = True
                     for ev in events:
                         emitted += 1
                         stats.events_emitted += 1
@@ -496,6 +509,16 @@ class ClaudeCodeSource:
                 ]
             if content.startswith(_LOCAL_CAVEAT_PREFIX) or data.get("isMeta") is True:
                 return [TurnEvent(**env, role=ROLE_SYSTEM, kind="meta", text=content, meta=meta)]
+            # Machine-written user records that carry no isMeta flag: bash-mode
+            # input and output, compact summaries, and the prompt a parent
+            # agent wrote for a subagent. Claude Code's own prompt filter
+            # excludes isCompactSummary and isSidechain separately from isMeta.
+            if content.startswith(_BASH_MODE_PREFIXES):
+                return [TurnEvent(**env, role=ROLE_SYSTEM, kind="bash_mode", text=content, meta=meta)]
+            if data.get("isCompactSummary") is True:
+                return [TurnEvent(**env, role=ROLE_SYSTEM, kind="compact_summary", text=content, meta=meta)]
+            if data.get("isSidechain") is True:
+                return [TurnEvent(**env, role=ROLE_SYSTEM, kind="sidechain_prompt", text=content, meta=meta)]
             # The verified human predicate: type==user, isMeta!=true, string
             # content, no machinery prefix.
             return [TurnEvent(**env, role=ROLE_HUMAN, kind=KIND_MESSAGE, text=content, meta=meta)]

@@ -135,7 +135,7 @@ def test_pipeline_merges_name_the_second_producing_call(tmp_path,monkeypatch):
     payload={k:v for k,v in agentic_payload().items() if k not in miner.MINE_AGENTIC_EXTRA_KEYS}
     def execute(self,call_id,stage,*args,**kwargs):
         value=payload if stage=='mine' else {'decision':'merge','generalized_rule':'Inspect the actual model and preserve its call identifier.','why':'Keep the producing evidence.'}
-        if stage not in {'mine','cluster'}:return _ExecResult.fail('parse_failure')
+        if stage not in {'mine','cluster'}:return _ExecResult.fail('parse_error')
         return _ExecResult(ok=True,text=json.dumps(value),parsed=value,outcome='ok',provider='claude',model_reported='claude-sonnet-4-6' if stage=='mine' else 'claude-opus-4-6')
     monkeypatch.setattr(LLMRunner,'_execute',execute)
     stats=pipeline.run_pipeline(cfg,corpus.store,review_only=True)
@@ -177,3 +177,171 @@ def test_rebuild_exports_mining_history_before_removing_derived_rows(cfg,store,t
     verify_backup(destination)
     assert json.loads((destination/'preserved.json').read_text())['mining_history']==retained
     assert store.query('SELECT * FROM mining_history')==[]
+
+
+def test_a_budget_refusal_at_the_cluster_stage_is_recorded_as_refused(tmp_path,monkeypatch):
+    """BL-20: the pipeline turned a cluster budget refusal into merge_failed."""
+    from tests.e2e_corpus import build_corpus
+    from self_improve.llm import BudgetExhausted
+    corpus=build_corpus(tmp_path)
+    cfg=replace(corpus.cfg,mine_mode='fast',cluster_group_cosine=-1.0)
+    payload={k:v for k,v in agentic_payload().items() if k not in miner.MINE_AGENTIC_EXTRA_KEYS}
+    real_call=LLMRunner.call
+    def call(self,stage,*args,**kwargs):
+        if stage=='cluster':raise BudgetExhausted('strong',0,1)
+        return real_call(self,stage,*args,**kwargs)
+    def execute(self,call_id,stage,*args,**kwargs):
+        if stage!='mine':return _ExecResult.fail('parse_error')
+        return _ExecResult(ok=True,text=json.dumps(payload),parsed=payload,outcome='ok',provider='claude',model_reported='claude-sonnet-4-6')
+    monkeypatch.setattr(LLMRunner,'call',call)
+    monkeypatch.setattr(LLMRunner,'_execute',execute)
+    stats=pipeline.run_pipeline(cfg,corpus.store,review_only=True)
+    assert stats['cluster']['merge_attempted']>=1,stats['cluster']
+    assert stats['cluster']['merge_refused']==stats['cluster']['merge_attempted'],stats['cluster']
+    assert stats['cluster']['merge_failed']==0,stats['cluster']
+
+
+def test_a_new_project_learning_targets_the_verified_repo_0_copy(cfg,store,tmp_path,monkeypatch):
+    """BL-13: the miner stored the session's raw cwd as primary_project_path,
+    so a lesson mined from a repo-3 session was written into repo-3 although
+    repo-0 is the automation target; canonical_working_copy ran only in the
+    one-time backfill."""
+    import self_improve.project_identity as identity
+    from tests.test_scan_observations import make_repo
+    remote='git@github.com:acme/widget.git'
+    clones=tmp_path/'Code'/'widget'
+    repo3=make_repo(clones/'repo-3',remote=remote); repo0=make_repo(clones/'repo-0',remote=remote)
+    def no_gh(owner_repo):raise RuntimeError('offline test')
+    monkeypatch.setattr(identity,'_default_gh',no_gh)
+    key=identity.resolve(repo3,gh=no_gh).key
+    incident=seed_incident(store,str(tmp_path/'s.jsonl'),project=repo3)
+    store.update('incidents','id',incident['id'],{'project_key':key});store.commit()
+    incident=store.query_one('SELECT * FROM incidents WHERE id=?',(incident['id'],))
+    learning=mine(store,cfg,incident,agentic_payload(),'fast','run',tmp_path,monkeypatch)
+    assert learning['primary_project_path']==repo0,learning['primary_project_path']
+
+
+def recording_gh(tmp_path,monkeypatch):
+    """A fake gh first on PATH. It logs every call and answers like gh would,
+    so code that still calls gh gets a usable identity and only the log shows it."""
+    import os,shlex
+    directory=tmp_path/'fake-gh-bin';directory.mkdir()
+    log=tmp_path/'gh-calls.log'
+    gh=directory/'gh'
+    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> '+shlex.quote(str(log))+'\n'
+                  'printf \'{"id": 4242, "full_name": "acme/widget"}\\n\'\n')
+    gh.chmod(0o755)
+    monkeypatch.setenv('PATH',str(directory)+os.pathsep+os.environ['PATH'])
+    return log
+
+
+def widget_clones(store,tmp_path,*,cached,scanned_repo1=False,repo0_remote='git@github.com:acme/widget.git'):
+    """repo-3 holds the incident; repo-0 sits beside it and was never scanned."""
+    from self_improve.store import utc_now_iso
+    from tests.test_scan_observations import make_repo
+    remote='git@github.com:acme/widget.git'
+    clones=tmp_path/'Code'/'widget'
+    repo3=make_repo(clones/'repo-3',remote=remote);repo0=make_repo(clones/'repo-0',remote=repo0_remote)
+    repo1=make_repo(clones/'repo-1',remote=remote)
+    if cached:
+        store.insert('project_identity_cache',{'remote_norm':'github.com/acme/widget','project_key':'github:4242',
+            'display':'acme/widget','method':'gh_repo_id','resolved_at':utc_now_iso()})
+    if scanned_repo1:
+        seed_incident(store,str(tmp_path/'repo1.jsonl'),project=repo1)
+        store.update('sessions','file_path',str(tmp_path/'repo1.jsonl'),{'project_key':'github:4242'})
+    incident=seed_incident(store,str(tmp_path/'s.jsonl'),project=repo3)
+    store.update('incidents','id',incident['id'],{'project_key':'github:4242'});store.commit()
+    incident=store.query_one('SELECT * FROM incidents WHERE id=?',(incident['id'],))
+    return incident,{'repo-0':repo0,'repo-1':repo1,'repo-3':repo3}
+
+
+@pytest.mark.parametrize('cached,scanned_repo1,expected',[
+    (True,False,'repo-0'),    # the cached identity verifies the unscanned sibling
+    (False,False,'repo-3'),   # no cached identity: the sibling is not adopted
+    (False,True,'repo-1'),    # and the lowest-numbered scanned copy still wins
+],ids=['cached','uncached','uncached_with_scanned_repo1'])
+@pytest.mark.parametrize('mode',['fast','agentic'])
+def test_choosing_the_write_target_never_calls_gh(cfg,store,tmp_path,monkeypatch,mode,cached,scanned_repo1,expected):
+    """BL-13 review: _write_target resolved the repo-0 sibling with gh, which
+    has a 10 s timeout and can run inside the incident-job write transaction.
+    It now reads only local git config and project_identity_cache."""
+    log=recording_gh(tmp_path,monkeypatch)
+    incident,clones=widget_clones(store,tmp_path,cached=cached,scanned_repo1=scanned_repo1)
+    learning=mine(store,cfg,incident,agentic_payload(),mode,'run',tmp_path,monkeypatch)
+    assert not log.exists(),log.read_text()
+    assert learning['primary_project_path']==clones[expected],learning['primary_project_path']
+
+
+@pytest.mark.parametrize('mode',['fast','agentic'])
+def test_a_repo_0_whose_origin_differs_only_in_case_is_still_the_target(cfg,store,tmp_path,monkeypatch,mode):
+    """BL-13 second review: the cache lookup was case-exact. An unscanned
+    repo-0 whose origin is Acme/Widget missed the cached acme/widget entry,
+    so the learning went to repo-3; the old gh path picked repo-0. GitHub
+    names are case-insensitive, as rejections._same_remote already says."""
+    log=recording_gh(tmp_path,monkeypatch)
+    incident,clones=widget_clones(store,tmp_path,cached=True,repo0_remote='git@github.com:Acme/Widget.git')
+    learning=mine(store,cfg,incident,agentic_payload(),mode,'run',tmp_path,monkeypatch)
+    assert not log.exists(),log.read_text()
+    assert learning['primary_project_path']==clones['repo-0'],learning['primary_project_path']
+
+
+def test_case_insensitive_lookup_refuses_entries_that_disagree(store,tmp_path):
+    """Two cached spellings that differ only in case but name different
+    repositories cannot pick one. The exact spelling still resolves, and a
+    host other than github.com is compared exactly."""
+    from self_improve.miner import _cache_only_resolver
+    from self_improve.store import utc_now_iso
+    from tests.test_scan_observations import make_repo
+    for norm,key in (('github.com/acme/widget','github:1'),('github.com/ACME/widget','github:2'),
+                     ('gitlab.com/acme/widget','gitlab-fixture')):
+        store.insert('project_identity_cache',{'remote_norm':norm,'project_key':key,'display':norm,
+            'method':'gh_repo_id','resolved_at':utc_now_iso()})
+    store.commit()
+    resolve=_cache_only_resolver(store)
+    assert resolve(make_repo(tmp_path/'a',remote='git@github.com:Acme/Widget.git'))=='remote:github.com/Acme/Widget'
+    assert resolve(make_repo(tmp_path/'b',remote='git@github.com:ACME/widget.git'))=='github:2'
+    assert resolve(make_repo(tmp_path/'c',remote='git@gitlab.com:ACME/widget.git'))=='remote:gitlab.com/ACME/widget'
+
+
+@pytest.mark.parametrize('copy',['repo-3','repo-prod'])
+@pytest.mark.parametrize('spelling',['Acme/Widget','acme/widget'],ids=['other_case','cached_case'])
+@pytest.mark.parametrize('mode',['fast','agentic'])
+def test_a_remote_keyed_incident_is_upgraded_through_the_cache(cfg,store,tmp_path,monkeypatch,mode,spelling,copy):
+    """BL-13 third review: the scan left this clone set at the remote: key,
+    because gh failed or was off. Another clone set reached gh, so the cache
+    maps github.com/acme/widget to github:4242. The sibling repo-0 resolved
+    to github:4242 and the incident's key did not, so repo-0 was refused.
+    The incident's key now goes through the same cache lookup first."""
+    from self_improve.store import utc_now_iso
+    from tests.test_scan_observations import make_repo
+    log=recording_gh(tmp_path,monkeypatch)
+    clones=tmp_path/'Code'/'Widget'
+    copies={name:make_repo(clones/name,remote='git@github.com:'+spelling+'.git')
+            for name in ('repo-0','repo-3','repo-prod')}
+    store.insert('project_identity_cache',{'remote_norm':'github.com/acme/widget','project_key':'github:4242',
+        'display':'acme/widget','method':'gh_repo_id','resolved_at':utc_now_iso()})
+    key='remote:github.com/'+spelling
+    session=str(tmp_path/'s.jsonl')
+    incident=seed_incident(store,session,project=copies[copy])
+    store.update('sessions','file_path',session,{'project_key':key})
+    store.update('incidents','id',incident['id'],{'project_key':key});store.commit()
+    incident=store.query_one('SELECT * FROM incidents WHERE id=?',(incident['id'],))
+    learning=mine(store,cfg,incident,agentic_payload(),mode,'run',tmp_path,monkeypatch)
+    assert not log.exists(),log.read_text()
+    assert learning['primary_project_path']==copies['repo-0'],learning['primary_project_path']
+
+
+def test_case_insensitive_lookup_matches_only_ascii_names(store,tmp_path):
+    """GitHub names are ASCII. casefold() maps the long s to s and lower()
+    maps the Kelvin sign to k, so either alone can match a name GitHub
+    would not accept to a cached one. A non-ASCII name keeps its remote: key."""
+    from self_improve.miner import _cache_only_resolver
+    from self_improve.store import utc_now_iso
+    from tests.test_scan_observations import make_repo
+    store.insert('project_identity_cache',{'remote_norm':'github.com/kit/widgets','project_key':'github:1',
+        'display':'kit/widgets','method':'gh_repo_id','resolved_at':utc_now_iso()})
+    store.commit()
+    resolve=_cache_only_resolver(store)
+    assert resolve(make_repo(tmp_path/'a',remote='git@github.com:KIT/Widgets.git'))=='github:1'
+    assert resolve(make_repo(tmp_path/'b',remote='git@github.com:Kit/widgets.git'))=='remote:github.com/Kit/widgets'
+    assert resolve(make_repo(tmp_path/'c',remote='git@github.com:kit/widgetſ.git'))=='remote:github.com/kit/widgetſ'

@@ -159,12 +159,18 @@ def test_download_detects_changes_inside_the_read_before_yielding(bundle,monkeyp
     shown=run_artifacts.read(store,'one','report')
     chunks,_,close=run_artifacts.download(store,'one','report',shown['version'])
     original_read=os.read
+    before=os.stat(file)
     def changed(fd,n):
         file.write_bytes(b'MUTATED!')
+        # Same size, so only the timestamps reveal the write. Linux file
+        # timestamps can stay equal within one clock tick, so set a later
+        # mtime explicitly rather than rely on the write moving it (BL-65).
+        os.utime(file,ns=(before.st_atime_ns,before.st_mtime_ns+1_000_000_000))
         return original_read(fd,n)
     monkeypatch.setattr(run_artifacts.os,'read',changed)
     try:
         with pytest.raises(run_artifacts.ArtifactError,match='changed during download'):next(chunks)
+        assert os.stat(file).st_size==before.st_size
     finally:close()
 
 

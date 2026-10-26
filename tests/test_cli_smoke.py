@@ -23,7 +23,7 @@ from self_improve.store import Store
 READ_ONLY = ["status", "contradictions"]
 HELP_ONLY = [
     "run", "scan", "rescan", "report", "rollback", "self-eval",
-    "search-learnings", "eval-retrieval", "backfill-project-keys",
+    "search-learnings", "eval-retrieval", "eval-filter", "backfill-project-keys",
     "rebuild-state", "install-launchd", "worker", "upgrade-state", "service",
 ]
 
@@ -211,6 +211,18 @@ def test_every_subcommand_is_covered(capsys):
     # then check the help mentions nothing obviously missing from our list.
     for cmd in known:
         assert cmd in text, f"{cmd} vanished from the CLI"
+
+
+def test_rebuild_help_says_what_rebuild_keeps(capsys):
+    """Review nit (BL-26): the help said rebuild keeps only incidents whose
+    transcripts are already deleted. It also keeps changed transcripts and
+    incidents that no scan produced."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "already deleted" not in text
+    assert "changed under a retained line hash" in text
+    assert "an incident no scan produced" in text
 
 
 def _applied(db) -> set[str]:
@@ -507,6 +519,105 @@ def test_contradictions_says_when_it_has_never_been_computed(tmp_path, capsys):
     assert out.strip() != "No open contradictions.", out
 
 
+def _contradictions_cli(tmp_path, capsys, entry, verdict_rows: int) -> str:
+    """Run `selfimprove contradictions` over one invented run whose stats
+    hold ``entry`` and which stored ``verdict_rows`` compatible verdicts."""
+    import json
+
+    from self_improve.store import Store, new_id, utc_now_iso
+
+    store = Store(tmp_path / "state.db")
+    run_id = new_id()
+    store.insert("runs", {
+        "id": run_id, "started": utc_now_iso(), "finished": utc_now_iso(),
+        "status": "ok", "report_path": "",
+        "stats_json": json.dumps({"contradictions": entry}),
+    })
+    for i in range(verdict_rows):
+        store.insert("contradictions", {
+            "id": new_id(), "run_id": run_id, "file_a": f"/f/a{i}.md",
+            "unit_a": f"invented unit a {i}", "file_b": f"/f/b{i}.md",
+            "unit_b": f"invented unit b {i}", "cosine": 0.7, "verdict": "compatible",
+            "explanation": "invented", "status": "new", "created_at": utc_now_iso(),
+        })
+    store.commit()
+    store.close()
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(f'state_dir = "{tmp_path}"\n')
+    assert main(["--config", str(cfg_path), "contradictions"]) == 0
+    return capsys.readouterr().out
+
+
+def test_contradictions_counts_an_older_refusal_after_stored_verdicts(tmp_path, capsys):
+    """Review fix (BL-37): a refusal stored before BL-37 has the older
+    {"skipped": "budget_exhausted"} shape, written even after verdicts were
+    stored. The CLI said "No contradiction has ever been computed" while the
+    run's two verdicts were in the table."""
+    out = _contradictions_cli(tmp_path, capsys, {"skipped": "budget_exhausted"}, 2)
+    assert out.strip() == "No open contradictions.", out
+
+
+def test_contradictions_says_a_rebuild_removes_an_older_refusals_verdicts(tmp_path, capsys):
+    """Review fix (BL-37): with no verdict from an older-shape refusal in the
+    database, the reason must not read as "the run stored none". A state
+    rebuild deletes every contradictions row."""
+    out = _contradictions_cli(tmp_path, capsys, {"skipped": "budget_exhausted"}, 0)
+    assert ("  what the runs recorded instead: skipped: budget_exhausted, and this "
+            "database holds no verdict from that run; a state rebuild removes stored "
+            "verdicts x1") in out, out
+
+
+def test_contradictions_never_claims_nothing_was_computed_beside_stored_verdicts(tmp_path, capsys):
+    """A sweep that raised after storing a verdict did not complete, but a
+    verdict was computed, so the CLI must not say none ever was."""
+    out = _contradictions_cli(tmp_path, capsys, {"error": "RuntimeError: invented"}, 1)
+    assert "ever been computed" not in out, out
+    assert ("Contradiction detection has not completed in any recorded run, so this "
+            "is NOT 'checked and found none'.") in out, out
+    assert "error: RuntimeError: invented x1" in out, out
+
+
+def test_contradictions_says_not_computed_when_the_budget_refused_every_judgment(tmp_path, capsys):
+    """BL-37 review: a sweep that found 4 candidates and judged none, because
+    the shared call budget was spent, printed 'No open contradictions.'
+
+    The stats come from the real refusal path (judge_pairs behind the
+    pipeline's _refusable wrapper), not from a typed dict.
+    """
+    import json
+    from pathlib import Path
+
+    from self_improve.config import Config
+    from self_improve.contradictions import JudgeRefused, judge_pairs
+    from self_improve.pipeline import BudgetExhaustedSignal, _refusable
+    from self_improve.store import Store, new_id, utc_now_iso
+
+    def spent(prompt):
+        raise BudgetExhaustedSignal("cheap pool spent")
+
+    store = Store(tmp_path / "state.db")
+    cands = [{"file_a": f"/f/a{i}.md", "unit_a": f"unit a {i}", "file_b": f"/f/b{i}.md",
+              "unit_b": f"unit b {i}", "cosine": 0.7} for i in range(4)]
+    prompts = Path(__file__).resolve().parents[1] / "prompts"
+    stats = judge_pairs(store, Config(), cands, _refusable(spent, JudgeRefused), prompts, "r1")
+    assert stats["judged"] == 0 and stats["budget_deferred"] == 4, stats
+    store.insert("runs", {
+        "id": new_id(), "started": utc_now_iso(), "finished": utc_now_iso(),
+        "status": "ok", "report_path": "", "stats_json": json.dumps({"contradictions": stats}),
+    })
+    store.commit()
+    store.close()
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(f'state_dir = "{tmp_path}"\n')
+    rc = main(["--config", str(cfg_path), "contradictions"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No open contradictions." not in out, out
+    assert "has not completed in any recorded run" in out, out
+    assert "call budget refused every judgment x1" in out, out
+
+
 def test_contradictions_says_none_when_it_really_did_run(tmp_path, capsys):
     """The complement: a completed stage with no findings still says so."""
     import json
@@ -518,7 +629,7 @@ def test_contradictions_says_none_when_it_really_did_run(tmp_path, capsys):
     store.insert("runs", {
         "id": new_id(), "started": utc_now_iso(), "finished": utc_now_iso(),
         "status": "ok", "report_path": "",
-        "stats_json": json.dumps({"contradictions": {"candidates": 4, "judged": 4, "found": 0}}),
+        "stats_json": json.dumps({"contradictions": {"candidates": 4, "judged": 4, "judge_failed": 0, "deferred": 0}}),
     })
     store.commit()
     store.close()
@@ -551,3 +662,87 @@ def test_worker_once_dispatches_and_exits_on_an_empty_queue(cfg_file, tmp_path):
     before=_applied(tmp_path/'state'/'state.db')
     assert main(['--config',cfg_file,'worker','--once'])==0
     assert _applied(tmp_path/'state'/'state.db')==before
+
+
+def test_reverify_partial_marks_only_partial_sessions_through_the_cli(cfg_file, tmp_path, capsys):
+    """BL-54: the reverify-partial command's wiring had no test; only its helper did."""
+    import json as _json
+    transcript = tmp_path / "claude" / "projects" / "-w" / "s.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n")
+    store = Store(tmp_path / "state" / "state.db")
+    for path, status in ((str(transcript), "partial"), (str(tmp_path / "gone.jsonl"), "partial"),
+                         (str(tmp_path / "ok.jsonl"), "ok")):
+        store.upsert_session({"file_path": path, "source": "claude", "session_id": path, "project_path": "/p",
+            "headless": 0, "is_subagent": 0, "first_ts": "", "last_ts": "", "mtime": 5.0, "file_size": 3,
+            "bytes_scanned": 3, "lines_scanned": 1, "malformed_lines": 1, "status": status, "error": "",
+            "last_scanned_at": "2026-10-12T00:00:00Z"})
+    store.commit()
+    store.close()
+    assert main(["--config", cfg_file, "reverify-partial", "--mark-only"]) == 0
+    printed = _json.loads(capsys.readouterr().out)
+    assert printed["partial_before"] == 2
+    assert printed["marked"]["marked_for_full_reread"] == 1 and printed["marked"]["skipped_transcript_gone"] == 1
+    store = Store(tmp_path / "state" / "state.db", read_only=True)
+    try:
+        rows = {r["file_path"]: r for r in store.query("SELECT file_path, bytes_scanned, malformed_lines FROM sessions")}
+    finally:
+        store.close()
+    assert rows[str(transcript)]["bytes_scanned"] == 0 and rows[str(transcript)]["malformed_lines"] == 1
+    assert rows[str(tmp_path / "ok.jsonl")]["bytes_scanned"] == 3
+
+
+def test_reverify_partial_rereads_flagged_sessions_and_records_its_dry_run(cfg_file, tmp_path, capsys):
+    """Review fix (BL-54): the earlier test stopped at --mark-only, which
+    returns before the dry-run pipeline. The full command re-reads each
+    flagged session, clears the flag only where every byte now parses,
+    prints the cleared count, and writes one dry-run row to runs."""
+    import json as _json
+
+    def line(text, minute):
+        return _json.dumps({"type": "user", "timestamp": f"2026-10-12T10:{minute:02d}:00Z", "cwd": "/w",
+                            "sessionId": "invented", "entrypoint": "cli",
+                            "message": {"role": "user", "content": text}}) + "\n"
+
+    project = tmp_path / "claude" / "projects" / "-w"
+    project.mkdir(parents=True)
+    repaired = project / "11111111-1111-4111-8111-111111111111.jsonl"
+    repaired.write_text(line("an invented request", 0) + line("an invented follow-up", 1))
+    broken = project / "22222222-2222-4222-8222-222222222222.jsonl"
+    broken.write_text(line("an invented request", 0) + "this line is not json\n")
+    assert main(["--config", cfg_file, "run", "--dry-run"]) == 0
+    db = tmp_path / "state" / "state.db"
+    store = Store(db)
+    try:
+        status = {r["file_path"]: r["status"] for r in store.query("SELECT file_path, status FROM sessions")}
+        assert status == {str(repaired): "ok", str(broken): "partial"}
+        # An earlier read failed on the repaired file; its bytes now all parse.
+        store.update("sessions", "file_path", str(repaired), {"status": "partial", "malformed_lines": 1})
+        store.commit()
+        runs_before = {r["id"] for r in store.query("SELECT id FROM runs")}
+    finally:
+        store.close()
+    capsys.readouterr()
+
+    assert main(["--config", cfg_file, "reverify-partial"]) == 0
+    out, decoder, printed, position = capsys.readouterr().out, _json.JSONDecoder(), [], 0
+    while out[position:].strip():
+        position += len(out[position:]) - len(out[position:].lstrip())
+        value, position = decoder.raw_decode(out, position)
+        printed.append(value)
+    marked, result = printed
+    assert marked["partial_before"] == 2 and marked["marked"]["marked_for_full_reread"] == 2
+    assert (result["partial_before"], result["partial_after"], result["cleared"]) == (2, 1, 1)
+    assert [r["file_path"] for r in result["still_partial"]] == [str(broken)]
+
+    store = Store(db, read_only=True)
+    try:
+        status = {r["file_path"]: r["status"] for r in store.query("SELECT file_path, status FROM sessions")}
+        new_runs = [r for r in store.query("SELECT * FROM runs") if r["id"] not in runs_before]
+    finally:
+        store.close()
+    assert status == {str(repaired): "ok", str(broken): "partial"}
+    assert len(new_runs) == 1 and new_runs[0]["status"] == "ok" and new_runs[0]["finished"]
+    stats = _json.loads(new_runs[0]["stats_json"])
+    assert stats["dry_run"] is True and stats["review_only"] is False
+    assert stats["scan"] == result["scan"]

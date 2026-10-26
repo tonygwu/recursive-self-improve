@@ -2241,13 +2241,19 @@ code, kbd, samp, .mono {
 }
 
 .review-card__eval--never_reproduced,
+.review-card__eval--with_arm_skipped,
 .review-card__eval--both_arms_failed,
+.review-card__eval--mixed_models,
 .review-card__eval--no_trial_ran {
   border-left-color: var(--c-status-partial);
 }
 
 .review-card__eval--tested {
   border-left-color: var(--c-status-ok);
+}
+
+.review-card__eval--rule_failed {
+  border-left-color: var(--c-status-fail);
 }
 
 .review-card__eval--no_arms {
@@ -2858,8 +2864,11 @@ code, kbd, samp, .mono {
 .overview-page {display:flex;flex-direction:column;gap:12px;}
 .overview-page > * {margin-bottom:0;}
 .overview-page .view__head {margin-bottom:0;}
-.overview-status {background:var(--c-bg-surface);border:1px solid var(--c-border-default);border-radius:10px;padding:12px 18px;box-shadow:var(--e-raised);}
-.overview-status .statusline {font-size:16px;line-height:22px;font-weight:600;letter-spacing:-.1px;margin:0 0 6px;}
+/* The coverage disclosure shares the status line while closed and takes the full width when open. */
+.overview-status {display:flex;flex-wrap:wrap;align-items:baseline;column-gap:12px;background:var(--c-bg-surface);border:1px solid var(--c-border-default);border-radius:10px;padding:12px 18px;box-shadow:var(--e-raised);}
+.overview-status .statusline {font-size:16px;line-height:22px;font-weight:600;letter-spacing:-.1px;margin:0;}
+.overview-status > details {margin:0;}
+.overview-status > details[open] {flex-basis:100%;margin-top:6px;}
 .overview-loop {background:var(--c-bg-surface);border:1px solid var(--c-border-default);border-radius:10px;box-shadow:var(--e-raised);padding:8px 16px;}
 .overview-loop__steps {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:16px;margin:0;padding:0;list-style:none;}
 .overview-loop__steps a {display:flex;flex-direction:column;gap:1px;color:var(--c-text-primary);text-decoration:none;}
@@ -2878,6 +2887,11 @@ code, kbd, samp, .mono {
 .overview-page .tile {padding:12px 16px;}
 .overview-run-columns {display:grid;grid-template-columns:minmax(0,1.35fr) minmax(260px,1fr);gap:18px;align-items:start;}
 .overview-run-columns .run-grid {width:100%;min-width:480px;}
+.overview-run-main {min-width:0;}
+.overview-run-guide {display:flex;flex-wrap:wrap;align-items:baseline;gap:0 12px;margin-top:6px;}
+.overview-run-guide:empty {display:none;}
+.overview-run-guide > p,.overview-run-guide > details {margin:0;}
+.overview-run-guide > details[open] {flex-basis:100%;}
 .overview-run-columns .run-grid__stage {width:60px;min-width:60px;}
 .overview-latest {display:grid;grid-template-columns:48px minmax(0,1fr);gap:0 8px;margin:4px 0;font-size:12px;line-height:18px;}
 .overview-latest dt,.overview-latest dd {margin:0;overflow-wrap:anywhere;}
@@ -3131,3 +3145,9 @@ code, kbd, samp, .mono {
 .run-backlog__summary { flex: 1; margin: 0; line-height: 1.55; }
 .run-backlog__heading .btn { flex-shrink: 0; }
 @media (max-width: 760px) { .run-backlog__heading { flex-direction: column; gap: 4px; } }
+
+/* Operator context separates the proposed instruction from its evidence. */
+.review-context-label { font: inherit; font-weight: 600; color: var(--c-text-muted); margin: 1.25rem 0 .5rem; }
+.review-card__body > .review-context-label:first-child { margin-top: 0; }
+.pipeline-guide { margin-top: 1rem; max-width: 76ch; }
+.pipeline-guide p { margin: .75rem 0; }

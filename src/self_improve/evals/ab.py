@@ -49,7 +49,11 @@ def effectiveness_delta(
 
 
 def find_spec(
-    learning_id: str, primary_dir: Path, *, fallback_dir: Path | None = None
+    learning_id: str,
+    primary_dir: Path,
+    *,
+    fallback_dir: Path | None = None,
+    spec_id: str = "",
 ) -> Path | None:
     """Locate a learning's eval spec, newest evidence first.
 
@@ -61,15 +65,31 @@ def find_spec(
 
     The state dir wins a tie: a freshly generated spec is newer evidence than a
     committed one.
+
+    The majority gate writes one spec per scenario, ``<learning-id>-s<N>``.
+    ``spec_id`` names the scenario that decided the applied proposal's gate;
+    it is tried before the legacy ``<learning-id>`` name.
     """
-    primary = Path(primary_dir) / f"{learning_id}.yaml"
-    if primary.is_file():
-        return primary
-    if fallback_dir is not None:
-        candidate = Path(fallback_dir) / f"{learning_id}.yaml"
-        if candidate.is_file():
-            return candidate
+    names = [n for n in (spec_id, learning_id) if n]
+    for directory in (primary_dir, fallback_dir):
+        if directory is None:
+            continue
+        for name in names:
+            candidate = Path(directory) / f"{name}.yaml"
+            if candidate.is_file():
+                return candidate
     return None
+
+
+def _deciding_spec_id(store: Store, proposal_id: str, learning_id: str) -> str:
+    """The spec id of the scenario that decided an applied proposal's gate."""
+    row = store.query_one(
+        "SELECT e.subject_id FROM proposals p JOIN eval_results e ON e.id = p.eval_result_id "
+        "WHERE p.id = ? AND e.kind = 'regression'",
+        (proposal_id,),
+    )
+    spec_id = row["subject_id"] if row else ""
+    return spec_id if spec_id.startswith(f"{learning_id}-s") else ""
 
 
 def rerun_applied(
@@ -91,8 +111,11 @@ def rerun_applied(
     candidate whose spec YAML (``<regression_dir>/<learning-id>.yaml``) is
     missing is skipped and counted as ``skipped_no_spec`` — it does NOT
     consume a cap slot (a skip runs no trials, and the cap exists to bound
-    trial cost). Once the cap is reached every remaining candidate is
-    counted as ``deferred``.
+    trial cost). Two more skips also run before the cap and use no slot: a
+    candidate whose latest applied proposal is a ``delete`` (the rule was
+    already removed) counts as ``skipped_delivered_delete``, and one with an
+    open delete proposal counts as ``skipped_open_delete``. Once the cap is
+    reached every remaining candidate is counted as ``deferred``.
 
     Per processed learning, ``cfg.eval_trials`` trials run via
     ``harness.run_trials`` with ``rule_text=None``. Verdict:
@@ -118,7 +141,8 @@ def rerun_applied(
     id raises ``SpecError``.
 
     Returns ``{attempted, still_needed, prunable, inconclusive,
-    skipped_no_spec, deferred, proposals}`` where
+    skipped_no_spec, skipped_open_delete, skipped_delivered_delete, deferred,
+    proposals}`` where
     attempted == still_needed + prunable + inconclusive.
     """
     regression_dir = Path(regression_dir)
@@ -130,7 +154,7 @@ def rerun_applied(
     # after a rollback keeps its most recent target_path), oldest applied
     # rules first so long-standing rules are re-tested before fresh ones.
     rows = store.query(
-        "SELECT l.id AS learning_id, p.id AS proposal_id, p.target_path, p.applied_at "
+        "SELECT l.id AS learning_id, p.id AS proposal_id, p.target_path, p.target_kind, p.action, p.applied_at "
         "FROM learnings l JOIN proposals p ON p.learning_id = l.id "
         "WHERE l.status = 'applied' AND p.status = 'applied' "
         "AND p.applied_at = ("
@@ -152,17 +176,34 @@ def rerun_applied(
             f"so their target_path is unknown: {orphaned}"
         )
 
+    # A delete proposal that is still open already carries this rule's result.
+    # Re-testing it spends gate calls and files a duplicate for the same line.
+    from ..store import TERMINAL_STATUSES
+    open_deletes = {r["learning_id"] for r in store.query(
+        "SELECT DISTINCT learning_id FROM proposals WHERE action = 'delete' AND status NOT IN ("
+        + ",".join("?" * len(TERMINAL_STATUSES)) + ")", TERMINAL_STATUSES)}
     counts = {
         "attempted": 0,
         "still_needed": 0,
         "prunable": 0,
         "inconclusive": 0,
         "skipped_no_spec": 0,
+        "skipped_open_delete": 0,
+        "skipped_delivered_delete": 0,
         "deferred": 0,
     }
     proposals: list[dict] = []
     for cand in candidates:
         lid = cand["learning_id"]
+        # Nothing sets a learning to 'pruned', so a delivered delete leaves it
+        # 'applied' with the delete as its latest applied proposal. The rule
+        # is gone from the file; re-testing it only spends gate calls.
+        if cand["action"] == "delete":
+            counts["skipped_delivered_delete"] += 1
+            continue
+        if lid in open_deletes:
+            counts["skipped_open_delete"] += 1
+            continue
         if counts["attempted"] >= cfg.ab_prune_max_rules_per_run:
             counts["deferred"] += 1
             continue
@@ -172,7 +213,9 @@ def rerun_applied(
         history = eval_history.begin(store,cfg,learning,proposal,run_id=run_id,kind='without_rule_rerun')
         history.event('scenario:0:with:skipped','arm_skipped',
                       {'reason':'without_rule_only_rerun'},scenario=0,arm='with')
-        spec_path = find_spec(lid, regression_dir, fallback_dir=fallback_spec_dir)
+        deciding = _deciding_spec_id(store, cand["proposal_id"], lid)
+        spec_path = find_spec(lid, regression_dir, fallback_dir=fallback_spec_dir,
+                              spec_id=deciding)
         if spec_path is None:
             counts["skipped_no_spec"] += 1
             history.event('skip:missing_spec','attempt_stopped',
@@ -180,7 +223,7 @@ def rerun_applied(
             continue
         try:
             spec = load_spec(spec_path)
-            if spec.id != lid:
+            if spec.id not in {lid, deciding} - {""}:
                 raise SpecError(
                     f"{spec_path}: spec id {spec.id!r} does not match learning id {lid!r}"
                 )
@@ -257,6 +300,7 @@ def rerun_applied(
                 {
                     "learning_id": lid,
                     "target_path": cand["target_path"],
+                    "target_kind": cand["target_kind"],
                     "action": "delete",
                     "marker_id": lid,
                     "eval_result_id": eval_result_id,
@@ -272,9 +316,18 @@ def rerun_applied(
             "has an applied proposal row to take a target_path from"
         )
     elif counts["attempted"] == 0:
+        # Name every skip that was counted, so the reason cannot contradict them.
+        skips = [(key, code, words) for key, code, words in (
+            ("skipped_delivered_delete", "delivered_delete",
+             "already had their delete delivered as their latest applied change"),
+            ("skipped_open_delete", "open_delete", "already have an open delete proposal awaiting review"),
+            ("skipped_no_spec", "no_spec", "had no regression spec to re-run"),
+            ("deferred", "deferred", "were deferred by the per-run cap"),
+        ) if counts[key]]
         reason = (
-            f"no_spec: {len(candidates)} candidate(s) considered, none had a "
-            "regression spec to re-run"
+            "+".join(code for _, code, _ in skips)
+            + f": {len(candidates)} candidate(s) considered; "
+            + "; ".join(f"{counts[key]} {words}" for key, _, words in skips)
         )
     else:
         reason = ""

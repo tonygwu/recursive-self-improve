@@ -146,3 +146,56 @@ def test_full_member_evidence_and_eval_are_returned_without_truncation(env):
         assert len(evidence) == 7
         assert json.loads(evidence[-1]['window_json'])[0]['text'].endswith('tail-6')
     assert store.query('SELECT * FROM proposal_revisions') == [], 'preview writes must remain empty'
+
+
+# Targets whose line boundaries the '\n'-joined applier would rewrite (BL-15),
+# with the phrase the refusal names. The last one has no final newline, and
+# the edit sits in the middle of the file, outside the last line's hunk.
+REWRITTEN_TARGETS = {
+    'crlf': (b'# Rules\r\n\r\n- keep tests green\r\n', 'line boundaries'),
+    'form_feed': (b'# Rules\n\x0c\n- keep tests green\n', 'line boundaries'),
+    'no_final_newline': (b'# Rules\n\n- keep tests green\n\n## Commands\n\n- make\n- make test', 'final newline'),
+}
+
+
+def _lf_edit(raw):
+    """The edit a proposal builder makes: it sees splitlines() rejoined with LF."""
+    lf = '\n'.join(raw.decode('utf-8').splitlines()) + '\n'
+    return lf, lf.replace('- keep tests green\n', '- keep tests green\n- new rule\n', 1)
+
+
+@pytest.mark.parametrize('name', sorted(REWRITTEN_TARGETS))
+def test_combine_edits_refuses_a_target_whose_line_endings_it_would_rewrite(name):
+    """Review of BL-15: without the refusal, combine_edits rewrote a CRLF
+    target ('CR bytes before 3 after 0') and offered that as the reviewed edit."""
+    from self_improve.propose import UnsupportedLineEndings, make_unified_diff
+    from self_improve.review import combine_edits
+    raw, phrase = REWRITTEN_TARGETS[name]
+    diff = make_unified_diff(*_lf_edit(raw), 'AGENTS.md')
+    with pytest.raises(UnsupportedLineEndings, match=phrase):
+        combine_edits(raw.decode('utf-8'), [diff], 'AGENTS.md')
+
+
+@pytest.mark.parametrize('name', sorted(REWRITTEN_TARGETS))
+def test_a_preview_cannot_approve_an_edit_that_would_rewrite_line_endings(env, name):
+    """Review of BL-15: prepare_targets is the review-time refusal. The
+    target stays unchanged and no command is recorded."""
+    cfg, store, target, before, a, b = env
+    raw, phrase = REWRITTEN_TARGETS[name]
+    target.write_bytes(raw)
+    store.update('proposals', 'id', a['id'], {'diff_unified': make_diff(*_lf_edit(raw))})
+    store.commit()
+    with TestClient(create_app(cfg)) as client:
+        shown = preview(client, a)
+        refused = shown['targets'][0]
+        assert refused['state'] == 'conflict', refused
+        assert phrase in refused['detail'], refused
+        # Review of BL-15: this used to read ConflictingEdits, which names a
+        # selection problem. The file itself must change first.
+        assert refused['error_code'] == 'UnsupportedLineEndings', refused
+        assert shown['ready'] is False
+        response = client.post('/api/commands', json=approval(shown))
+    assert response.status_code == 409, response.text
+    assert response.json()['error'] == 'UnsupportedLineEndings', response.text
+    assert target.read_bytes() == raw
+    assert store.query('SELECT * FROM commands') == []

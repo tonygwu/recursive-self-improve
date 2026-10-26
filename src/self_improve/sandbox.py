@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 import subprocess
 import tempfile
 import uuid
@@ -93,6 +94,8 @@ def instruction_paths_to_protect(cfg) -> tuple[str, ...]:
             cfg.global_claude_md,
             cfg.codex_global_agents_md,
             cfg.skills_dir,
+            # Delivery targets can live outside the loaded files (docs/TARGETS.md).
+            *(cfg.delivery_path(kind) for kind in ("global_claude_md", "codex_global", "global_private", "skill")),
             str(Path(cfg.global_claude_md).expanduser().parent / "settings.json"),
             str(Path(cfg.state_dir).expanduser() / "state.db"),
         )
@@ -270,11 +273,14 @@ def verify_boundary(cfg, *, probe_root: str | Path | None = None) -> dict:
     return observed
 
 
-def agent_config_dir() -> str:
+def agent_config_dir(env: "Mapping[str, str] | None" = None) -> str:
     """The config directory the eval agent will run under.
 
-    Read from the environment rather than guessed. Setting CLAUDE_CONFIG_DIR to
-    a directory that has never been logged in scaffolds an empty account, so
-    the eval agent inherits whichever account the run already uses.
+    Read from the environment the agent is started with rather than guessed.
+    Pass that child environment: quota routing sets the picked account's
+    CLAUDE_CONFIG_DIR there, while the parent's (unset under launchd) names a
+    different account. Setting CLAUDE_CONFIG_DIR to a directory that has never
+    been logged in scaffolds an empty account, so nothing here invents one.
     """
-    return os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+    source = os.environ if env is None else env
+    return source.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))

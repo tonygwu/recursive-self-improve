@@ -410,3 +410,57 @@ def test_corrupt_projects_json_names_the_learning_not_a_character_offset():
     # The working path is untouched, including the already-a-list shortcut.
     assert _projects_of({"id": "L", "projects_json": '["/a"]'}) == ["/a"]
     assert _projects_of({"id": "L", "projects_json": ["/b"]}) == ["/b"]
+
+
+def test_a_refused_merge_call_is_counted_as_refused_and_keeps_its_items():
+    """BL-20: a budget refusal returned None and was counted as merge_failed."""
+    from self_improve.cluster import MergeRefused, merge_clusters
+
+    items = [{"id": "a", "rule_text": "x", "evidence_count": 1, "first_seen": ""},
+             {"id": "b", "rule_text": "y", "evidence_count": 1, "first_seen": ""}]
+
+    def refuse(_items):
+        raise MergeRefused("strong pool spent")
+
+    out, stats = merge_clusters([items], refuse)
+    assert (stats["merge_attempted"], stats["merge_refused"], stats["merge_failed"]) == (1, 1, 0)
+    assert [o["id"] for o in out] == ["a", "b"]
+
+
+def test_a_merge_with_a_personal_member_stays_personal_whatever_the_model_says():
+    a = learning("use the work account alias", scope="personal", evidence_count=2)
+    b = learning("use the work alias for mail", scope="project")
+    merged, _ = merge_clusters(
+        [[a, b]],
+        lambda items: {"decision": "merge", "generalized_rule": "canonical", "why": "w",
+                       "title": "T", "category": "process", "scope_guess": "global"},
+    )
+    assert merged[0]["scope"] == "personal"
+    plain, _ = merge_clusters(
+        [[learning("x one"), learning("x two")]],
+        lambda items: {"decision": "merge", "generalized_rule": "canonical", "why": "w",
+                       "title": "T", "category": "process", "scope_guess": "global"},
+    )
+    assert plain[0]["scope"] == "global"
+
+
+@pytest.mark.parametrize("scope", ["rule_path", "Global", ""])
+def test_a_merge_with_a_scope_outside_the_prompt_set_fails_and_keeps_items(scope):
+    a, b = learning("variant a"), learning("variant b")
+    merged, stats = merge_clusters(
+        [[a, b]],
+        lambda items: {"decision": "merge", "generalized_rule": "canonical", "why": "w",
+                       "title": "T", "category": "process", "scope_guess": scope},
+    )
+    assert stats["merge_failed"] == 1 and stats["merge_succeeded"] == 0
+    assert stats["taxonomy"] == {"merge_invalid_scope": 1}
+    assert sorted(m["id"] for m in merged) == sorted([a["id"], b["id"]])
+
+
+def test_merge_scopes_match_the_merge_prompt():
+    import re
+    from pathlib import Path
+    from self_improve.cluster import MERGE_SCOPES
+    text = (Path(__file__).resolve().parents[1] / "prompts" / "cluster_merge.md").read_text()
+    line = re.search(r"`scope_guess` is exactly one of (.*?)\.", text, re.DOTALL).group(1)
+    assert tuple(re.findall(r'"([a-z_]+)"', line)) == MERGE_SCOPES

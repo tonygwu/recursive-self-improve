@@ -16,6 +16,8 @@ from .store import PROPOSAL_ACTIONS, actor_for, new_id, utc_now_iso
 
 COMMAND_MIGRATION = '0010_dashboard_commands'
 COMMAND_STATES = frozenset({'queued', 'running', 'blocked', 'failed', 'cancelled', 'completed'})
+#: States the worker no longer acts on. Any other state still has a recovery owner.
+FINISHED_STATES = frozenset({'completed', 'cancelled'})
 COMMAND_ACTIONS = frozenset({'approve', 'reject_target', 'reject_lesson'})
 CONTROL_ACTIONS = frozenset({'retry_delivery', 'cancel_delivery'})
 CONTROL_MIGRATION = '0011_command_controls'

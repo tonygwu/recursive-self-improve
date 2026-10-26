@@ -159,3 +159,80 @@ def test_every_action_the_code_assigns_is_in_the_declared_vocabulary():
     assert len(assigned) >= 5, f"the scanner found only {assigned}; it is broken"
     unknown = assigned - PROPOSAL_ACTIONS
     assert unknown == set(), f"code writes actions the vocabulary does not declare: {sorted(unknown)}"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"gate_with_min_passes": 0},
+        {"gate_with_min_passes": -1},
+        {"gate_with_min_passes": 4, "eval_trials": 3},
+        {"gate_without_min_failures": 0},
+        {"gate_without_min_failures": 4, "eval_trials": 3},
+        {"eval_trials": 0},
+        {"eval_scenarios": 0},
+    ],
+)
+def test_configuration_cannot_lower_or_break_the_gate_bar(overrides):
+    """BL-02: a TOML line must not turn a rule that never helps into a pass."""
+    from self_improve.config import Config, ConfigError
+
+    with pytest.raises(ConfigError):
+        Config(**overrides)
+
+
+def test_a_loaded_config_cannot_lower_the_gate_bar(tmp_path):
+    from self_improve.config import ConfigError, load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text("gate_with_min_passes = 0\n")
+    with pytest.raises(ConfigError, match="gate_with_min_passes"):
+        load_config(path)
+
+
+def test_an_explicit_config_path_that_does_not_exist_fails_loud(tmp_path):
+    """BL-12: a typo in --config silently fell back to the default state dir."""
+    from self_improve.config import ConfigError, load_config
+
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_config(tmp_path / "no-such-config.toml")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'cluster_dup_cosine = "high"',
+        "cluster_group_cosine = true",
+        'contradiction_candidate_cosine = "0.5"',
+        'max_incidents_per_signal_per_session = "5"',
+        "max_incidents_per_signal_per_session = 1.5",
+    ],
+)
+def test_float_and_optional_int_keys_are_type_checked(tmp_path, line):
+    from self_improve.config import ConfigError, load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text(line + "\n")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_an_integer_is_accepted_for_a_float_key_and_an_int_for_an_optional_int(tmp_path):
+    from self_improve.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text("cluster_dup_cosine = 1\nmax_incidents_per_signal_per_session = 4\n")
+    cfg = load_config(path)
+    assert cfg.cluster_dup_cosine == 1.0 and isinstance(cfg.cluster_dup_cosine, float)
+    assert cfg.max_incidents_per_signal_per_session == 4
+
+
+def test_the_default_stale_run_threshold_outlasts_a_legal_run():
+    """BL-38: run_stale_after_hours was 6 while mining alone may run 12 hours,
+    so a manual run started mid-nightly reaped the live nightly as abandoned.
+    Since BL-55 the threshold applies only to legacy rows that record no
+    process; tests/test_run_liveness.py covers runs that record one."""
+    from self_improve.config import Config
+
+    cfg = Config()
+    assert cfg.run_stale_after_hours * 3600 > cfg.max_run_wall_seconds + 6 * 3600

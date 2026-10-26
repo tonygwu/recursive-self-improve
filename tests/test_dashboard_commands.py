@@ -270,3 +270,35 @@ def test_compatibility_approval_is_an_idempotent_command_adapter(env):
     assert first.json()['command']['id'] == second.json()['command']['id']
     assert len(store.query('SELECT * FROM commands')) == 1
     assert len(store.query('SELECT * FROM command_members')) == 1
+
+
+def _mutations(body):
+    member = body['members'][0]
+    return {
+        'unknown action': ({**body, 'action': 'apply_now'}, 400, 'UnknownCommand'),
+        'short request key': ({**body, 'request_key': 'short'}, 400, 'InvalidRequestKey'),
+        'request key with a slash': ({**body, 'request_key': 'request/../key'}, 400, 'InvalidRequestKey'),
+        'note that is not text': ({**body, 'note': 7}, 400, 'InvalidCommand'),
+        'member without revision': ({**body, 'members': [{'proposal_id': member['proposal_id']}]}, 400, 'InvalidMembers'),
+        'duplicate member': ({**body, 'members': [member, member]}, 400, 'InvalidMembers'),
+        'malformed member revision': ({**body, 'members': [{**member, 'revision': 'not-a-digest'}]}, 400, 'InvalidRevision'),
+        'malformed preview': ({**body, 'preview_revision': 'not-a-digest'}, 400, 'InvalidRevision'),
+        'approval without preview': ({k: v for k, v in body.items() if k != 'preview_revision'}, 409, 'FreshReviewRequired'),
+        'rejection carrying a preview': ({**body, 'action': 'reject_target'}, 400, 'InvalidCommand'),
+    }
+
+
+@pytest.mark.parametrize('case', list(_mutations({'members': [{'proposal_id': '', 'revision': ''}]})))
+def test_each_malformed_command_is_refused_by_name_and_writes_nothing(env, case):
+    """These request-validation refusals in commands.py had no test. Each
+    one must name its cause and record no command, member or decision."""
+    cfg, store, one, _ = env
+    events = store.query('SELECT * FROM proposal_events')
+    with TestClient(create_app(cfg)) as client:
+        body, status, code = _mutations(request(client, [one['id']]))[case]
+        response = client.post('/api/commands', json=body)
+    assert response.status_code == status, response.text
+    assert response.json()['error'] == code, response.text
+    assert store.query('SELECT * FROM commands') == []
+    assert store.query('SELECT * FROM proposal_events') == events
+    assert store.query_one('SELECT status FROM proposals WHERE id=?', (one['id'],))['status'] == 'ungated'

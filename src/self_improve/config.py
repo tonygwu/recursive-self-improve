@@ -57,6 +57,12 @@ class Config:
         ".self-improve/runs",
         "-self-improve-runs-",
     )
+    # Absolute directories whose sessions are never an instruction source or
+    # target: no AGENTS.md/CLAUDE.md under them enters the in-force corpus,
+    # the inventory, or a destination list. Their sessions are still scanned
+    # and mined; use denylist_substrings to stop that. Lexical match on whole
+    # path components, symlinks unresolved (see instruction_exclusions.py).
+    instruction_excluded_dirs: tuple[str, ...] = ()
 
     # --- runtime state (read-write, OUTSIDE the repo) ---
     state_dir: str = str(HOME / ".self-improve")
@@ -75,6 +81,13 @@ class Config:
     # Line budget for the global CLAUDE.md: at/over budget an addition must be
     # paired with a deletion proposal or demoted to a skill.
     global_claude_md_line_budget: int = 250
+    # Delivery targets: where instruction edits are WRITTEN. The keys above
+    # name what the harness LOADS (observation, in-force corpus, hooks); a
+    # loaded file can be a symlink into a checkout automation must not write.
+    # Set from the optional [targets] table in config.toml as sorted
+    # (key, absolute path) pairs; read only through delivery_path().
+    # See docs/TARGETS.md.
+    targets: tuple[tuple[str, str], ...] = ()
 
     # --- clustering / embeddings ---
     # Local static-embedding model (model2vec); rule text never leaves the
@@ -245,12 +258,16 @@ class Config:
     # the macOS monotonic clock pauses during sleep. The gate has its own budget.
     max_run_wall_seconds: int = 12 * 3600
 
-    # A run left in status='running' longer than this is assumed dead and is
-    # reaped as 'abandoned'. Generous on purpose: the nightly lock only
-    # serializes nightly-vs-nightly, so a manual run can legitimately be in
+    # Legacy rows only. A run now records its process (PID and start time) and
+    # is live exactly while that process exists (run_liveness.py), for both
+    # the stale-run reaper and Review, however long the run takes. A
+    # 'running' row written before that record existed has no process to
+    # check: it is assumed dead and reaped as 'abandoned' once it is older
+    # than this. Generous on purpose: a manual run can legitimately be in
     # flight while another process starts, and reaping a LIVE run would put a
-    # lie in the audit trail.
-    run_stale_after_hours: int = 6
+    # lie in the audit trail. Mining alone may run max_run_wall_seconds (12h),
+    # and the gate and report follow it, so this must exceed that with room.
+    run_stale_after_hours: int = 24
 
     # --- project identity ---
     # Resolve a repo's canonical key via `gh api repos/<owner>/<name>`, whose
@@ -300,10 +317,37 @@ class Config:
         __post_init__ runs for every Config. validate also checks source
         directories and is reserved for entry points that need those paths.
         """
+        # The gate's evidence bar. A value below one lets a rule pass without
+        # evidence; a value above eval_trials can never be met and silently
+        # holds every rule. Both are configuration errors, not tuning.
+        for name in ("eval_trials", "eval_scenarios"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ConfigError(f"{name} must be an integer >= 1, got {value!r}")
+        for name in ("gate_with_min_passes", "gate_without_min_failures"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= self.eval_trials:
+                raise ConfigError(
+                    f"{name} must be an integer from 1 to eval_trials "
+                    f"({self.eval_trials}), got {value!r}"
+                )
         if not isinstance(self.claude_managed_dir, str) or not Path(self.claude_managed_dir).is_absolute():
             raise ConfigError("claude_managed_dir must be an absolute directory")
         if not isinstance(self.claude_plugins_dir, str) or (self.claude_plugins_dir and not Path(self.claude_plugins_dir).is_absolute()):
             raise ConfigError("claude_plugins_dir must be empty or an absolute directory")
+        for entry in self.instruction_excluded_dirs:
+            # "~" is not expanded: an entry that silently matched nothing would
+            # leave the directory it names in force.
+            if not isinstance(entry, str) or not Path(entry).is_absolute():
+                raise ConfigError(
+                    f"instruction_excluded_dirs entries must be absolute directories, got {entry!r}"
+                )
+        # A frozen job plan round-trips Config through JSON, which turns the
+        # pairs into lists; restore the tuple form before checking it.
+        if isinstance(self.targets, list):
+            object.__setattr__(self, "targets", tuple(
+                tuple(pair) if isinstance(pair, list) else pair for pair in self.targets))
+        _check_targets(self.targets)
         from .store import PROPOSAL_ACTIONS
 
         unknown = sorted(set(self.review_queue_actions) - PROPOSAL_ACTIONS)
@@ -313,6 +357,21 @@ class Config:
                 f"any code writes. Known actions: {sorted(PROPOSAL_ACTIONS)}. "
                 "A carve-out naming an action nothing produces never fires."
             )
+
+    def delivery_path(self, kind: str) -> str:
+        """The path an edit of target ``kind`` is written to.
+
+        ``skill`` returns the directory that new skills are created in.
+        ``global_private`` returns "" when no private target is configured;
+        every other kind falls back to the matching load path.
+        """
+        if kind not in DELIVERY_KINDS:
+            raise ConfigError(f"no delivery target for kind {kind!r}; known kinds: {sorted(DELIVERY_KINDS)}")
+        key, fallback = DELIVERY_KINDS[kind]
+        configured = dict(self.targets).get(key)
+        if configured:
+            return configured
+        return getattr(self, fallback) if fallback else ""
 
     def validate(self) -> None:
         """Check that read-only source paths exist. Raises ConfigError."""
@@ -324,21 +383,92 @@ class Config:
 
 _FIELD_TYPES = {f.name: f for f in dataclasses.fields(Config)}
 
+# Proposal target kind -> ([targets] key, load-path field used when unset).
+# A private target has no load-path fallback: unset means not configured.
+DELIVERY_KINDS = {
+    "global_claude_md": ("global_public", "global_claude_md"),
+    "codex_global": ("codex_global", "codex_global_agents_md"),
+    "global_private": ("global_private", ""),
+    "skill": ("skills_dir", "skills_dir"),
+}
+TARGET_KEYS = frozenset(key for key, _ in DELIVERY_KINDS.values())
+
+
+def _check_targets(targets) -> None:
+    """Shape checks that need no filesystem access (run for every Config)."""
+    from .routing import _NEVER_WRITE_NAMES
+
+    if not isinstance(targets, tuple):
+        raise ConfigError(f"targets must be a tuple of (key, path) pairs, got {targets!r}")
+    seen = set()
+    for pair in targets:
+        if not (isinstance(pair, tuple) and len(pair) == 2):
+            raise ConfigError(f"targets entry must be a (key, path) pair, got {pair!r}")
+        key, value = pair
+        if key not in TARGET_KEYS:
+            raise ConfigError(f"Unknown targets key {key!r}. Known keys: {sorted(TARGET_KEYS)}")
+        if key in seen:
+            raise ConfigError(f"targets key {key!r} appears twice")
+        seen.add(key)
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise ConfigError(f"targets.{key} must be an absolute path, got {value!r}")
+        blocked = [part for part in Path(value).parts if part in _NEVER_WRITE_NAMES]
+        if blocked:
+            raise ConfigError(
+                f"targets.{key} = {value!r} is inside a {blocked[0]!r} checkout, which "
+                "automation never writes. Point it at a working clone instead.")
+
+
+def _load_targets(raw, path: Path) -> tuple[tuple[str, str], ...]:
+    """Validate the [targets] table, including the paths that must exist."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"targets in {path} must be a table ([targets]), got {raw!r}")
+    for key in raw:
+        if key not in TARGET_KEYS:
+            raise ConfigError(f"Unknown targets key {key!r} in {path}. Known keys: {sorted(TARGET_KEYS)}")
+    pairs = tuple(sorted(raw.items()))
+    _check_targets(pairs)
+    for key, value in pairs:
+        if key == "skills_dir":
+            if not Path(value).is_dir():
+                raise ConfigError(f"targets.skills_dir is not an existing directory: {value}")
+        elif not Path(value).parent.is_dir():
+            raise ConfigError(f"targets.{key}: parent directory does not exist: {value}")
+    return pairs
+
 
 def load_config(override_path: str | os.PathLike | None = None) -> Config:
-    """Load Config with optional TOML overrides. Unknown keys raise."""
+    """Load Config with optional TOML overrides. Unknown keys raise.
+
+    Only the default location may be absent. An explicitly named file that does
+    not exist is an error: falling back to defaults would point every command
+    at the default state directory.
+    """
     path = Path(override_path) if override_path else Path(HOME / ".self-improve" / "config.toml")
     if not path.exists():
+        if override_path:
+            raise ConfigError(f"Config file does not exist: {path}")
         return Config()
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     kwargs = {}
     for key, value in raw.items():
+        if key == "targets":
+            kwargs[key] = _load_targets(value, path)
+            continue
         if key not in _FIELD_TYPES:
             raise ConfigError(
                 f"Unknown config key {key!r} in {path}. Known keys: {sorted(_FIELD_TYPES)}"
             )
         default = getattr(Config(), key)
+        if default is None:
+            # Optional fields name their type in the annotation; TOML has no
+            # null, so a present value must be that type.
+            declared = str(_FIELD_TYPES[key].type)
+            if declared == "int | None":
+                default = 0
+            else:
+                raise ConfigError(f"Config key {key!r} has no load rule for type {declared!r}")
         if isinstance(default, tuple):
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ConfigError(f"Config key {key!r} must be a list of strings, got {value!r}")
@@ -349,6 +479,10 @@ def load_config(override_path: str | os.PathLike | None = None) -> Config:
         elif isinstance(default, int):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ConfigError(f"Config key {key!r} must be an int, got {value!r}")
+        elif isinstance(default, float):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ConfigError(f"Config key {key!r} must be a number, got {value!r}")
+            value = float(value)
         elif isinstance(default, str):
             if not isinstance(value, str):
                 raise ConfigError(f"Config key {key!r} must be a string, got {value!r}")

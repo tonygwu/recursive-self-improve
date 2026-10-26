@@ -501,3 +501,58 @@ def test_denylisted_cwd_marks_events(tmp_path):
     assert len(events) == 2
     assert all(e.meta["denylisted"] is True for e in events)
     assert src.parse_stats.denylisted_events == 2
+
+
+@pytest.mark.parametrize("source", [
+    "mcp", "internal", "some_future_value",
+    # Review of BL-39: an object source without "subagent" is unhashable, and
+    # the frozenset membership test raised TypeError on it.
+    {"review": {"kind": "pr"}}, ["a", "list"],
+])
+def test_an_unlisted_codex_source_is_counted_not_silently_interactive(tmp_path, source):
+    """BL-39: only exec, a subagent object or codex_exec counted as headless;
+    any other source was treated as interactive with no counter."""
+    path = tmp_path / "rollout-2026-08-10T10-00-00-a.jsonl"
+    meta = {"timestamp": "2026-08-10T10:00:00Z", "type": "session_meta", "payload": {
+        "id": "s", "session_id": "s", "cwd": str(tmp_path), "originator": "codex_cli_rs", "source": source}}
+    path.write_text(json.dumps(meta) + "\n")
+    src = CodexSource(Config(codex_sessions_dir=str(tmp_path), codex_archived_dir=str(tmp_path / "a")))
+    list(src.parse(str(path)))
+    assert src.parse_stats.malformed_taxonomy["session_meta_unknown_source"] == 1
+
+
+@pytest.mark.parametrize("source", ["cli", "vscode", "exec"])
+def test_a_listed_codex_source_is_not_counted_as_unknown(tmp_path, source):
+    path = tmp_path / "rollout-2026-08-10T10-00-00-b.jsonl"
+    meta = {"timestamp": "2026-08-10T10:00:00Z", "type": "session_meta", "payload": {
+        "id": "s", "session_id": "s", "cwd": str(tmp_path), "originator": "codex_cli_rs", "source": source}}
+    path.write_text(json.dumps(meta) + "\n")
+    src = CodexSource(Config(codex_sessions_dir=str(tmp_path), codex_archived_dir=str(tmp_path / "a")))
+    list(src.parse(str(path)))
+    assert src.parse_stats.malformed_taxonomy["session_meta_unknown_source"] == 0
+
+
+def test_a_resumed_parse_keeps_the_denylist_across_a_session_meta_without_id(tmp_path):
+    """Review of BL-06: _parse_inner keeps the previous denylist state through
+    a session_meta that has no id, but _prefix_state rebuilt it from the reset
+    cwd. A scan resumed after that record mined text the whole-file scan drops."""
+    denied = tmp_path / "denied-tree" / "project"
+    path = tmp_path / "rollout-2026-08-10T10-00-00-c.jsonl"
+    rows = [
+        {"timestamp": "2026-08-10T10:00:00Z", "type": "session_meta", "payload": {
+            "id": "s", "session_id": "s", "cwd": str(denied), "originator": "codex_cli_rs",
+            "source": "cli"}},
+        {"timestamp": "2026-08-10T10:00:01Z", "type": "session_meta", "payload": {"cwd": "/x"}},
+    ]
+    tail = {"timestamp": "2026-08-10T10:00:02Z", "type": "event_msg",
+            "payload": {"type": "user_message", "message": "keep this private"}}
+    head = "".join(json.dumps(r) + "\n" for r in rows)
+    path.write_text(head + json.dumps(tail) + "\n")
+    cfg = Config(codex_sessions_dir=str(tmp_path), codex_archived_dir=str(tmp_path / "a"),
+                 denylist_substrings=("denied-tree",))
+
+    whole = [e for e in CodexSource(cfg).parse(str(path)) if e.text == "keep this private"]
+    resumed = [e for e in CodexSource(cfg).parse(str(path), len(head.encode()))
+               if e.text == "keep this private"]
+    assert [e.meta["denylisted"] for e in whole] == [True]
+    assert [e.meta["denylisted"] for e in resumed] == [True]

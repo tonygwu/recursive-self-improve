@@ -20,13 +20,18 @@ TARGET_CLASSES = ("global", "project", "skill", "hook")
 TARGET_CLASS = {
     "global_claude_md": "global",
     "codex_global": "global",
+    # The private file shares the global class switch: it is user-wide, and a
+    # separate fifth class would need its own consent and dashboard row.
+    "global_private": "global",
     "project_agents_md": "project",
     "project_claude_md": "project",
     "rule_file": "project",
     "skill": "skill",
     "hook": "hook",
 }
-MANDATORY_REVIEW_ACTIONS = frozenset({"convert_to_hook", "delete_human_line", "resolve_rollback", "reapply", "recover_rule"})
+# "delete" removes a delivered machine rule on A/B evidence alone (three
+# without-rule trials, no majority vote), so it always needs a human.
+MANDATORY_REVIEW_ACTIONS = frozenset({"convert_to_hook", "delete", "delete_human_line", "resolve_rollback", "reapply", "recover_rule"})
 REASON_COPY = {
     "class_disabled": "automatic application is off for this target class.",
     "predates_class_enable": "this proposal predates the class switch and still needs your decision.",
@@ -40,6 +45,7 @@ REASON_COPY = {
     "target_rejected": "this lesson is rejected at this canonical target; other targets remain available.",
     "lesson_rejected": "this lesson is permanently rejected everywhere.",
     "fresh_approval_required": "this historical approval has no delivery command. Inspect the current combined edit and give fresh approval before anything can be written.",
+    "automatic_delivery_missed": "the run that could deliver this automatically ended without recording a delivery, so it needs your decision.",
 }
 
 
@@ -170,14 +176,41 @@ def automatic_permission(store, cfg, proposal: dict, *, review_only: bool = Fals
     if rejection:
         return {'allowed':False, 'reason':rejection['reason'], 'target_class':TARGET_CLASS.get(proposal.get('target_kind')),
                 'detail':rejection['detail']}
-    prior = store.query_one(
-        "SELECT id FROM proposals WHERE learning_id=? AND status='rolled_back' AND id!=? LIMIT 1",
-        (proposal["learning_id"], proposal["id"]),
-    )
+    learning = store.query_one("SELECT rule_text FROM learnings WHERE id=?", (proposal["learning_id"],))
+    prior = _prior_rollback(_rolled_back_index(store, exclude=proposal["id"]), proposal["learning_id"],
+                            learning["rule_text"] if learning else "")
     return automatic_eligibility(
         proposal, policy_snapshot(store), review_queue_actions=cfg.review_queue_actions,
-        review_only=review_only or originating_review_only(store, proposal), prior_rollback=prior["id"] if prior else "",
+        review_only=review_only or originating_review_only(store, proposal), prior_rollback=prior,
     )
+
+
+def _rule_key(text: str) -> str:
+    # Same normalization rejection_reason uses for rule text.
+    return " ".join((text or "").split()).casefold()
+
+
+def _rolled_back_index(store, *, exclude: str = "") -> tuple[dict, dict]:
+    """Rolled-back proposals by learning id and by normalized rule text.
+
+    A lesson mined again as a new learning carries a new id but the same
+    rule; the human undo must still veto its automatic reapplication.
+    """
+    by_learning, by_text = {}, {}
+    for row in store.query(
+            "SELECT p.id, p.learning_id, l.rule_text FROM proposals p "
+            "LEFT JOIN learnings l ON l.id = p.learning_id WHERE p.status='rolled_back' AND p.id != ?",
+            (exclude,)):
+        by_learning.setdefault(row["learning_id"], row["id"])
+        key = _rule_key(row["rule_text"])
+        if key:
+            by_text.setdefault(key, row["id"])
+    return by_learning, by_text
+
+
+def _prior_rollback(index: tuple[dict, dict], learning_id: str, rule_text: str) -> str:
+    by_learning, by_text = index
+    return by_learning.get(learning_id) or by_text.get(_rule_key(rule_text), "")
 
 
 def historical_approval_ids(store) -> set[str]:
@@ -217,7 +250,28 @@ def proposal_dispositions(store, cfg, *, run_id: str | None = None, retained_onl
                        (run_id,) if run_id is not None else ())
     result = []
     historical = historical_approval_ids(store)
-    rolled_back = {p["learning_id"]: p["id"] for p in store.query("SELECT id, learning_id FROM proposals WHERE status='rolled_back'")}
+    rolled_back = _rolled_back_index(store)
+    rule_texts = {r["id"]: r["rule_text"] for r in store.query("SELECT id, rule_text FROM learnings")}
+    # Only the pipeline delivers automatically, and only inside the run that
+    # created the proposal. After that run ends, an eligible proposal with no
+    # recorded automatic operation has no writer left; it returns to Review
+    # instead of waiting forever. A run has ended once its recorded process is
+    # gone, even before the next pipeline start marks it abandoned; the reaper
+    # uses the same rule (run_liveness). An unfinished recorded operation keeps
+    # its recovery owner. A completed or cancelled one owns nothing any more:
+    # the worker never acts on it again, so a later passing re-gate needs Review.
+    from .commands import FINISHED_STATES
+    from .run_liveness import RunLivenessError, live_run_ids
+    try:
+        live_runs = live_run_ids(store, cfg)
+    except RunLivenessError as exc:
+        raise PolicyError(f"cannot tell whether a running run is live: {exc}") from exc
+    migrations = {r['name'] for r in store.query('SELECT name FROM schema_migrations')}
+    finished = sorted(FINISHED_STATES)
+    owned = ({r["proposal_id"] for r in store.query(
+        "SELECT DISTINCT proposal_id FROM instruction_operations WHERE kind='auto_apply' "
+        f"AND state NOT IN ({','.join('?' for _ in finished)})", tuple(finished))}
+        if '0012_instruction_operations' in migrations else set())
     for row in rows:
         if (row["status"] in DECIDED_STATUSES and row['id'] not in historical) or row["status"] not in PROPOSAL_STATUSES:
             continue
@@ -229,10 +283,14 @@ def proposal_dispositions(store, cfg, *, run_id: str | None = None, retained_onl
             raise PolicyError(f"invalid run review_only policy for proposal {row['id']}")
         decision = automatic_eligibility(row, policy, review_only=stats.get("review_only", False),
                                          review_queue_actions=cfg.review_queue_actions,
-                                         prior_rollback=rolled_back.get(row["learning_id"], ""))
+                                         prior_rollback=_prior_rollback(rolled_back, row["learning_id"],
+                                                                        rule_texts.get(row["learning_id"], "")))
         if row['id'] in historical:
             decision.update(allowed=False, reason='fresh_approval_required',
                             detail=REASON_COPY['fresh_approval_required'])
+        elif decision["allowed"] and row["run_id"] not in live_runs and row["id"] not in owned:
+            decision.update(allowed=False, reason='automatic_delivery_missed',
+                            detail=REASON_COPY['automatic_delivery_missed'])
         try:
             rejection = rejection_reason(store,cfg,row,ctx=rejections,retained_only=retained_only)
         except TargetInspectionRequired as exc:

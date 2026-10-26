@@ -8,7 +8,7 @@ import os
 
 from .instruction_surfaces import PROFILE, inspect_surfaces
 from .mining_history import digest, encoded
-from .rule_revisions import (AvailabilityError, MIGRATION, capture_revision, identity_cache,
+from .rule_revisions import (AvailabilityError, MIGRATION, SourceChanged, capture_revision, identity_cache,
     marked_units, read_record, record_revision, require_schema, require_write,
     resolve_project, retained_revisions, timestamp, validate_revision)
 from .scan_observations import working_copy_identity
@@ -207,14 +207,27 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
             copy = working_copy_identity(revision['project_key'], path)
             copies[(revision['project_key'], copy['id'])] = (revision['project_key'], path)
     observations, inventories, text_archives = [], [], []
+    from .instruction_exclusions import excluded_by
     for (project_key, copy_id), (_, path) in sorted(copies.items()):
+        # An excluded copy gets no inventory at all: its latest earlier
+        # inventory stays latest, rather than a refused one standing in.
+        if excluded_by(cfg, path): continue
         relevant = [r for r in revisions if r['project_key'] in {'', project_key}]
         actual = resolve_project(path, cache)
-        surface = ({'files': [], 'issues': [{'cause': 'working_copy_identity_changed'}],
-                    'profile': PROFILE, 'runtime_loading_verified': False}
-                   if actual.key != project_key else inspect_surfaces(cfg, path,
-                       global_targets=[*(p for p in (cfg.global_claude_md, cfg.codex_global_agents_md) if os.path.lexists(p)),
-                           *(r['destination']['target_path'] for r in relevant if not r['project_key'])]))
+        refused_cause = 'working_copy_identity_changed' if actual.key != project_key else ''
+        surface = None
+        if not refused_cause:
+            try:
+                surface = inspect_surfaces(cfg, path,
+                    global_targets=[*(p for p in (cfg.global_claude_md, cfg.codex_global_agents_md) if os.path.lexists(p)),
+                        *(r['destination']['target_path'] for r in relevant if not r['project_key'])])
+            except SourceChanged:
+                # A settings write in one copy (an "always allow" click) must
+                # not discard every other copy's inventory: refuse this copy.
+                refused_cause = 'source_changed_during_observation'
+        if refused_cause:
+            surface = {'files': [], 'issues': [{'cause': refused_cause}],
+                       'profile': PROFILE, 'runtime_loading_verified': False}
         copy_at = timestamp(observed_at or utc_now_iso(), 'inventory observation')
         from .instruction_metrics import collect as collect_metrics
         measurements = collect_metrics(surface, path)
@@ -235,6 +248,8 @@ def collect_availability(store, cfg, *, run_id='', observed_at=None):
             if actual.key != project_key:
                 record.update(status='unknown', cause='working_copy_identity_changed', matches=[])
                 record['observed_project_identity'] = {'key': actual.key, 'method': actual.method}
+            elif refused_cause:
+                record.update(status='unknown', cause=refused_cause, matches=[])
             record['run_id'] = run_id
             record['id'] = digest({k: v for k, v in record.items() if k != 'id'})
         observations.extend(batch)

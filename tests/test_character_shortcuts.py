@@ -105,3 +105,20 @@ console.log(JSON.stringify({ignored,approved,actions:requests.map(r=>JSON.parse(
     assert all(not item["result"] and not item["prevented"] for item in result["ignored"])
     assert result["approved"]["result"] == "a"
     assert result["actions"] == ["approve"]
+
+
+def test_r_waits_for_a_ready_preview_like_its_button():
+    """BL-18: `a` and Shift+R checked the selected preview, but plain `r` sent
+    reject_target for a preview the operator had not seen yet."""
+    result = node(SETUP + """
+app.state.characterShortcuts={enabled:true,notice:''};
+const entry=app.state.reviewPreviews[family.learning_id];
+entry.loading=true;const whileLoading=press('r');
+entry.loading=false;entry.error='preview read failed';const whileFailed=press('r');
+entry.error='';const ready=press('r');await new Promise(resolve=>setImmediate(resolve));
+console.log(JSON.stringify({whileLoading,whileFailed,ready,actions:requests.map(r=>JSON.parse(r.options.body).action)}));
+""")
+    assert result["whileLoading"] == {"result": "", "prevented": False, "hash": result["whileLoading"]["hash"]}
+    assert result["whileFailed"]["result"] == "" and not result["whileFailed"]["prevented"]
+    assert result["ready"]["result"] == "r"
+    assert result["actions"] == ["reject_target"]

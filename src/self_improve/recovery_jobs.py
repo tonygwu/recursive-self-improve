@@ -2,6 +2,7 @@
 from dataclasses import asdict
 from pathlib import Path
 import json
+import re
 from .commands import CommandError,_hash,_json,_parsed,review_snapshot
 from .destinations import resolve_destination,read_destination,destination_identity,DestinationError
 from .store import new_id,utc_now_iso,DECIDED_STATUSES,actor_for
@@ -21,6 +22,58 @@ def _learning(store,lid):
     if lesson_rejected(store,lid):raise CommandError('LessonRejected','This lesson remains rejected everywhere.',409)
     return row
 
+# Every options() read re-verifies each session folder's project identity with
+# git and gh, and one recovery request reads options several times. Reuse the
+# two caches resolve() accepts for a short time within one process. The answers
+# match an uncached read: the remote cache is the persisted one the scanner
+# already trusts across runs, loaded at most once per interval. Candidate
+# destinations are cached the same way; the instruction writer re-resolves its
+# recorded destination without any cache before it changes a file or ref.
+IDENTITY_CACHE_SECONDS=900
+_identity_caches={'store':None,'at':None,'path_cache':{},'cache':{},'destinations':{}}
+
+def _fresh_caches(store):
+    import time
+    from .scan import _load_identity_cache
+    now=time.monotonic();memo=_identity_caches
+    if memo['store']!=str(store.db_path) or memo['at'] is None or now-memo['at']>IDENTITY_CACHE_SECONDS:
+        memo.update(store=str(store.db_path),at=now,path_cache={},cache=_load_identity_cache(store),destinations={})
+    return memo
+
+def _drop_degraded(memo):
+    # A failed gh lookup leaves a remote-URL identity behind. The scanner never
+    # persists those, so neither does this cache: retry them on the next read,
+    # and forget the paths that resolved through one.
+    from .project_identity import METHOD_REMOTE_URL
+    for remote in [r for r,i in memo['cache'].items() if i.method==METHOD_REMOTE_URL]:del memo['cache'][remote]
+    for path in [p for p,i in memo['path_cache'].items() if i.method==METHOD_REMOTE_URL]:del memo['path_cache'][path]
+
+def _identity_resolver(store):
+    from .project_identity import resolve
+    memo=_fresh_caches(store);_drop_degraded(memo)
+    return lambda p:resolve(p,cache=memo['cache'],path_cache=memo['path_cache'])
+
+def _candidate_destination(store,cfg,path,kind):
+    """resolve_destination for an options candidate, cached within the interval.
+
+    A refusal is cached too and raised again, so a cached read reports the
+    same unavailable cause as an uncached one.
+    """
+    memo=_fresh_caches(store)['destinations']
+    key=(path,kind,cfg.project_branch_name,str(cfg.state_path('snapshots')))
+    if key not in memo:
+        try:memo[key]=('ok',resolve_destination(cfg,path,kind))
+        except (DestinationError,OSError,UnicodeError) as exc:memo[key]=('error',(type(exc),str(exc)))
+    state,value=memo[key]
+    # Raise a new exception on every read, the first included, so each read
+    # reports the same cause: re-raising one cached object would grow its
+    # traceback and keep every earlier read's frame alive.
+    if state=='error':
+        try:fresh=value[0](value[1])
+        except TypeError:fresh=DestinationError(value[1])
+        raise fresh
+    return dict(value)
+
 def options(store,cfg,learning_id):
     """Resolve configured destinations and verified canonical projects; never accept paths."""
     from .routing import canonical_working_copy,skill_md_path,skill_slug,is_never_write
@@ -28,23 +81,32 @@ def options(store,cfg,learning_id):
     from .rejections import proposal_rejection
     from .embeddings import Embedder
     require_schema(store);learning=_learning(store,learning_id)
-    candidates=[(cfg.global_claude_md,'global_claude_md','Global Claude instructions'),
-        (cfg.codex_global_agents_md,'codex_global','Global Codex instructions'),
+    candidates=[(cfg.delivery_path('global_claude_md'),'global_claude_md','Global Claude instructions'),
+        (cfg.delivery_path('codex_global'),'codex_global','Global Codex instructions'),
         (str(Path(cfg.global_claude_md).parent/'settings.json'),'hook','Claude command hook'),
         (str(skill_md_path(cfg,learning)),'skill','Shared skill')]
+    if cfg.delivery_path('global_private'):
+        candidates.append((cfg.delivery_path('global_private'),'global_private','Personal rules'))
+    # Every existing skill in the delivery folder can take the lesson as an edit.
+    from .instruction_exclusions import excluded_by
+    skills_root=Path(cfg.delivery_path('skill'))
+    if not excluded_by(cfg,str(skills_root)) and skills_root.is_dir():
+        candidates.extend((str(s),'skill','Existing skill · '+s.parent.name)
+                          for s in sorted(skills_root.glob('*/SKILL.md')) if s.is_file())
     groups={};unavailable=[]
     for r in store.query("SELECT DISTINCT project_key,project_path FROM sessions WHERE project_path!='' ORDER BY project_key,project_path"):
-        groups.setdefault(r['project_key'],[]).append(r['project_path'])
+        if not excluded_by(cfg,r['project_path']):groups.setdefault(r['project_key'],[]).append(r['project_path'])
+    identity=_identity_resolver(store)
     for key,paths in groups.items():
-        valid=[p for p in paths if Path(p).is_dir() and resolve(p).key==key]
-        root=canonical_working_copy(valid,project_key=key,resolver=lambda p:resolve(p).key)
+        valid=[p for p in paths if Path(p).is_dir() and identity(p).key==key]
+        root=canonical_working_copy(valid,project_key=key,resolver=lambda p:identity(p).key)
         if not root:
             unavailable.append({'project_key':key,'cause':'NoWritableProject'});continue
         for name,kind in [('CLAUDE.md','project_claude_md'),('AGENTS.md','project_agents_md'),('.claude/rules/'+skill_slug(learning)+'.md','rule_file')]:
             candidates.append((str(Path(root)/name),kind,key+' · '+name))
     # Existing proposal destinations let regeneration address its exact source.
     proposals=store.query('SELECT * FROM proposals WHERE learning_id=? ORDER BY created_at,id',(learning_id,))
-    candidates.extend((p['target_path'],p['target_kind'],'Existing proposal target') for p in proposals)
+    candidates.extend((p['target_path'],p['target_kind'],'Existing proposal target') for p in proposals if not excluded_by(cfg,p['target_path']))
     class PreviewEmbedder(Embedder):
         def cached_vector(self,owner_kind,owner_key,text):
             return self.encode([text])[0]  # Preview never populates the persistent cache.
@@ -54,13 +116,20 @@ def options(store,cfg,learning_id):
     if rejected:raise CommandError('LessonRejected','This rule matches a rejected lesson: '+matched,409)
     for path,kind,label in candidates:
         try:
+            # Checked first, so an excluded folder is never resolved or read.
+            entry=excluded_by(cfg,path)
+            if entry:raise DestinationError(f'instruction_excluded_dirs contains {entry}.')
             if any(is_never_write(str(p)) for p in Path(path).parents):raise DestinationError('Production checkouts are not write targets.')
             if Path(path).resolve().is_relative_to(Path(cfg.production_repo_path).expanduser().resolve()):
                 raise DestinationError('The production checkout is not a write target.')
-            dest=resolve_destination(cfg,path,kind)
+            dest=_candidate_destination(store,cfg,path,kind)
             if kind in {'project_claude_md','project_agents_md','rule_file'} and dest['mode']!='git_branch':
                 raise DestinationError('This project is missing or is no longer a Git repository.')
             if dest['mode']=='git_branch' and is_never_write(dest['repo_root']):raise DestinationError('Production checkouts are not write targets.')
+            # The edit applies to the delivery base, not the working tree; a
+            # skill missing there would be created, not edited.
+            if label.startswith('Existing skill · ') and not read_destination(dest)['exists']:
+                raise DestinationError('This skill is not in the delivery base, so an edit would create it.')
             reason=proposal_rejection(store,cfg,learning,dest['target_path'],kind,embedder)
             ident=_hash(destination_identity(dest))
             if ident not in targets:targets[ident]={'id':ident,'label':label,'destination':dest,'available':not reason,'reason':reason,'modes':['regenerate_patch'] if label=='Existing proposal target' else ['hook'] if kind=='hook' else ['correct_target','regenerate_patch']}
@@ -156,7 +225,13 @@ def generate(store,cfg,saved,llm,journal):
     from .redact import redact_text
     from .resolutions import proposed_patch
     source=saved['source'];frozen=source['snapshot']
-    prompt=bundled_path('prompts','propose_recovery.md').read_text()+'\nFROZEN INPUT\n'+redact_text(_json(frozen))
+    # The learning ID is a generated 32-hex UUID, which the high-entropy
+    # redaction rule removes; the model needs it for the si:<learning_id>
+    # marker, so it travels outside the redacted evidence.
+    learning_id=frozen['learning_id']
+    if not re.fullmatch(r'[0-9a-f]{32}',learning_id):raise CommandError('InvalidRecoverySource','The frozen learning ID is not a generated identifier.')
+    prompt=(bundled_path('prompts','propose_recovery.md').read_text()+f'\nLEARNING ID: {learning_id}\n'
+            +'\nFROZEN INPUT\n'+redact_text(_json(frozen)))
     def ask():
         _unchanged(store,cfg,source)
         answer=llm.call(ACTION,cfg.strong_model_class,prompt,True)

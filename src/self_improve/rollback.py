@@ -122,12 +122,18 @@ def _application_source(store,cfg,proposal_id,*,event_id=None):
         if selected is None or selected['revision_id']!=note.get('revision_id'):
             raise RollbackError('InvalidApplication','The application does not identify a frozen member revision.',409)
         source=load_revision(store,selected['revision_id'])['snapshot']['proposal']
-        applied=apply_unified_diff(before,source['diff_unified'])
+        # Both recomputations in this branch start from the completed target's
+        # retained before_content. They only identify each member's recorded
+        # contribution and choose no new bytes, so they opt out of the
+        # line-ending refusal. A delivery recorded before the refusal existed
+        # can hold CRLF content or content without a final newline, and
+        # refusing it would block its rollback.
+        applied=apply_unified_diff(before,source['diff_unified'],refuse_rewritten_boundaries=False)
         application_id='command:'+command['id']+':'+target['id']
         cohort=[]
         for member in store.query('SELECT * FROM command_members WHERE target_id=? ORDER BY proposal_id',(target['id'],)):
             frozen=load_revision(store,member['revision_id'])['snapshot']['proposal']
-            if apply_unified_diff(before,frozen['diff_unified'])==applied:
+            if apply_unified_diff(before,frozen['diff_unified'],refuse_rewritten_boundaries=False)==applied:
                 member_event=latest_application(store,member['proposal_id'])
                 if member_event:
                     member_note = _note(member_event)

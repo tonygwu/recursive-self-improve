@@ -128,3 +128,46 @@ def test_the_optional_json_column_defaults_to_something_a_reader_can_parse(store
         "the default this writer chose is not readable by the reader that "
         "consumes it"
     )
+
+
+def test_a_database_with_a_newer_migration_is_refused_by_the_ordinary_open(tmp_path):
+    """BL-27: DEPLOYMENT.md said older code tolerates a newer database. Since
+    7fec020 the ordinary open calls migration_plan, which refuses unknown
+    names; read-only and non-migrating opens still read it."""
+    import pytest as _pytest
+    from self_improve.store import Store
+
+    path = tmp_path / "state.db"
+    store = Store(path)
+    store.insert("schema_migrations", {"name": "9999_from_newer_code", "applied_at": "2026-10-12T00:00:00Z"})
+    store.commit()
+    store.close()
+    with _pytest.raises(ValueError, match="unknown names"):
+        Store(path)
+    Store(path, migrate=False).close()
+    Store(path, read_only=True).close()
+
+
+def test_store_as_a_context_manager_commits_on_success_and_rolls_back_on_error(tmp_path):
+    """BL-54: Store had close() but no context manager. Leaving the block
+    closes the connection; an exception discards the block's pending writes
+    instead of committing them as close() would."""
+    import sqlite3
+
+    import pytest
+
+    from self_improve.store import Store
+
+    db = tmp_path / "state.db"
+    with Store(db) as store:
+        store.insert("runs", {"id": "kept", "started": "2026-10-12T00:00:00Z", "status": "ok"})
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.conn.execute("SELECT 1")
+    with pytest.raises(RuntimeError, match="invented failure"):
+        with Store(db) as store:
+            store.insert("runs", {"id": "dropped", "started": "2026-10-12T00:00:00Z", "status": "ok"})
+            raise RuntimeError("invented failure")
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.conn.execute("SELECT 1")
+    with Store(db, read_only=True) as reader:
+        assert [r["id"] for r in reader.query("SELECT id FROM runs ORDER BY id")] == ["kept"]

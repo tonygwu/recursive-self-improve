@@ -149,7 +149,12 @@ class TestPrimaryProjectUsesTheConvention:
         assert primary_project(learning) == "/c/tn/repo-0"
 
     def test_stored_write_target_still_wins(self) -> None:
-        """A backfilled primary_project_path is authoritative; do not re-derive."""
+        """A backfilled primary_project_path is authoritative; do not re-derive.
+
+        Kept unchanged by operator decision (BL-13 review): the repo-0 rule
+        applies to new learnings only. A learning mined before it keeps the
+        raw clone it was stored with, here repo-7.
+        """
         from self_improve.routing import primary_project
 
         learning = {
@@ -222,8 +227,9 @@ class TestKnownClonesFromTheDatabase:
 #
 # This path is reachable in normal operation, not hypothetical: llm.py runs
 # every headless call with cwd = the running checkout, so nightly miner
-# sessions index under repo-prod, and miner.py stores that raw cwd as
-# primary_project_path without consulting canonical_working_copy.
+# sessions index under repo-prod. miner.py stores the raw repo-prod cwd as
+# primary_project_path when canonical_working_copy finds no verified repo-0
+# sibling, and learnings mined before BL-13 keep their raw cwd.
 
 import pytest
 
@@ -281,20 +287,44 @@ class TestProductionCheckoutIsNeverAWriteTarget:
         assert redirect_never_write(f"{_SET}/repo-prod", isdir=no_git) == ""
 
     def test_primary_project_redirects_a_stored_repo_prod_path(self, tmp_path):
-        """A real clone set on disk: repo-prod beside a git-checkout repo-0."""
-        prod = tmp_path / "repo-prod"
-        prod.mkdir()
-        zero = tmp_path / "repo-0"
-        (zero / ".git").mkdir(parents=True)
-        learning = {"id": "L1", "primary_project_path": str(prod)}
-        assert primary_project(learning) == str(zero)
+        """A real clone set on disk: repo-prod beside a repo-0 checkout of the
+        same origin. A bare .git directory no longer passes (BL-13 review)."""
+        from tests.test_scan_observations import make_repo
+
+        prod = make_repo(tmp_path / "repo-prod", remote="git@github.com:acme/widget.git")
+        zero = make_repo(tmp_path / "repo-0", remote="https://github.com/acme/widget")
+        learning = {"id": "L1", "primary_project_path": prod}
+        assert primary_project(learning) == zero
 
     def test_primary_project_raises_when_repo_prod_has_no_sibling(self, tmp_path):
-        prod = tmp_path / "repo-prod"
-        prod.mkdir()
-        learning = {"id": "L2", "primary_project_path": str(prod)}
+        from tests.test_scan_observations import make_repo
+
+        prod = make_repo(tmp_path / "repo-prod", remote="git@github.com:acme/widget.git")
+        learning = {"id": "L2", "primary_project_path": prod}
         with pytest.raises(RoutingError) as exc:
             primary_project(learning)
+        assert "must never be written to" in str(exc.value)
+        assert "no repo-0 sibling with the same origin" in str(exc.value)
+
+    @pytest.mark.parametrize("prod_state", ["no_origin", "missing"])
+    def test_primary_project_refuses_when_the_repo_prod_origin_is_unreadable(self, tmp_path, prod_state):
+        """BL-13 review: _origin_remote returned "" for a repo-prod with no
+        origin or no directory, and an empty key skipped the identity check, so
+        the redirect went to an unrelated repo-0."""
+        import subprocess
+
+        from tests.test_scan_observations import make_repo
+
+        make_repo(tmp_path / "repo-0", remote="git@github.com:someone/else.git")
+        prod = tmp_path / "repo-prod"
+        if prod_state == "no_origin":
+            prod.mkdir()
+            subprocess.run(["git", "init", "-q", str(prod)], check=True)
+        learning = {"id": "L3", "primary_project_path": str(prod)}
+        with pytest.raises(RoutingError) as exc:
+            primary_project(learning)
+        cause = "has no readable origin remote" if prod_state == "no_origin" else "does not exist"
+        assert cause in str(exc.value)
         assert "must never be written to" in str(exc.value)
 
     def test_ordinary_paths_are_untouched(self):
@@ -356,3 +386,22 @@ class TestTheSiblingMustBeTheSameRepo:
         assert redirect_never_write(
             str(prod), resolver=boom, project_key="github:1"
         ) == ""
+
+
+def test_a_repo_prod_redirect_requires_the_same_origin(tmp_path):
+    """BL-13: the repo-prod redirect checked only that <parent>/repo-0/.git
+    existed, so a learning could be written into an unrelated repository."""
+    import pytest
+    from self_improve.routing import RoutingError, primary_project
+    from tests.test_scan_observations import make_repo
+
+    same = tmp_path / "same"
+    make_repo(same / "repo-prod", remote="git@github.com:acme/widget.git")
+    make_repo(same / "repo-0", remote="https://github.com/acme/widget")
+    assert primary_project({"id": "a", "primary_project_path": str(same / "repo-prod")}) == str(same / "repo-0")
+
+    other = tmp_path / "other"
+    make_repo(other / "repo-prod", remote="git@github.com:acme/widget.git")
+    make_repo(other / "repo-0", remote="git@github.com:someone/else.git")
+    with pytest.raises(RoutingError):
+        primary_project({"id": "b", "primary_project_path": str(other / "repo-prod")})

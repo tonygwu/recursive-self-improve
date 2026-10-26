@@ -12,8 +12,8 @@ def validate_managed(record):
     statuses = [managed['memory_status'], managed['skills_status']]
     if any(status not in {'observed', 'absent', 'failed', 'not_checked'} for status in statuses):
         raise ValueError('invalid managed discovery outcome')
-    refused = not record['files'] and any(i['cause'] in {
-        'working_copy_identity_changed', 'working_copy_missing', 'working_copy_not_git'} for i in record['issues'])
+    from .rule_revisions import REFUSED_SURFACE_CAUSES
+    refused = not record['files'] and any(i['cause'] in REFUSED_SURFACE_CAUSES for i in record['issues'])
     if 'not_checked' in statuses:
         if not refused or statuses != ['not_checked', 'not_checked']:
             raise ValueError('managed discovery was not checked without identity refusal')

@@ -346,6 +346,9 @@ def rebuild_store(tmp_path):
             "id": name, "session_file": str(path), "session_id": name,
             "signal_type": "correction", "window": [{"text": "invented " + name}],
         })
+    from tests.test_rebuild import _produced
+    # A scan produced the available incident, so a rescan can regenerate it.
+    _produced(store, str(alive), "available")
     store.commit()
     try:
         yield store
